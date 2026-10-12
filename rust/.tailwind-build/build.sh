@@ -38,6 +38,51 @@ test -f "$STYLES" || { echo "找不到 $STYLES"; exit 1; }
 @source inline("sr-only");
 
 /* ---------------------------------------------------------------------
+ * 翻转数字的进入动画
+ *
+ * TS 侧用 `motion/react` 的 `AnimatePresence` 做 rotateX + y 的进出场。
+ * Rust 侧没有动画库，改成「按字符 key 重建元素 + CSS 关键帧」：
+ * 字符变化时旧元素卸载、新元素挂载并播放一次进入动画。
+ *
+ * 关键帧参数逐字对应 flip-metric-value.tsx 里的
+ *   initial={{ rotateX: -90, y: "-0.45em", opacity: 0 }}
+ *   animate={{ rotateX: 0,   y: 0,        opacity: 1 }}
+ *   transition={{ duration: 0.16, ease: [0.4, 0, 0.2, 1] }}
+ * --------------------------------------------------------------------- */
+@keyframes zcode-flip-metric-in {
+  from {
+    transform: rotateX(-90deg) translateY(-0.45em);
+    opacity: 0;
+  }
+  to {
+    transform: rotateX(0deg) translateY(0);
+    opacity: 1;
+  }
+}
+
+@utility zcode-flip-metric-in {
+  animation: zcode-flip-metric-in 160ms cubic-bezier(0.4, 0, 0.2, 1) both;
+  transform-origin: 50% 50%;
+}
+
+/* ---------------------------------------------------------------------
+ * `scrollbar-hide` 的等价物
+ *
+ * 上游 styles.css 第 3 行 `@import "tailwind-scrollbar-hide/v4"` 提供这个
+ * 工具类，而那个 npm 包不在本仓库里。缺了它，`command-list` 这类
+ * 「滚动但不显示滚动条」的容器就会露出原生滚动条。
+ *
+ * 这里按该插件的实现原样补一条 @utility。
+ * --------------------------------------------------------------------- */
+@utility scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* ---------------------------------------------------------------------
  * shadcn/tailwind.css 的等价物
  *
  * 上游 Radix 写的是 data-state="open" / data-orientation="vertical" 这类属性，

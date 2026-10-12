@@ -134,6 +134,17 @@ pub fn PopoverContent(
     #[props(default)] align: Align,
     /// 对应 Radix `sideOffset`，默认 `4`（与 TS 一致）。
     #[props(default = 4.0)] side_offset: f64,
+    /// 透传到根节点的 `role`。Radix 的 `Content` 会把它收到的属性直接铺在根上，
+    /// 调用点常写 `role="toolbar"` / `role="dialog"`（见 `PptxSelectionActionBar`）。
+    #[props(default)] role: Option<String>,
+    /// 透传到根节点的 `aria-label`。
+    #[props(default)] aria_label: Option<String>,
+    /// 根节点上的 `keydown`。
+    ///
+    /// Radix 把 `onEscapeKeyDown` 做成「焦点在内容内时按 Esc」的语义化回调；
+    /// 本移植不接管焦点，直接把原始 `keydown` 交给调用方（同 `Select` 的做法），
+    /// 由调用方判断按键与 IME 合成状态。
+    #[props(default)] onkeydown: EventHandler<KeyboardEvent>,
     #[props(default, into)] class: String,
     children: Element,
 ) -> Element {
@@ -149,6 +160,9 @@ pub fn PopoverContent(
             "data-state": "open",
             "data-side": side.as_str(),
             "data-align": align.as_str(),
+            role,
+            "aria-label": aria_label,
+            onkeydown: move |e| onkeydown.call(e),
             {children}
         }
     }

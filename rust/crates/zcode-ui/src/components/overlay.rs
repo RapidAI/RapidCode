@@ -11,28 +11,37 @@
 //!   还会自动翻转（flip）与平移（shift）以避免越界。
 //!
 //! Rust 侧**两者都没有**（无渲染器时不可测；有渲染器时也需要大量 JS 桥接）。
-//! 因此这里统一采用一套**纯 CSS 的自管理定位**约定：
+//! 因此这里统一采用一套**纯 CSS 的自管理定位**约定，分两条路径：
+//!
+//! ### 路径 A：相对锚点（`side_align_classes`）
 //!
 //! 1. 每个浮层组件渲染一个 `position: relative` 的**锚点包裹元素**
 //!    （[`OVERLAY_ANCHOR_BASE`]），浮层内容以 `position: absolute` 相对它定位；
 //! 2. 方向与对齐由 [`Side`] / [`Align`] 枚举映射成固定的 inset + translate 类名
 //!    （[`side_align_classes`]），不依赖运行时测量；
 //! 3. 层级用 `z-*` 类名静态指定（沿用 TS 的取值，如 tooltip `z-50`、
-//!    popover `z-[60]`）。
+//!    popover / menu `z-[60]`）。
+//!
+//! 适用于 Tooltip / HoverCard / Popover / DropdownMenu / Select ——
+//! 它们的锚点是一个**元素**。
+//!
+//! ### 路径 B：跟随光标（`cursor_overlay_classes` + `cursor_position_style`）
+//!
+//! 右键菜单的锚点是**鼠标位置**，没有可包裹的元素，所以走
+//! `position: fixed` + 内联 `left/top`。`fixed` 是必须的：`clientX` / `clientY`
+//! 是视口坐标，只有 `fixed` 的包含块才是视口。另外提供
+//! [`clamp_to_viewport`]（`floating-ui` 的 `shift` 等价物），
+//! 让贴着屏幕边缘右键时菜单不会跑出去。
 //!
 //! ## 与 TS 的已知差异
 //!
 //! | 能力 | TS（Radix） | 本移植 |
 //! | --- | --- | --- |
-//! | 脱离祖先裁剪 | Portal 到 body | ❌ 仍在原位置（需祖先无 `overflow:hidden`） |
-//! | 自动翻转/避让 | floating-ui flip/shift | ❌ 固定方向，可能越界 |
+//! | 脱离祖先裁剪 | Portal 到 body | ⚠️ 路径 A 仍在原位置（需祖先无 `overflow:hidden`）；路径 B 用 `fixed` 天然脱离 |
+//! | 自动翻转 | floating-ui flip | ❌ 路径 A 固定方向，可能越界 |
+//! | 自动平移 | floating-ui shift | ⚠️ 路径 B 有 [`clamp_to_viewport`]；路径 A 无 |
 //! | 箭头指向 | floating-ui arrow | ❌ 未实现 |
-//! | 定位计算 | 运行时 JS | ✅ 纯 CSS，零运行时 |
-//!
-//! 这三条差异都是「用静态 CSS 换掉运行时测量」的必然代价。对桌面端应用
-//! （固定尺寸窗口、浮层大多挂在工具栏/列表项上）实际影响很小；如果将来需要
-//! 精确避让，接入渲染器后给 [`side_align_classes`] 增加一个「测量并追加
-//! `--overlay-x/--overlay-y` CSS 变量」的变体即可，调用方无需改动。
+//! | 定位计算 | 运行时 JS | ✅ 纯 CSS + 可测的纯函数，零运行时测量 |
 
 use crate::cn::cn;
 
@@ -140,6 +149,62 @@ pub fn overlay_anchor_classes(class: &str) -> String {
     cn(&[OVERLAY_ANCHOR_BASE, class])
 }
 
+// ---------------------------------------------------------------------------
+// 光标定位（右键菜单）
+// ---------------------------------------------------------------------------
+
+/// 光标定位浮层的定位基准类名。
+///
+/// 用 `fixed` 而不是 `absolute`：`clientX` / `clientY` 是**视口坐标**，
+/// 只有 `position: fixed` 的包含块才是视口。用 `absolute` 会把浮层相对最近的
+/// 定位祖先偏移，右键菜单就会跑偏 —— 这是 Radix 用 `Portal` 到 `body`
+/// 之外还需要额外处理的原因，我们靠 `fixed` 一步到位。
+pub const OVERLAY_CURSOR_BASE: &str = "fixed";
+
+/// 由光标坐标生成内联定位样式。
+pub fn cursor_position_style(x: f64, y: f64) -> String {
+    format!("left: {x}px; top: {y}px;")
+}
+
+/// 光标定位浮层的最终类名。
+pub fn cursor_overlay_classes(class: &str) -> String {
+    cn(&[OVERLAY_CURSOR_BASE, class])
+}
+
+/// 把浮层左上角夹进视口内。
+///
+/// 这是 `floating-ui` 的 `shift` 中间件里最常用的一条（只平移、不翻方向）的
+/// 等价物：右键贴着屏幕右/下边缘时，菜单仍然完整可见。
+///
+/// 参数都用视口坐标系（`clientX` / `clientY` 那一套），
+/// `padding` 是距视口边缘的安全间距。
+///
+/// 浮层比视口还大时（`content_* + 2 * padding > viewport_*`）优先保证左上角
+/// 不越界，即退化为 `padding`。
+pub fn clamp_to_viewport(
+    x: f64,
+    y: f64,
+    viewport_w: f64,
+    viewport_h: f64,
+    content_w: f64,
+    content_h: f64,
+    padding: f64,
+) -> (f64, f64) {
+    let clamp_axis = |pos: f64, viewport: f64, content: f64| {
+        let max = viewport - content - padding;
+        if max < padding {
+            // 放不下：退到左/上边界，至少不把起点挤出屏幕
+            padding
+        } else {
+            pos.clamp(padding, max)
+        }
+    };
+    (
+        clamp_axis(x, viewport_w, content_w),
+        clamp_axis(y, viewport_h, content_h),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +281,47 @@ mod tests {
         let c = cn(&[&side_align_classes(Side::Top, Align::Center, 4.0), "mb-2"]);
         assert!(c.contains("mb-2"));
         assert!(!c.contains("mb-[4px]"));
+    }
+
+    #[test]
+    fn cursor_overlay_is_fixed() {
+        // clientX/clientY 是视口坐标 → 必须用 fixed，absolute 会相对祖先偏移
+        assert_eq!(OVERLAY_CURSOR_BASE, "fixed");
+        let c = cursor_overlay_classes("min-w-44");
+        assert!(c.contains("fixed"));
+        assert!(c.contains("min-w-44"));
+    }
+
+    #[test]
+    fn cursor_style_uses_pixels() {
+        assert_eq!(cursor_position_style(120.0, 340.5), "left: 120px; top: 340.5px;");
+    }
+
+    #[test]
+    fn clamp_leaves_roomy_positions_alone() {
+        let (x, y) = clamp_to_viewport(100.0, 200.0, 1280.0, 800.0, 200.0, 300.0, 8.0);
+        assert_eq!((x, y), (100.0, 200.0));
+    }
+
+    #[test]
+    fn clamp_pulls_back_from_the_far_edges() {
+        // 光标在右下角 → 菜单要整体左移/上移，保证完整可见
+        let (x, y) = clamp_to_viewport(1270.0, 790.0, 1280.0, 800.0, 200.0, 300.0, 8.0);
+        assert_eq!(x, 1280.0 - 200.0 - 8.0);
+        assert_eq!(y, 800.0 - 300.0 - 8.0);
+    }
+
+    #[test]
+    fn clamp_keeps_the_near_edges_off_screen() {
+        // 负坐标（多显示器）也不该贴到 0
+        let (x, y) = clamp_to_viewport(-50.0, -50.0, 1280.0, 800.0, 200.0, 300.0, 8.0);
+        assert_eq!((x, y), (8.0, 8.0));
+    }
+
+    #[test]
+    fn clamp_degrades_gracefully_when_content_is_too_big() {
+        // 浮层比视口还大：退到 padding，而不是算出负的 max 再夹出负数
+        let (x, y) = clamp_to_viewport(500.0, 500.0, 300.0, 200.0, 400.0, 300.0, 8.0);
+        assert_eq!((x, y), (8.0, 8.0));
     }
 }

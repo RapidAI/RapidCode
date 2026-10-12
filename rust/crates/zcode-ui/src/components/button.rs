@@ -133,6 +133,12 @@ pub fn Button(
     /// 覆盖 `data-size`。TS 里 `InputGroupButton` 用 cva 的 size 覆盖了
     /// `buttonVariants` 的 size 属性，但类名仍走 `className`，两者不一致。
     #[props(default)] data_size: Option<&'static str>,
+    /// 透传 `aria-label`（图标按钮或文案与标签分离时使用）。
+    #[props(default)] aria_label: Option<String>,
+    /// `mousedown`。少数调用点需要 `preventDefault` 来保住页面上的文本选区
+    /// （见 `PptxSelectionActionBar`：按钮拿到鼠标焦点前浏览器可能清空 PPTX
+    /// 的 `Selection`，阻止默认 mousedown 仍保留 click / 键盘激活）。
+    #[props(default)] onmousedown: EventHandler<MouseEvent>,
     #[props(default)] onclick: EventHandler<MouseEvent>,
     children: Element,
 ) -> Element {
@@ -145,6 +151,8 @@ pub fn Button(
             "data-slot": slot,
             "data-variant": variant.as_str(),
             "data-size": data_size.unwrap_or(size.as_str()),
+            "aria-label": aria_label,
+            onmousedown: move |e| onmousedown.call(e),
             onclick: move |e| onclick.call(e),
             {children}
         }

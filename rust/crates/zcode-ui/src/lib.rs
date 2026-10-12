@@ -30,22 +30,38 @@
 //!
 //! ## 移植范围与取舍
 //!
-//! 已移植：Button / Badge / Card / Alert / Input / Label / Separator / Progress /
-//! Kbd / Spinner / Textarea / Avatar / Switch / Checkbox / Tabs。
+//! 已移植 **31 / 47** 个原语：
 //!
-//! 未移植（需要浏览器/Electron 运行时能力，或依赖 React 生态的浮层库）：
-//! Dialog / Popover / Tooltip / DropdownMenu / ContextMenu / Select / Combobox /
-//! Command / Toast / Carousel / Resizable / ScrollArea 等。这些组件的可移植部分
-//! 是「类名表 + 状态机」，需要配合 Dioxus 的 `Portal` 与定位计算单独设计。
+//! - 基础：Button / Badge / Card / Alert / Input / Textarea / Label / Separator /
+//!   Progress / Kbd / Spinner / Avatar / Switch / Checkbox / Tabs
+//! - 折叠：Collapsible / Accordion
+//! - 组合：RadioGroup / ButtonGroup / InputGroup / ScrollArea / Resizable
+//! - 浮层：Tooltip / HoverCard / Popover / Dialog / AlertDialog / DropdownMenu
+//! - 展示：ScrollFadeViewport / ZCodeAboutLogo / GlmMonochromeIcon
+//!
+//! 尚未移植的 16 个集中在两类：需要浏览器运行时能力的重型渲染器
+//! （carousel / chart / code-viewer / diff-viewer / pdf-viewer /
+//! pptx-preview-viewer / floating-particles / smooth-metric-value /
+//! flip-metric-value），以及它们派生出的组合件
+//! （command / context-menu / select / toast / lightweight-diff-preview /
+//! highlighted-lightweight-diff-preview / pptx-selection-action-bar）。
 //!
 //! 细节见仓库根目录 `rust/PORTING-UI.md`。
 
 /// 类名合并（`clsx` + `tailwind-merge` 的务实子集）。
 pub mod cn;
+pub mod code_preview_preferences;
+pub mod diffs_highlighter_engine;
 /// shadcn 风格原语组件。
 pub mod components;
 /// lucide 图标的内联 SVG 移植（零额外依赖）。
 pub mod icons;
+pub mod keyboard_shortcuts;
+pub mod patch_diff_preview;
+pub mod pdf_js_assets;
+pub mod pdf_zoom_overlay;
+pub mod presentation_element_model;
+pub mod shiki_highlighter;
 
 pub use cn::{cn, cn_opt};
 pub use components::accordion::*;
@@ -53,27 +69,47 @@ pub use components::alert::*;
 pub use components::alert_dialog::*;
 pub use components::avatar::*;
 pub use components::badge::*;
+pub use components::brand::*;
 pub use components::button::*;
 pub use components::button_group::*;
 pub use components::card::*;
+pub use components::carousel::*;
+pub use components::chart::*;
 pub use components::checkbox::*;
+pub use components::code_viewer::*;
 pub use components::collapsible::*;
+pub use components::command::*;
+pub use components::context_menu::*;
 pub use components::dialog::*;
+pub use components::diff_viewer::*;
+pub use components::flip_metric_value::*;
+pub use components::floating_particles::*;
 pub use components::dropdown_menu::*;
+pub use components::glm_icon::*;
+pub use components::highlighted_lightweight_diff_preview::*;
 pub use components::hover_card::*;
 pub use components::input::*;
 pub use components::input_group::*;
 pub use components::kbd::*;
 pub use components::label::*;
+pub use components::lightweight_diff_preview::*;
 pub use components::overlay::{Align, Side};
+pub use components::pdf_viewer::*;
 pub use components::popover::*;
+pub use components::pptx_preview_viewer::*;
+pub use components::pptx_selection_action_bar::*;
 pub use components::progress::*;
 pub use components::radio_group::*;
+pub use components::resizable::*;
 pub use components::scroll_area::*;
+pub use components::scroll_fade_viewport::*;
+pub use components::select::*;
 pub use components::separator::*;
+pub use components::smooth_metric_value::*;
 pub use components::spinner::*;
 pub use components::switch::*;
 pub use components::tabs::*;
 pub use components::textarea::*;
+pub use components::toast::*;
 pub use components::tooltip::*;
 pub use icons::*;

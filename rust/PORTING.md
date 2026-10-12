@@ -78,18 +78,19 @@ Rust 侧与 React 语义最贴近的等价框架是 **Dioxus 0.6**（RSX ≈ JSX
 `#[component]` ≈ 函数组件、`use_signal` ≈ `useState`、
 `use_context(_provider)` ≈ `useContext`/`Provider`）。
 
-`packages/ui/src/components/ui` 下共 **47** 个 shadcn 风格原语，已移植 **15** 个：
+`packages/ui/src/components/ui` 下共 **47** 个 shadcn 风格原语，**已全部移植（47 / 47）**：
 
-| Rust 模块 | TSX 来源 | Rust 模块 | TSX 来源 |
-| --- | --- | --- | --- |
-| `button.rs` | `button.tsx` | `kbd.rs` | `kbd.tsx` |
-| `badge.rs` | `badge.tsx` | `spinner.rs` | `spinner.tsx` |
-| `card.rs` | `card.tsx` | `avatar.rs` | `avatar.tsx` |
-| `alert.rs` | `alert.tsx` | `switch.rs` | `switch.tsx` |
-| `input.rs` | `input.tsx` | `checkbox.rs` | `checkbox.tsx` |
-| `textarea.rs` | `textarea.tsx` | `tabs.rs` | `tabs.tsx` |
-| `label.rs` | `label.tsx` | `separator.rs` | `separator.tsx` |
-| `progress.rs` | `progress.tsx` | `cn.rs` | `lib/utils.ts` |
+| 批次 | 数量 | 内容 |
+| --- | ---: | --- |
+| 第一批 | 15 | `button` `badge` `card` `alert` `input` `textarea` `label` `separator` `progress` `kbd` `spinner` `avatar` `switch` `checkbox` `tabs`（+ `cn.rs` ← `lib/utils.ts`） |
+| 第二批 | 12 | 折叠类 `collapsible` `accordion`；组合型 `radio_group` `button_group` `input_group` `scroll_area`；浮层类 `tooltip` `hover_card` `popover` `dialog` `alert_dialog` `dropdown_menu` |
+| 第三批 | 11 | 展示 / 动画 / 组合类 `brand` `glm_icon` `scroll_fade_viewport` `toast` `select` `command` `context_menu` `resizable` `floating_particles` `smooth_metric_value` `flip_metric_value` |
+| 第四批 | 9 | 重型预览（注入式移植）`carousel` `chart` `code_viewer` `diff_viewer` `pdf_viewer` `pptx_preview_viewer` `lightweight_diff_preview` `highlighted_lightweight_diff_preview` `pptx_selection_action_bar` |
+
+> 第四批背后的 `@pierre/diffs` / `pdf.js` / `pptx-renderer` / `recharts` / `embla` /
+> shiki 都无法移植到 Rust。做法不是丢掉这些组件，而是**不 vendor 引擎、把引擎注入**：
+> 抽出全部纯逻辑并加单测，引擎经 `children` / trait / 回调交给宿主。
+> 详见 [PORTING-UI.md](./PORTING-UI.md) §3.8 与 §4.4。
 
 关键点（细节见 [PORTING-UI.md](./PORTING-UI.md)）：
 
@@ -142,7 +143,7 @@ TS 的 `TContext` 泛型在 Rust 侧统一用 `Value` 承载（上下文本身�
 ```bash
 cd rust
 cargo build                              # 编译整个工作区
-cargo test                               # 工作区 242 个测试
+cargo test                               # 工作区 871 个测试
 cargo run -p zcode-app                   # 开桌面窗口（UI 层见 PORTING-UI.md）
 cargo run -p zcode-ui --example preview  # 生成 UI 预览页 ./preview.html
 cargo build --release
@@ -154,7 +155,8 @@ cargo build --release
 | --- | ---: | ---: | --- |
 | `zcode-rpc` | 10 | — | 序列化 / 事件 / 端到端 RPC |
 | `zcode-shared` | 14 | — | 行级变更统计 / 供应商族 / 套餐身份 |
-| `zcode-ui` | 65 | 34 | 类名映射 / 渲染指令 / HTML 快照 |
+| `zcode-ui` | 742 | 75 + 11 | 类名 / 几何 / 键盘纯函数、渲染指令、HTML 快照 |
+| `zcode-app` | 2 | 17 | 应用外壳 + 整树冒烟 |
 
 逻辑层测试覆盖：
 
@@ -177,10 +179,11 @@ cargo build --release
    `background-task-controls.ts`、`oauth.ts`、`zcode-protocol-v4/*` 等。
 2. **`packages/rpc` 的补充**：真实 `Socket` 实现（TCP / WebSocket）、  
    `MessagePortLike` 的 Electron/浏览器绑定、与 `packages/provider*` 的对接。
-3. **UI 层继续推进**（见 [PORTING-UI.md](./PORTING-UI.md) §6/§7）：  
-   已完成 27 / 47 个原语，并拼出了可运行的 `zcode-app`；剩余 20 个里优先做  
-   **浮层定位第二步**（`position: fixed` + 光标坐标 → 接 `context-menu`）与  
-   **键盘漫游**（`select` / `command` 的前置），再处理 toast 与重型渲染器。
+3. **UI 层**（见 [PORTING-UI.md](./PORTING-UI.md) §6/§7）：  
+   **47 / 47 个原语已全部移植完毕**，并拼出了可运行的 `zcode-app`（871 个测试全绿）。
+   剩余的是**宿主接线**而非移植：`overlay.rs` 的边缘翻转碰撞检测，以及为
+   `code_viewer` / `diff_viewer` / `pdf_viewer` / `pptx_preview_viewer` / `chart` /
+   `carousel` 接上各自的 JS 引擎等价物（这些属于宿主应用职责，见 §4.4）。
 4. **服务层核心逻辑**（`packages/services`，224k 行）：按领域切分，优先迁移  
    纯计算/状态机模块；I/O 与第三方 SDK 调用保留边界。
 5. **不可移植部分**：桌面/浏览器外壳（Electron / Vite / Node 主进程）不迁移；

@@ -26,11 +26,14 @@ macro_rules! lucide {
             #[props(default, into)] class: String,
             /// 覆盖 `data-slot`（默认与 lucide 组件名一致）。
             #[props(default = $default_slot)] slot: &'static str,
+            /// 装饰性图标标记。TS 调用处常写 `aria-hidden="true"`。
+            #[props(default)] aria_hidden: bool,
         ) -> Element {
             rsx! {
                 svg {
                     class: class,
                     "data-slot": slot,
+                    "aria-hidden": aria_hidden.then_some("true"),
                     view_box: "0 0 24 24",
                     fill: "none",
                     stroke: "currentColor",
@@ -49,11 +52,14 @@ macro_rules! lucide {
 pub fn IconChevronDown(
     #[props(default, into)] class: String,
     #[props(default = "chevron-down")] slot: &'static str,
+    /// 装饰性图标标记。TS 调用处常写 `aria-hidden="true"`。
+    #[props(default)] aria_hidden: bool,
 ) -> Element {
     rsx! {
         svg {
             class: class,
             "data-slot": slot,
+            "aria-hidden": aria_hidden.then_some("true"),
             view_box: "0 0 24 24",
             fill: "none",
             stroke: "currentColor",
@@ -70,11 +76,14 @@ pub fn IconChevronDown(
 pub fn IconChevronUp(
     #[props(default, into)] class: String,
     #[props(default = "chevron-up")] slot: &'static str,
+    /// 装饰性图标标记。TS 调用处常写 `aria-hidden="true"`。
+    #[props(default)] aria_hidden: bool,
 ) -> Element {
     rsx! {
         svg {
             class: class,
             "data-slot": slot,
+            "aria-hidden": aria_hidden.then_some("true"),
             view_box: "0 0 24 24",
             fill: "none",
             stroke: "currentColor",
@@ -91,11 +100,14 @@ pub fn IconChevronUp(
 pub fn IconChevronRight(
     #[props(default, into)] class: String,
     #[props(default = "chevron-right")] slot: &'static str,
+    /// 装饰性图标标记。TS 调用处常写 `aria-hidden="true"`。
+    #[props(default)] aria_hidden: bool,
 ) -> Element {
     rsx! {
         svg {
             class: class,
             "data-slot": slot,
+            "aria-hidden": aria_hidden.then_some("true"),
             view_box: "0 0 24 24",
             fill: "none",
             stroke: "currentColor",
@@ -107,16 +119,43 @@ pub fn IconChevronRight(
     }
 }
 
-/// lucide `circle`（空心圆，radio 指示器用；`fill-current` 由调用处类名控制）。
+/// lucide `chevron-left`（`chevron-right` 的镜像路径）。
 #[component]
-pub fn IconCircle(
+pub fn IconChevronLeft(
     #[props(default, into)] class: String,
-    #[props(default = "circle")] slot: &'static str,
+    #[props(default = "chevron-left")] slot: &'static str,
+    /// 装饰性图标标记。TS 调用处常写 `aria-hidden="true"`。
+    #[props(default)] aria_hidden: bool,
 ) -> Element {
     rsx! {
         svg {
             class: class,
             "data-slot": slot,
+            "aria-hidden": aria_hidden.then_some("true"),
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "m15 18-6-6 6-6" }
+        }
+    }
+}
+
+/// lucide `circle`（空心圆，radio 指示器用；`fill-current` 由调用处类名控制）。
+#[component]
+pub fn IconCircle(
+    #[props(default, into)] class: String,
+    #[props(default = "circle")] slot: &'static str,
+    /// 装饰性图标标记。TS 调用处常写 `aria-hidden="true"`。
+    #[props(default)] aria_hidden: bool,
+) -> Element {
+    rsx! {
+        svg {
+            class: class,
+            "data-slot": slot,
+            "aria-hidden": aria_hidden.then_some("true"),
             view_box: "0 0 24 24",
             fill: "none",
             stroke: "currentColor",
@@ -133,11 +172,14 @@ pub fn IconCircle(
 pub fn IconCheck(
     #[props(default, into)] class: String,
     #[props(default = "check")] slot: &'static str,
+    /// 装饰性图标标记。TS 调用处常写 `aria-hidden="true"`。
+    #[props(default)] aria_hidden: bool,
 ) -> Element {
     rsx! {
         svg {
             class: class,
             "data-slot": slot,
+            "aria-hidden": aria_hidden.then_some("true"),
             view_box: "0 0 24 24",
             fill: "none",
             stroke: "currentColor",
@@ -154,11 +196,14 @@ pub fn IconCheck(
 pub fn IconX(
     #[props(default, into)] class: String,
     #[props(default = "x")] slot: &'static str,
+    /// 装饰性图标标记。TS 调用处常写 `aria-hidden="true"`。
+    #[props(default)] aria_hidden: bool,
 ) -> Element {
     rsx! {
         svg {
             class: class,
             "data-slot": slot,
+            "aria-hidden": aria_hidden.then_some("true"),
             view_box: "0 0 24 24",
             fill: "none",
             stroke: "currentColor",
@@ -176,11 +221,14 @@ pub fn IconX(
 pub fn IconSearch(
     #[props(default, into)] class: String,
     #[props(default = "search")] slot: &'static str,
+    /// 装饰性图标标记。TS 调用处常写 `aria-hidden="true"`。
+    #[props(default)] aria_hidden: bool,
 ) -> Element {
     rsx! {
         svg {
             class: class,
             "data-slot": slot,
+            "aria-hidden": aria_hidden.then_some("true"),
             view_box: "0 0 24 24",
             fill: "none",
             stroke: "currentColor",
@@ -308,6 +356,46 @@ lucide!(IconLayers, "layers",
     path { d: "m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65" }
 );
 
+lucide!(IconInfo, "info",
+    circle { cx: "12", cy: "12", r: "10" }
+    path { d: "M12 16v-4" }
+    path { d: "M12 8h.01" }
+);
+
+lucide!(IconTriangleAlert, "triangle-alert",
+    path { d: "m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" }
+    path { d: "M12 9v4" }
+    path { d: "M12 17h.01" }
+);
+
+lucide!(IconZoomIn, "zoom-in",
+    circle { cx: "11", cy: "11", r: "8" }
+    line { x1: "21", x2: "16.65", y1: "21", y2: "16.65" }
+    line { x1: "11", x2: "11", y1: "8", y2: "14" }
+    line { x1: "8", x2: "14", y1: "11", y2: "11" }
+);
+
+lucide!(IconZoomOut, "zoom-out",
+    circle { cx: "11", cy: "11", r: "8" }
+    line { x1: "21", x2: "16.65", y1: "21", y2: "16.65" }
+    line { x1: "8", x2: "14", y1: "11", y2: "11" }
+);
+
+lucide!(IconFileDown, "file-down",
+    path { d: "M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" }
+    path { d: "M14 2v4a2 2 0 0 0 2 2h4" }
+    path { d: "M12 18v-6" }
+    path { d: "m9 15 3 3 3-3" }
+);
+
+lucide!(IconLoader2, "loader-2",
+    path { d: "M21 12a9 9 0 1 1-6.219-8.56" }
+);
+
+lucide!(IconMousePointer2, "mouse-pointer-2",
+    path { d: "M4.037 4.688a.495.495 0 0 1 .651-.651l16 6.5a.5.5 0 0 1-.063.947l-6.124 1.58a2 2 0 0 0-1.438 1.435l-1.579 6.126a.5.5 0 0 1-.947.063z" }
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +409,7 @@ mod tests {
         let _ = IconX as fn(IconXProps) -> Element;
         let _ = IconSearch as fn(IconSearchProps) -> Element;
         let _ = IconChevronRight as fn(IconChevronRightProps) -> Element;
+        let _ = IconChevronLeft as fn(IconChevronLeftProps) -> Element;
         let _ = IconPlus as fn(IconPlusProps) -> Element;
         let _ = IconMinus as fn(IconMinusProps) -> Element;
         let _ = IconSettings as fn(IconSettingsProps) -> Element;
@@ -341,5 +430,12 @@ mod tests {
         let _ = IconStop as fn(IconStopProps) -> Element;
         let _ = IconRefresh as fn(IconRefreshProps) -> Element;
         let _ = IconLayers as fn(IconLayersProps) -> Element;
+        let _ = IconInfo as fn(IconInfoProps) -> Element;
+        let _ = IconTriangleAlert as fn(IconTriangleAlertProps) -> Element;
+        let _ = IconZoomIn as fn(IconZoomInProps) -> Element;
+        let _ = IconZoomOut as fn(IconZoomOutProps) -> Element;
+        let _ = IconFileDown as fn(IconFileDownProps) -> Element;
+        let _ = IconLoader2 as fn(IconLoader2Props) -> Element;
+        let _ = IconMousePointer2 as fn(IconMousePointer2Props) -> Element;
     }
 }

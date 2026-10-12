@@ -28,5 +28,10 @@ dioxus = { version = "0.6", default-features = false, features = [
     "signals",
 ] }
 
+# 仅 toast 的自动消失计时器用（TS 侧是 `setTimeout`）。
+# 选它的原因：`Delay` 只是一个与执行器无关的 `Future`（自带计时线程），
+# 不引入 tokio/async-std 运行时，因此本 crate 仍然「不需要渲染器也能编译 + 测试」。
+futures-timer = "3"
+
 [dev-dependencies]
 dioxus-ssr = "0.6"

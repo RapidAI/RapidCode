@@ -73,3 +73,5 @@ packages/desktop/resources/macos-window-bounds/
 __pycache__/
 *.pyc
 .zcode-runtime
+# AI 助手在本地生成的工作区数据（对话记忆 / 任务清单），属于本机状态而非仓库源码。
+.workbuddy-ai/

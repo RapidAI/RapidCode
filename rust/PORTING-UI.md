@@ -5,21 +5,29 @@
 ## 1. 结论先行
 
 `packages/ui` 的 shadcn 风格原语组件（React + Radix + Tailwind）已经用
-**Rust + [Dioxus](https://dioxuslabs.com/) 0.6** 重写，落在 `rust/crates/zcode-ui`；
+**Rust + [Dioxus](https://dioxuslabs.com/) 0.6** 全量重写，落在 `rust/crates/zcode-ui`；
 在此之上又用移植出来的原语搭了一个**真能开窗口跑**的桌面应用 `rust/crates/zcode-app`。
 
-- **27 / 47** 个原语完成移植（`6,569` 行 Rust，含 147 个内联单测）；
+- **47 / 47** 个原语完成移植（`26,390` 行 Rust，含 **742** 个内联单测）；
 - **应用外壳**：侧栏 / 会话流 / 输入区 / 详情面板 / 设置对话框 / 组件画廊，
-  `2,719` 行 + `645` 行冒烟测试；
-- `cargo build` / `cargo test` **全绿**（工作区 **242** 个测试），
+  `2,719` 行 + `653` 行冒烟测试；
+- `cargo build` / `cargo test` **全绿**（工作区 **871** 个测试，零警告），
   且测试层**不需要 wasm、不需要窗口、不需要浏览器**；
 - 类名（`class`）输出与 TS 版本**逐字符对齐** —— 移植后仍复用 `packages/ui` 的
   同一套 Tailwind 样式与 `@custom-variant` 语义，不需要改一行 CSS。
 
+> **重型组件怎么落的**：`code-viewer` / `diff-viewer` / `pdf-viewer` /
+> `pptx-preview-viewer` / `chart` / `carousel` 这类组件背后是
+> `@pierre/diffs`、`react-pdf`、`pptx-renderer`、`recharts`、`embla` 等
+> **无法移植的 JS 引擎**。处理方式是**不 vendor 引擎、而是把引擎注入**：
+> 把可移植的部分（状态机、坐标换算、类名、渲染参数、缓存键）全部抽成
+> **纯函数**并完整测试，引擎本身由宿主以 `children` / 参数 / trait 的形式注入。
+> 详见 §4.4 与 §3.8。
+
 ```
 cargo run   -p zcode-app                  # 开一个 1360×860 的桌面窗口（默认 feature = desktop）
 cargo build -p zcode-ui                   # 纯组件模型，任意环境可编译
-cargo test  --workspace                   # 242 个测试，全部在 host 上跑
+cargo test  --workspace                   # 871 个测试，全部在 host 上跑
 cargo run   -p zcode-ui --example preview # 生成可直接打开的 preview.html
 ```
 
@@ -234,10 +242,48 @@ rsx! {
 | `Button` `asChild` | Radix `Slot` 把样式委托给子元素 | 未移植 | Dioxus 0.6 无对应原语；需要时改用 `button_classes()` 自行贴类名 |
 | `CollapsibleContent` / `AccordionContent` | `Presence`：关闭后**卸载** DOM | 保持挂载 + `hidden` | 子树状态（输入框内容、滚动位置）在反复折叠时不丢；代价是退场动画不播放 |
 | `ScrollArea` | Radix 的 JS 滚动条（`ResizeObserver` 测量 + 自绘 thumb） | 原生 `overflow-auto`，可选隐藏滚动条 | 桌面端原生滚动更顺、可访问性更好；自绘滚动条需要浏览器运行时，无头环境无法验证 |
-| 浮层定位 | Radix `Portal` + `@floating-ui`（碰撞检测 / 自动翻转） | 锚点包裹层 + `absolute` 类名 | 见 §4.3；不做碰撞检测，位置由调用方给的 `side` / `align` / `side_offset` 决定 |
+| 浮层定位 | Radix `Portal` + `@floating-ui`（碰撞检测 / 自动翻转） | 锚点包裹层 + `absolute` 类名 | 见 §4.5；不做碰撞检测，位置由调用方给的 `side` / `align` / `side_offset` 决定 |
 | `DropdownMenu` 高亮态 | Radix 内部 roving focus | 每项一个 `Signal<bool>` 写 `data-highlighted` | 只做 hover 高亮，不做键盘漫游（见 `dropdown_menu.rs` 模块文档） |
 | `Collapsible` / `Accordion` 的 `id` | `useId()` 自动生成，并自动接 `aria-controls` | 显式 prop，**不传则不发该属性** | Dioxus 0.6 没有「每实例稳定 id」原语；Trigger 与 Content 是两个组件，拿不到同一个 id。发 `id=""` 是无效 HTML，所以宁可整个不发 |
 | `InputGroupButton` | 委托给 `Button` | 渲染裸 `button` + `button_classes()` | 与 TS 一致（TS 里它就是 `<button className={button({...})}>`，不是 `<Button>`） |
+
+### 3.8 不 vendor 引擎，而是把引擎注入
+
+最后 9 个组件（`carousel` / `chart` / `code-viewer` / `diff-viewer` /
+`pdf-viewer` / `pptx-preview-viewer` / `lightweight-diff-preview` /
+`highlighted-lightweight-diff-preview` / `pptx-selection-action-bar`）
+全部卡在同一件事上：**它们背后是一个无法移植的 JS 引擎**。
+
+| 组件 | 背后的引擎 | 为什么不能移植 |
+| --- | --- | --- |
+| `diff-viewer` | `@pierre/diffs` | Shadow DOM 里自绘，无 Rust 等价物 |
+| `code-viewer` | `@pierre/diffs` + shiki | 同上；shiki 的 tokenizer 是 oniguruma WASM |
+| `pdf-viewer` | `react-pdf` / `pdf.js` | worker + canvas + 原生 PDF 解析 |
+| `pptx-preview-viewer` | `pptx-renderer` | 直接写 DOM 的 OOXML 渲染器 |
+| `chart` | `recharts` | 依赖真实 SVG 测量与响应式容器 |
+| `carousel` | `embla-carousel-react` | 依赖真实滚动吸附与手势测量 |
+
+面对这种情况有两条路：**vendor 一个 Rust 引擎**（等于换库重写，且质量不可控），
+或者**把引擎当外部依赖注入**。这里选后者，做法固定成三步：
+
+1. **抽出纯逻辑**：状态机（`CarouselState`）、坐标换算
+   （`pdf_zoom_overlay` 的锚点、`presentation_element_model` 的单元格矩形）、
+   缓存键（`create_code_viewer_file` 的 `cacheKey`）、
+   渲染参数（`DiffViewerRenderPlan` / `CodeViewerRenderOptions`）、
+   类名（全部 `*_classes()`）；
+2. **定义注入点**：能用 `children: Element` 就用它（`pdf-viewer` /
+   `pptx-preview-viewer` / `code-viewer` / `diff-viewer` 的画布），
+   需要「每项一份数据」时用参数（`thumbnails` / `PptxThumbnail::content_width`），
+   需要调用引擎时用 trait（`shiki_highlighter` 的 `ShikiLanguageCatalog` /
+   `CodeHighlighter`，因为 **Dioxus 的 props 需要 `PartialEq`，
+   而 `Rc<dyn Trait>` 不是 `PartialEq`**）；
+3. **把「不能移植」写进模块文档**：每个模块的「与 TS 的差异」一节都逐条列出
+   哪一段交给了宿主、为什么，以及 `unsafeCSS` / Shadow DOM 查询这类
+   DOM 层职责的归属。
+
+这样做的收益是**每个模块都仍然可以被完整测试** —— 纯函数层有单测，
+外壳层有 `dioxus-ssr` 快照，而引擎的缺席只影响「画面」，不影响「逻辑」。
+代价是宿主需要多写一点接线代码，这部分记在 §4.4 的「宿主职责」列里。
 
 ## 4. 已移植组件清单
 
@@ -282,18 +328,69 @@ rsx! {
 | `components/alert_dialog.rs` | `alert-dialog.tsx` | `AlertDialog` / `AlertDialogTrigger` / `AlertDialogPortal` / `AlertDialogOverlay` / `AlertDialogContent` / `AlertDialogAction` / `AlertDialogCancel` / `AlertDialogHeader` / `AlertDialogFooter` / `AlertDialogTitle` / `AlertDialogDescription` |
 | `components/dropdown_menu.rs` | `dropdown-menu.tsx` | `DropdownMenu` / `…Trigger` / `…Portal` / `…Content` / `…Group` / `…Item` / `…CheckboxItem` / `…RadioGroup` / `…RadioItem` / `…Label` / `…Separator` / `…Shortcut` / `…Sub` / `…SubTrigger` / `…SubContent`、`DropdownMenuItemVariant` |
 
-### 4.3 支撑模块
+### 4.3 第三批：展示 / 动画 / 组合类（11 个）
+
+| Rust 模块 | TSX 来源 | 导出 |
+| --- | --- | --- |
+| `components/brand.rs` | `ZCodeAboutLogo.tsx` | `ZCodeAboutLogo` / `ZCodeWordmarkLogo`、`ZCODE_LOGO_BASE` |
+| `components/glm_icon.rs` | `GlmMonochromeIcon.tsx` | `GlmMonochromeIcon`、`glm_monochrome_filter`、`GLM_FILTER_DARK` / `GLM_FILTER_LIGHT` |
+| `components/scroll_fade_viewport.rs` | `scroll-fade-viewport.tsx` | `ScrollFadeViewport`、`ScrollMaskState`、`scroll_mask_state` |
+| `components/toast.rs` | `toast.tsx` | `ToastProvider` / `ToastHost` / `ToastMessage` / `AnchoredToastStack`、`ToastStore`、`use_toast_store`、`toast` / `toast_with` / `update_toast` / `dismiss_toast`、`ToastPosition` / `ToastVariant`、`resolve_toast_stack_classes` |
+| `components/select.rs` | `select.tsx` | `Select` / `SelectTrigger` / `SelectValue` / `SelectContent` / `SelectGroup` / `SelectLabel` / `SelectItem` / `SelectRichItem` / `SelectSeparator` / `SelectScrollUpButton` / `SelectScrollDownButton`、`SelectNav` / `select_navigate`、`SelectTriggerVariant` / `SelectTriggerSize` / `SelectContentPosition` |
+| `components/command.rs` | `command.tsx` | `Command` / `CommandDialog` / `CommandInput` / `CommandList` / `CommandEmpty` / `CommandGroup` / `CommandItem` / `CommandSeparator` / `CommandShortcut`、`CommandNav` / `command_navigate`、`command_filter_matches` / `command_visible_indices` |
+| `components/context_menu.rs` | `context-menu.tsx` | `ContextMenu` / `ContextMenuTrigger` / `ContextMenuContent` / `ContextMenuItem` / `ContextMenuSeparator` / `ContextMenuSub` / `ContextMenuSubTrigger` / `ContextMenuSubContent`、`CursorPoint`、`ContextMenuItemVariant` |
+| `components/resizable.rs` | `resizable.tsx` | `ResizablePanelGroup` / `ResizablePanel` / `ResizableHandle`、`clamp_size` / `normalize_sizes` / `resize_pair`、`MemoryLayoutStore`、`ResizableOrientation`、`ArrowKey` / `key_to_arrow` / `arrow_to_delta` / `px_to_percent` |
+| `components/floating_particles.rs` | `floating-particles.tsx` | `FloatingParticles`、`particles` / `seeded_unit` / `lerp`、`particle_frame` / `particle_frame_draws` / `should_draw_frame`、`PARTICLE_CHANNEL_TIMES` |
+| `components/smooth_metric_value.rs` | `smooth-metric-value.tsx` | `SmoothMetricValue`、`SmoothMetricState`、`MetricValue`、`normalize_smooth_metric_target` / `normalize_smooth_metric_target_str` / `clamp_metric_speed` / `estimate_smooth_metric_lines_per_second` / `resolve_next_smooth_metric_display` |
+| `components/flip_metric_value.rs` | `flip-metric-value.tsx` | `FlipMetricValue`、`metric_characters` / `metric_slot_classes` / `uses_flip_slot` / `is_digit_character` / `character_width_class`、`FLIP_TRANSITION_DURATION_MS` / `FLIP_TRANSITION_EASE` |
+
+### 4.4 第四批：重型预览（注入式移植，9 个）
+
+这 9 个背后都是不可移植的 JS 引擎，按 §3.8 的三步落地。
+「宿主职责」列列出**没有**被移植、需要调用方接上的部分。
+
+| Rust 模块 | TSX 来源 | 导出 | 宿主职责 |
+| --- | --- | --- | --- |
+| `components/carousel.rs` | `carousel.tsx` | `Carousel` / `CarouselContent` / `CarouselItem` / `CarouselPrevious` / `CarouselNext`、`CarouselState`、`CarouselOrientation`、`resolve_carousel_key_action` | 替换 `embla` 的滚动吸附（`basis-full` 下 `CarouselState` 的索引机与 embla 等价） |
+| `components/chart.rs` | `chart.tsx` | `ChartContainer` / `ChartTooltipContent` / `ChartLegendContent`、`ChartConfig` / `ChartConfigItem`、`ChartPayloadObject`、`ChartIndicator`、`ChartValue` / `format_chart_value`、`build_chart_style` | 把配置交给 `recharts`；本模块只产出配置数据与类名 |
+| `components/code_viewer.rs` | `code-viewer.tsx` | `CodeViewer` / `CodeCommentAnnotation` / `CodeCommentDraft`、`CodeCommentLabels` / `CodeCommentRange` / `CodeCommentPreview`、`create_code_viewer_file` / `hash_code_viewer_content`、`build_line_annotations` / `build_selected_lines`、`code_viewer_marked_lines_css`、`code_viewer_style` | 渲染 `@pierre/diffs` 的 `<File>`（`children`）；Shadow DOM 内的行元素查询与 gutter 按钮 `title` 补丁；`installDocumentLinkSafety` |
+| `components/diff_viewer.rs` | `diff-viewer.tsx` | `DiffViewer`、`DiffViewerRenderPlan`、`DiffViewerOptions`、`DiffViewerInput` / `DiffViewerKind`、`DiffViewerSelectedLineRange` / `DiffViewerTheme`、`build_diff_viewer_render_plan` / `diff_viewer_worker_options` | 渲染 `<PatchDiff>` / `<MultiFileDiff>`（`children`） |
+| `components/pdf_viewer.rs` | `pdf-viewer.tsx` | `PdfViewer`、`PdfViewerSource` / `PdfViewerRangeSource`、`PdfViewerLabels`、`PdfViewerControlsState` / `build_pdf_viewer_controls`、`go_to_page` / `commit_page_input` / `resolve_pdf_viewer_key_action`、`PdfViewerWheelZoom`、`create_pdf_viewer_range_document_options` | 渲染 `<Document>` + `<Page>`（`children`）；`wheel` 的**非 passive** 原生监听；range 传输的 `requestRange` 回调 |
+| `components/pptx_preview_viewer.rs` | `pptx-preview-viewer.tsx` | `PptxPreviewViewer` / `PptxThumbnail`、`PptxPreviewViewerLabels`、`clamp_presentation_page_number` / `clamp_presentation_zoom_percent`、`pptx_main_scale`、`resolve_pptx_viewer_key_action`、`resolve_pptx_reference_navigation`、`suggested_pptx_pdf_name` | `pptxRendererPreviewEngine` 的 `open` / `renderPage` / `getPageElements`；缩略图列的 `IntersectionObserver` 懒渲染；缩略图宽度测量；导出 PDF 的 `printPageToPdf` / `saveFile` |
+| `components/lightweight_diff_preview.rs` | `lightweight-diff-preview.tsx` | `LightweightDiffPreview`、`LightweightDiffLineParts` / `get_lightweight_diff_line_parts`、`LightweightDiffLineStyles` / `get_lightweight_diff_line_styles`、`format_truncated_label` | 无需引擎（纯 DOM 渲染，本模块自己画） |
+| `components/highlighted_lightweight_diff_preview.rs` | `highlighted-lightweight-diff-preview.tsx` | `HighlightedLightweightDiffPreview`、`get_highlighted_lightweight_diff_line`、`build_highlighted_lightweight_diff_code`、`should_tokenize_highlighted_lightweight_diff`、`tokenize_highlighted_lightweight_diff` | 提供 `CodeHighlighter`（shiki）实现，见 `shiki_highlighter.rs` |
+| `components/pptx_selection_action_bar.rs` | `pptx-selection-action-bar.tsx` | `PptxSelectionActionBar`、`resolve_pptx_selection_escape`、`is_ime_composing_key_event`、`pptx_selection_resets_draft`、`pptx_selection_content_class` | 无需引擎（纯浮层） |
+
+> 这三个「无需引擎」的组件仍然被归在第四批，是因为它们和另外 6 个共享同一批
+> 支撑模块（`patch_diff_preview` / `shiki_highlighter` / `keyboard_shortcuts`），
+> 拆开列反而看不出依赖关系。
+
+### 4.5 支撑模块
 
 | Rust 模块 | 作用 |
 | --- | --- |
 | `icons.rs` | **内联 lucide 图标**，零图标库依赖。`lucide!` 宏把 `<svg>` 的公共属性（`viewBox` / `stroke` / `stroke-width` / `stroke-linecap` / `stroke-linejoin`）固化，手写几何；`data-slot` 默认取图标名（`plus` / `check` / `chevron-down`…），这样 TS 里 `**:data-[slot=accordion-trigger-icon]:size-4` 这类选择器能原样命中 |
 | `components/overlay.rs` | **浮层定位约定**。Radix 的 `Portal` + `@floating-ui` 在这里被替换成「锚点包裹层 + `absolute` 类名」：`Side`（Top/Right/Bottom/Left）、`Align`（Start/Center/End）、`side_align_classes(side, align, side_offset)` 生成形如 `absolute bottom-full left-1/2 -translate-x-1/2 mb-[4px]` 的类名，`OVERLAY_ANCHOR_BASE = "relative inline-flex"` 是锚点基准 |
 
+第四批还引入了 8 个**crate 根模块**，它们镜像的是 TS 的 `lib/*` 与
+`presentation/*`（纯逻辑，与具体组件解耦）：
+
+| Rust 模块 | TS 来源 | 作用 |
+| --- | --- | --- |
+| `code_preview_preferences.rs` | `lib/codePreviewPreferences.ts` | 代码主题白名单。明暗判定靠**白名单**不靠正则 —— `catppuccin-mocha` / `github-light-high-contrast` 这种名字里没有 `light`/`dark` 的主题正则猜不出来 |
+| `keyboard_shortcuts.rs` | `lib/keyboardShortcuts.ts` | 平台主修饰键（`⌘` / `Ctrl`）、`event.code` 回退（macOS 的 Option 会改写 `event.key`）、快捷键文案 |
+| `diffs_highlighter_engine.rs` | `lib/diffsHighlighterEngine.ts` | 高亮器配置。记录为什么选 oniguruma WASM 而不是 shiki-js：后者的巨型正则常驻 V8 **code space**（主窗口 + 4 个 diff worker 共享 256 MB），会 OOM |
+| `shiki_highlighter.rs` | `lib/shikiHighlighter.ts` | 语言归一化、token 缓存键、`create_raw_code_tokens`；引擎通过 `ShikiLanguageCatalog` / `CodeHighlighter` 两个 trait 注入 |
+| `patch_diff_preview.rs` | `lib/patchDiffPreview.ts` | 「这段 patch 能不能进富渲染器」的判定（行数 / 字符数 / hunk 行号上限 + lockfile 强制纯文本），以及纯文本回退的行收集 |
+| `pdf_zoom_overlay.rs` | `components/ui/usePdfZoomOverlay.ts` | PDF 缩放的数学：两套倍率（手势走 CSS transform、停顿后提交真实渲染）、指针锚点、滚轮指数缩放 |
+| `pdf_js_assets.rs` | `lib/pdfJsAssets.ts` | 算 `cMapUrl`。ReportLab 的 `STSong-Light` 等 Type0 字体只声明预定义 CMap、未内嵌字符映射，不给这个路径就是一片空白 |
+| `presentation_element_model.rs` | `presentation/presentationElementModel.ts` | PPTX 元素模型：节点树 → 可命中矩形表（含表格单元格的比例换算与合并单元格推进规则）+ 命中测试 |
+
 > **为什么 Dialog 不需要这套约定**：Dialog / AlertDialog 的内容用 `position: fixed`，
 > containing block 是**视口**而不是最近的定位祖先，所以没有 Portal 也能居中盖满整屏。
 > 只有相对锚点定位的浮层（Tooltip / HoverCard / Popover / DropdownMenu）才需要 §4.3 的约定。
 
-### 4.4 可运行的应用：`crates/zcode-app`
+### 4.6 可运行的应用：`crates/zcode-app`
 把移植出的原语拼成一个 ZCode 风格的外壳，用来证明「组件库真的能用」。
 
 | 文件 | 内容 |
@@ -309,7 +406,7 @@ rsx! {
 | `src/views/settings.rs` | 设置 `Dialog`（常规/外观/关于 三个 `Tabs`）+ 删除确认 `AlertDialog` |
 | `src/views/gallery.rs` | 组件画廊 `Dialog`，六个分页把所有原语和变体都渲染一遍 |
 
-### 4.5 整屏静态快照
+### 4.7 整屏静态快照
 
 ```bash
 cargo run -p zcode-app --example app_preview    # → ./app-preview.html（自包含，206 KB）
@@ -323,7 +420,7 @@ cargo run -p zcode-app --example app_preview    # → ./app-preview.html（自�
 > 渲染的是 `AppShell` 而不是 `App` —— `App` 用 `document::Style` 注入样式，
 > 而那需要真实渲染器，SSR 下没有实现（这也是两者被拆开的原因）。
 
-### 4.6 样式表怎么来的
+### 4.8 样式表怎么来的
 
 仓库里**没有** Tailwind 安装，`packages/ui` 的样式来自 `shadcn/tailwind.css`
 （一个不在本仓库的依赖）。所以 `rust/.tailwind-build/build.sh` 手工拼了一份入口 CSS：
@@ -338,7 +435,7 @@ cargo run -p zcode-app --example app_preview    # → ./app-preview.html（自�
 5. 用 `sed` 从 `packages/ui/src/styles.css` 里抠出 `@theme { … }` 与 `.dark { … }` 两块原样粘贴。
 
 ```bash
-cd rust/.tailwind-build && ./build.sh   # → rust/crates/zcode-app/assets/app.css（93,588 字节）
+cd rust/.tailwind-build && ./build.sh   # → rust/crates/zcode-app/assets/app.css（116,737 字节）
 ```
 
 > ⚠️ Tailwind v4 会**按需裁剪** `@theme`：只有被实际用到的令牌才会作为 CSS 变量输出。
@@ -351,9 +448,9 @@ cd rust/.tailwind-build && ./build.sh   # → rust/crates/zcode-app/assets/app.c
 
 | 层 | 文件 | 数量 | 断言粒度 |
 | --- | --- | --- | --- |
-| 类名纯函数单测 | `zcode-ui/src/**` 内联 `#[cfg(test)]` | 147 | 字符串包含 / 相等 |
+| 纯函数单测 | `zcode-ui/src/**` 内联 `#[cfg(test)]` | 742 | 字符串包含 / 相等 / 数值 |
 | mutation 记录式渲染 | `zcode-ui/tests/render.rs` | 11 | 区分静态属性 / 动态属性 / 文本节点 |
-| HTML 快照 | `zcode-ui/tests/html_snapshot.rs` | 41 | 序列化后的 HTML 字符串 |
+| HTML 快照 | `zcode-ui/tests/html_snapshot.rs` | 75 | 序列化后的 HTML 字符串 |
 | 整树冒烟 | `zcode-app/tests/smoke.rs` | 17 | 把整个应用（含浮层）真渲染一遍 |
 
 各 crate 明细：
@@ -362,16 +459,30 @@ cd rust/.tailwind-build && ./build.sh   # → rust/crates/zcode-app/assets/app.c
 | --- | --- | --- | --- |
 | `zcode-rpc` | 10 | — | 10 |
 | `zcode-shared` | 14 | — | 14 |
-| `zcode-ui` | 147 | 41 + 11 | 199 |
+| `zcode-ui` | 742 | 75 + 11 | 828 |
 | `zcode-app` | 2 | 17 | 19 |
-| **合计** | **173** | **69** | **242** |
+| **合计** | **768** | **103** | **871** |
 
-### 5.1 类名纯函数单测（147 个）
+### 5.1 纯函数单测（742 个）
 
 `*_classes()` 与 `cn()` 的直接断言。覆盖 variant/size 映射、用户 class 覆盖
 组件默认、`text-ui-*` 与文字颜色不互相覆盖、方括号修饰符切分、
 `ring` 宽度 vs 颜色、`shadow` 尺寸 vs 颜色、负向定位前缀
 （`-translate-x-1/2` / `-inset-x-1` 的 tailwind-merge 分组）等。
+
+第四批之后这一层扩大到**所有被抽出来的纯逻辑**，包括：
+
+- **几何**：`pdf_zoom_overlay` 的锚点捕获/还原（指针在容器外要先夹进容器再算比例）、
+  `presentation_element_model` 的表格单元格矩形与合并单元格的**不对称推进**
+  （纵向续格推进列号、横向续格不推进）；
+- **坐标系换算**：`code_viewer` 的「文件行号 ↔ 选中行 ↔ 注释锚点」三套坐标；
+- **JS 数值语义**：`Math.round` 半数向 `+∞`（与 Rust 的 `f64::round` 不同）、
+  `Number.parseInt` 的前缀解析、`JSON.stringify` 的转义、
+  `Number.prototype.toString(36)`、`Math.max(0, NaN) = NaN` 的传染性；
+- **UTF-16 而非 `char`**：`hash_code_viewer_content` 的 djb2 与 `code.length`
+  都按 **UTF-16 码元**走，否则非 BMP 字符算出的 `cacheKey` 与 TS 不一致；
+- **`Array.prototype.join` 把 `null` 变成 `""`**：`chart.rs` 里
+  「主题没有颜色时输出一行空白」是**上游行为**，被单独钉成一条测试。
 
 ### 5.2 mutation 记录式渲染（11 个）
 
@@ -396,7 +507,7 @@ vdom.rebuild(&mut rec);          // ← 不能是 rebuild_in_place()，见下
 SVG 命名空间与 `viewBox` / `stroke-*`、`Progress` 的宽度与分段 `flex-basis`、
 文本节点透传、受控 prop 在 DOM 上的反映。
 
-### 5.3 HTML 快照（41 个）
+### 5.3 HTML 快照（75 个）
 
 `dioxus-ssr`（**仅 dev-dependency**，库本身不依赖它）把组件序列化成
 浏览器会看到的 HTML，断言读起来跟看页面一样，适合做回归快照：
@@ -471,55 +582,58 @@ cargo run -p zcode-app            # 保持运行
 
 > ⚠️ `MainWindowTitle` 首次读可能是空串（.NET 侧缓存），`$p.Refresh()` 之后才对。
 
-## 6. 未移植组件与原因
+## 6. 曾经的未移植清单与最终归宿
 
-`packages/ui/src/components/ui` 下还有 **20 / 47** 个 TSX 未移植，分三类：
+**结论：`packages/ui/src/components/ui` 下 47 / 47 个 TSX 全部已移植，未移植 0 个。**
 
-**(a) 浮层类（需要焦点陷阱 / 键盘导航）** —— 4 个
-`context-menu` / `select` / `command` / `toast`。
+下面这张表保留历史记录 —— 这些组件一度被判定为「不可能移植」，后来各自用
+不同的方式落地了。保留它的价值在于：如果你要移植 `packages/ui` 之外的业务
+组件，会再次遇到同样的三类问题，这里的解法可以直接复用。
 
-`dialog` / `alert-dialog` / `popover` / `hover-card` / `tooltip` / `dropdown-menu`
-已经在第二批里用 §4.3 的「锚点包裹层 + `absolute`」约定做掉了，证明这层不需要
-Portal 也能落地。剩下的 4 个卡在别处：
+| 曾经的分类 | 当时的判断 | 最终解法 | 对应章节 |
+| --- | --- | --- | --- |
+| **(a) 浮层类** 4 个：`context-menu` / `select` / `command` / `toast` | Radix 的 roving focus、Portal、全局队列都没有 Rust 等价物 | 拆成「纯状态机 + 宿主渲染」：roving focus 变成 `resolve_*_key_action` 纯函数，Portal 变成「锚点包裹层 + `absolute`」，`toast` 队列变成 `Vec<ToastItem>` + `futures-timer::Delay` | §4.2 / §4.3 |
+| **(b) 需要浏览器运行时** 10 个：`carousel` / `resizable` / `chart` / `code-viewer` / `diff-viewer` / `pdf-viewer` / `pptx-preview-viewer` / `floating-particles` / `smooth-metric-value` / `flip-metric-value` | 「换一个 Rust 库」而不是「移植 TSX」，宿主无 wasm / 无浏览器时无法验证 | **不 vendor 引擎，而是把引擎注入**（§3.8）：抽出全部纯逻辑并加单测，引擎经 `children` / trait / 回调注入 | §3.8 / §4.4 |
+| **(c) 组合型 / 装饰型** 6 个：`scroll-fade-viewport` / `lightweight-diff-preview` / `highlighted-lightweight-diff-preview` / `pptx-selection-action-bar` / `ZCodeAboutLogo` / `GlmMonochromeIcon` | 依赖 (a) 或 (b) 的产出，属于收尾 | 先做 (a)(b) 的公共件，再拼装 | §4.3 / §4.4 |
 
-- `select` / `command` 需要**键盘漫游 + 列表虚拟化 + 输入过滤**，
-  Radix 的 roving focus 没有 Rust 等价物；
-- `context-menu` 需要**光标坐标**定位（我们的约定是「相对锚点」，而右键菜单
-  的锚点就是鼠标位置），要额外一套 `position: fixed` + clientX/clientY 的路径；
-- `toast` 需要**全局队列 + 自动消失计时器**，属于运行时服务而不是纯组件。
+> `scroll-area` 也曾在 (b) 类（Radix 用 `ResizeObserver` 自绘滚动条），
+> 第二批改用原生滚动绕开了（见 §3.7），所以提前从清单里划掉。
+> `button-group` / `input-group` / `radio-group` / `collapsible` / `accordion`
+> 曾在 (c) 类，第二批已完成。
 
-**(b) 需要浏览器运行时能力** —— 10 个
-`carousel`（滚动吸附 + 手势）、`resizable`（Pointer Events）、
-`chart`（canvas/SVG 绘制）、`code-viewer` / `diff-viewer` / `pdf-viewer` /
-`pptx-preview-viewer`（重型渲染器）、
-`floating-particles` / `smooth-metric-value` / `flip-metric-value`
-（`requestAnimationFrame` 动画）。
-
-> `scroll-area` 本来也在这类（Radix 用 `ResizeObserver` 自绘滚动条），
-> 第二批改用原生滚动绕开了（见 §3.7），所以从清单里划掉。
-
-**(c) 组合型 / 装饰型** —— 6 个
-`scroll-fade-viewport` / `lightweight-diff-preview` /
-`highlighted-lightweight-diff-preview` / `pptx-selection-action-bar` /
-`ZCodeAboutLogo` / `GlmMonochromeIcon`。
-
-`button-group` / `input-group` / `radio-group` / `collapsible` / `accordion`
-原先也在这类，第二批已完成。
+**这套解法的可复用结论**：判断一个组件「能不能移植」，问的不是「它用了什么
+浏览器 API」，而是「**它的纯逻辑边界在哪里**」。把 `Math` / 坐标 / 键盘 /
+格式化规则抽出来之后，剩下真正必须留在浏览器里的部分，往往只有一个
+`<canvas>` 或一个第三方库的实例 —— 而那部分本来也不该由 UI 库负责。
 
 ## 7. 剩余工作
 
-1. **浮层定位的第二步**：给 `overlay.rs` 补 `position: fixed` + 光标坐标的路径，
-   用来接 `context-menu`；再补碰撞检测（视口边缘自动翻转），
-   这一步做完 `select` 之外的浮层就齐了；
-2. **键盘导航**：给 `DropdownMenu` 补 roving focus（当前只有 hover 高亮），
-   这是 `select` / `command` 的前置；
-3. **`toast` 的运行时服务**：需要一个挂在 `AppShell` 顶层的队列 + 定时器；
-4. **重型渲染器**（`code-viewer` / `diff-viewer` / `pdf-viewer`）建议独立评估，
-   它们是「换一个 Rust 库」而不是「移植 TSX」；
-5. 把 `packages/ui/src/styles.css` 的 `@theme` 令牌导出成 Rust 常量，
-   让颜色/间距不再只存在于 CSS 里（当前 CSS 仍是唯一真源，组件只负责类名）；
-6. 补上 `--color-muted` / `--color-ring` / `--color-secondary-foreground`
-   的权威取值 —— 它们由 `shadcn/tailwind.css` 提供，而该文件不在本仓库中，
-   预览页目前用的是等价回退值；
-7. `packages/ui` 里 **`components/` 下非 `ui/` 的组合型业务组件**
-   （工作流时间线、文件树、diff 面板等）还没建立移植清单。
+47 个 `ui/` 组件的移植已经收敛，下面是**尚未完成、但已明确**的事项，
+按「是否阻塞使用」排序：
+
+**A. 影响预览页观感（不阻塞编译 / 测试）**
+
+1. **补上 `--color-muted` / `--color-ring` / `--color-secondary-foreground`
+   的权威取值** —— 它们由 `shadcn/tailwind.css` 提供，而该文件不在本仓库中。
+   预览页目前用的是等价回退值（见 §4.8），视觉上与上游可能有细微色差。
+   拿到该文件后重新生成 `app.css` 即可。
+2. **把 `packages/ui/src/styles.css` 的 `@theme` 令牌导出成 Rust 常量** ——
+   当前 CSS 仍是颜色 / 间距的唯一真源，组件只负责拼类名。如果将来需要
+   在 Rust 侧读色值（例如给 `chart` 传主题色），需要一层导出。
+
+**B. 宿主接线（组件已就绪，等真实宿主）**
+
+3. **`overlay.rs` 的碰撞检测**：当前浮层定位是「相对锚点 + `absolute`」，
+   视口边缘不会自动翻转。`context-menu` 的 `position: fixed` + 光标坐标
+   路径已在 §4.2 落地，但边缘翻转还没做。
+4. **重型预览的引擎注入**：`code-viewer` / `diff-viewer` / `pdf-viewer` /
+   `pptx-preview-viewer` / `chart` / `carousel` 的 Rust 壳已全部完成且带单测，
+   但宿主需要按 §4.4 的「宿主职责」列自行接上 `@pierre/diffs` / `pdf.js` /
+   `pptx-renderer` / `recharts` / shiki 的等价物。这一步是**宿主应用**的工作，
+   不是 UI 库的。
+
+**C. 范围之外**
+
+5. **`packages/ui` 中 `components/` 下非 `ui/` 的组合型业务组件**
+   （工作流时间线、文件树、diff 面板等）还没建立移植清单 ——
+   它们不属于本次「UI primitives 移植」的范围，需要单独盘点。

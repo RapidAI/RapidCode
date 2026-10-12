@@ -4,7 +4,7 @@
 分三批推进：
 
 1. **核心逻辑层**（`packages/rpc` + `packages/shared`）—— 见 **[PORTING.md](./PORTING.md)**
-2. **UI 层**（`packages/ui` 的 shadcn 风格原语，27 / 47）—— 见 **[PORTING-UI.md](./PORTING-UI.md)**
+2. **UI 层**（`packages/ui` 的 shadcn 风格原语，**47 / 47**）—— 见 **[PORTING-UI.md](./PORTING-UI.md)**
 3. **可运行的应用**（`crates/zcode-app`）—— 用移植出的原语拼出的 ZCode 风格桌面外壳
 
 目标是：把项目的核心逻辑与 UI 用 Rust 重写，并保证 **可编译、可测试、能跑起来**。
@@ -14,7 +14,7 @@
 ```bash
 cd rust
 cargo build                          # 编译整个工作区
-cargo test                           # 运行全部测试（242 个）
+cargo test                           # 运行全部测试（871 个）
 cargo run -p zcode-app               # 开一个 1360×860 的桌面窗口
 cargo build --release
 
@@ -67,18 +67,32 @@ rust/
     │   ├── src/
     │   │   ├── cn.rs                     类名合并（clsx + tailwind-merge 子集）
     │   │   ├── icons.rs                  内联 lucide 图标（零图标库依赖）
-    │   │   └── components/               27 个 shadcn 风格原语 + overlay.rs 定位约定
+    │   │   ├── code_preview_preferences.rs  代码预览主题白名单
+    │   │   ├── keyboard_shortcuts.rs     快捷键平台判定（mac / 非 mac）
+    │   │   ├── presentation_element_model.rs  PPTX 元素命中测试模型
+    │   │   ├── patch_diff_preview.rs     diff 预览的纯数据层
+    │   │   ├── shiki_highlighter.rs      shiki 的 trait 抽象
+    │   │   ├── pdf_js_assets.rs          pdf.js 资源路径解析
+    │   │   ├── pdf_zoom_overlay.rs       缩放浮层的双缓冲状态
+    │   │   ├── diffs_highlighter_engine.rs  高亮引擎的纯决策层
+    │   │   └── components/               47 个 shadcn 风格原语 + overlay.rs 定位约定
     │   │       ├── 基础     button  badge  card  alert  input  textarea  label
     │   │       │            separator  progress  kbd  spinner  avatar  switch  checkbox  tabs
     │   │       ├── 折叠类   collapsible  accordion
     │   │       ├── 组合型   radio_group  button_group  input_group  scroll_area
-    │   │       └── 浮层类   tooltip  hover_card  popover  dialog  alert_dialog  dropdown_menu
+    │   │       ├── 浮层类   tooltip  hover_card  popover  dialog  alert_dialog  dropdown_menu
+    │   │       ├── 展示/动画 brand  glm_icon  scroll_fade_viewport  toast  select  command
+    │   │       │            context_menu  resizable  floating_particles
+    │   │       │            smooth_metric_value  flip_metric_value
+    │   │       └── 重型预览 carousel  chart  code_viewer  diff_viewer  pdf_viewer
+    │   │                    pptx_preview_viewer  lightweight_diff_preview
+    │   │                    highlighted_lightweight_diff_preview  pptx_selection_action_bar
     │   ├── tests/
     │   │   ├── render.rs                 mutation 记录式渲染测试（11）
-    │   │   └── html_snapshot.rs          dioxus-ssr HTML 快照测试（41）
+    │   │   └── html_snapshot.rs          dioxus-ssr HTML 快照测试（75）
     │   └── examples/preview.rs           预览页生成器
     └── zcode-app/                  # 可运行的桌面应用（用上面两个 crate 拼出来）
-        ├── assets/app.css                由 .tailwind-build/build.sh 生成（93,588 字节）
+        ├── assets/app.css                由 .tailwind-build/build.sh 生成（116,737 字节）
         ├── src/
         │   ├── lib.rs                    App / AppShell，内嵌样式表
         │   ├── main.rs                   桌面入口（LaunchBuilder::desktop）
@@ -116,8 +130,8 @@ rust/
 ## 测试
 
 ```
-cargo test                 # 工作区 242 个测试
-cargo test -p zcode-ui     # UI 层 199 个测试
+cargo test                 # 工作区 871 个测试
+cargo test -p zcode-ui     # UI 层 828 个测试
 cargo test -p zcode-app    # 应用层 19 个测试
 ```
 
@@ -125,14 +139,14 @@ cargo test -p zcode-app    # 应用层 19 个测试
 | --- | --- | --- | --- |
 | `zcode-rpc` | 10 | — | 10 |
 | `zcode-shared` | 14 | — | 14 |
-| `zcode-ui` | 147 | 41 + 11 | 199 |
+| `zcode-ui` | 742 | 75 + 11 | 828 |
 | `zcode-app` | 2 | 17 | 19 |
-| **合计** | **173** | **69** | **242** |
+| **合计** | **768** | **103** | **871** |
 
 - **逻辑层**：VQL 序列化往返、嵌套 `Uint8Array` 的 JSON 回退、Base64、
   事件缓冲、基于内存队列（`create_queue_pair`）的端到端 RPC 调用 / 事件订阅。
-- **UI 层**：类名纯函数断言（147）、mutation 记录式渲染（11）、
-  `dioxus-ssr` HTML 快照（41）—— 全部不需要 wasm / 窗口 / 浏览器。
+- **UI 层**：类名 / 几何 / 键盘 / 格式化的纯函数断言（742）、mutation 记录式
+  渲染（11）、`dioxus-ssr` HTML 快照（75）—— 全部不需要 wasm / 窗口 / 浏览器。
 - **应用层**：整棵应用树（含三个浮层）真渲染一遍，断言区域文案、
   `data-slot` 锚点、`data-*` 语义属性、浮层默认关闭、内嵌样式表覆盖到了
   所需的 `@custom-variant` 与设计令牌。

@@ -23,8 +23,21 @@ pub fn Textarea(
     #[props(default)] rows: Option<i64>,
     /// 覆盖 `data-slot`（`InputGroupTextarea` 需要 `input-group-control`）。
     #[props(default = "textarea")] slot: &'static str,
+    /// 透传 `aria-label`（占位文案与无障碍标签分离时使用）。
+    #[props(default)] aria_label: Option<String>,
+    /// 挂载后自动聚焦（对应原生 `autoFocus`）。
+    #[props(default)] autofocus: bool,
     #[props(default)] oninput: EventHandler<FormEvent>,
     #[props(default)] onchange: EventHandler<FormEvent>,
+    /// 输入法合成开始 / 结束。
+    ///
+    /// TS 侧用它们维护一个 `compositionActiveRef`，因为部分平台在 `keydown`
+    /// 上把 `isComposing` 提前置回 `false`（见 `PptxSelectionActionBar` 的
+    /// Esc 处理）。Dioxus 的 `textarea` 支持这两个原生事件，这里直接透传。
+    #[props(default)] oncompositionstart: EventHandler<Event<CompositionData>>,
+    #[props(default)] oncompositionend: EventHandler<Event<CompositionData>>,
+    /// `keydown`。`CodeViewer` 的评论草稿需要在这里处理「提交 / 取消」快捷键。
+    #[props(default)] onkeydown: EventHandler<KeyboardEvent>,
 ) -> Element {
     rsx! {
         textarea {
@@ -34,8 +47,13 @@ pub fn Textarea(
             placeholder: placeholder,
             disabled: disabled,
             rows: rows,
+            "aria-label": aria_label,
+            autofocus,
             oninput: move |e| oninput.call(e),
             onchange: move |e| onchange.call(e),
+            oncompositionstart: move |e| oncompositionstart.call(e),
+            oncompositionend: move |e| oncompositionend.call(e),
+            onkeydown: move |e| onkeydown.call(e),
         }
     }
 }
