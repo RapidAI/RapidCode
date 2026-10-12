@@ -19,7 +19,8 @@ cargo run -p zcode-app               # 开一个 1360×860 的桌面窗口
 cargo build --release
 
 # UI 预览（生成一份可直接在浏览器打开的 HTML）
-cargo run -p zcode-ui --example preview   # → ./preview.html
+cargo run -p zcode-ui --example preview       # → ./preview.html      （原语清单）
+cargo run -p zcode-app --example app_preview  # → ./app-preview.html  （应用整屏静态快照）
 ```
 
 > `zcode-rpc` / `zcode-shared` **零外部依赖**（只用 `std`），离线也能编译。
@@ -34,8 +35,9 @@ rust/
 ├── Cargo.toml                      # workspace 根
 ├── PORTING.md                      # 逻辑层移植说明
 ├── PORTING-UI.md                   # UI 层移植说明
-├── preview.html                    # 预览页（由 example 生成）
-├── .tailwind-build/                # 从仓库的 @theme 令牌生成 app.css（见 PORTING-UI.md §4.5）
+├── preview.html                    # 原语清单预览页（由 zcode-ui 的 example 生成）
+├── app-preview.html                # 应用整屏静态快照（由 zcode-app 的 example 生成，自包含）
+├── .tailwind-build/                # 从仓库的 @theme 令牌生成 app.css（见 PORTING-UI.md §4.6）
 └── crates/
     ├── zcode-rpc/                  # 核心：VS Code 风格 IPC/RPC 框架（完整移植）
     │   └── src/
@@ -83,6 +85,7 @@ rust/
         │   ├── state.rs                  AppState / AppCtx / demo_state
         │   └── views/                    sidebar / topbar / conversation / composer
         │                                 detail / settings / gallery
+        ├── examples/app_preview.rs       整屏静态快照生成器（自包含 HTML）
         └── tests/smoke.rs                整树冒烟测试（17）
 ```
 

@@ -309,7 +309,21 @@ rsx! {
 | `src/views/settings.rs` | 设置 `Dialog`（常规/外观/关于 三个 `Tabs`）+ 删除确认 `AlertDialog` |
 | `src/views/gallery.rs` | 组件画廊 `Dialog`，六个分页把所有原语和变体都渲染一遍 |
 
-### 4.5 样式表怎么来的
+### 4.5 整屏静态快照
+
+```bash
+cargo run -p zcode-app --example app_preview    # → ./app-preview.html（自包含，206 KB）
+```
+
+把 [`AppShell`] 用 `dioxus-ssr` 渲染成 HTML，再把 `APP_CSS` 原样包进 `<style>`，
+产出一个**单文件、无外部依赖**的页面（不需要 CDN / 本地服务 / wasm）。
+它和 `cargo run -p zcode-app` 开原生窗口是两条独立的验证路径：
+前者能进 CI、能被 diff，后者才证明窗口真的能开。
+
+> 渲染的是 `AppShell` 而不是 `App` —— `App` 用 `document::Style` 注入样式，
+> 而那需要真实渲染器，SSR 下没有实现（这也是两者被拆开的原因）。
+
+### 4.6 样式表怎么来的
 
 仓库里**没有** Tailwind 安装，`packages/ui` 的样式来自 `shadcn/tailwind.css`
 （一个不在本仓库的依赖）。所以 `rust/.tailwind-build/build.sh` 手工拼了一份入口 CSS：
