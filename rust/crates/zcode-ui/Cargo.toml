@@ -1,0 +1,32 @@
+[package]
+name = "zcode-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ZCode UI 原语组件库（Rust + Dioxus 移植自 packages/ui）"
+
+[lib]
+name = "zcode_ui"
+path = "src/lib.rs"
+
+[features]
+default = []
+# 真机上挂载用（可选）。默认关闭，使本 crate 在**任何**环境都能离线编译 + 测试：
+# 没有渲染器就没有 wasm / 窗口 / 图形栈依赖。
+# 用法：`cargo build -p zcode-ui --features web`
+web = ["dioxus/web"]
+
+[dependencies]
+# Dioxus 0.6 —— React 的 Rust 等价物：RSX ≈ JSX，#[component] ≈ 函数组件，
+# use_signal ≈ useState，use_context(_provider) ≈ useContext/Provider。
+# 默认关闭渲染器，只保留组件模型（core/hooks/html/macro/signals）。
+dioxus = { version = "0.6", default-features = false, features = [
+    "macro",
+    "hooks",
+    "html",
+    "signals",
+] }
+
+[dev-dependencies]
+dioxus-ssr = "0.6"
