@@ -21,13 +21,15 @@ pub fn Textarea(
     #[props(default)] placeholder: Option<String>,
     #[props(default)] disabled: bool,
     #[props(default)] rows: Option<i64>,
+    /// 覆盖 `data-slot`（`InputGroupTextarea` 需要 `input-group-control`）。
+    #[props(default = "textarea")] slot: &'static str,
     #[props(default)] oninput: EventHandler<FormEvent>,
     #[props(default)] onchange: EventHandler<FormEvent>,
 ) -> Element {
     rsx! {
         textarea {
             class: textarea_classes(&class),
-            "data-slot": "textarea",
+            "data-slot": slot,
             value: value,
             placeholder: placeholder,
             disabled: disabled,

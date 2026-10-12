@@ -142,7 +142,8 @@ TS 的 `TContext` 泛型在 Rust 侧统一用 `Value` 承载（上下文本身�
 ```bash
 cd rust
 cargo build                              # 编译整个工作区
-cargo test                               # 工作区 123 个测试
+cargo test                               # 工作区 242 个测试
+cargo run -p zcode-app                   # 开桌面窗口（UI 层见 PORTING-UI.md）
 cargo run -p zcode-ui --example preview  # 生成 UI 预览页 ./preview.html
 cargo build --release
 ```
@@ -177,8 +178,9 @@ cargo build --release
 2. **`packages/rpc` 的补充**：真实 `Socket` 实现（TCP / WebSocket）、  
    `MessagePortLike` 的 Electron/浏览器绑定、与 `packages/provider*` 的对接。
 3. **UI 层继续推进**（见 [PORTING-UI.md](./PORTING-UI.md) §6/§7）：  
-   先补 **Portal + 浮层定位** 基础设施，再批量移植 dialog / popover / tooltip /  
-   dropdown-menu / select / command / toast 等 32 个尚未移植的原语。
+   已完成 27 / 47 个原语，并拼出了可运行的 `zcode-app`；剩余 20 个里优先做  
+   **浮层定位第二步**（`position: fixed` + 光标坐标 → 接 `context-menu`）与  
+   **键盘漫游**（`select` / `command` 的前置），再处理 toast 与重型渲染器。
 4. **服务层核心逻辑**（`packages/services`，224k 行）：按领域切分，优先迁移  
    纯计算/状态机模块；I/O 与第三方 SDK 调用保留边界。
 5. **不可移植部分**：桌面/浏览器外壳（Electron / Vite / Node 主进程）不迁移；

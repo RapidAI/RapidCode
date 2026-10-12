@@ -44,20 +44,36 @@
 pub mod cn;
 /// shadcn 风格原语组件。
 pub mod components;
+/// lucide 图标的内联 SVG 移植（零额外依赖）。
+pub mod icons;
 
 pub use cn::{cn, cn_opt};
+pub use components::accordion::*;
 pub use components::alert::*;
+pub use components::alert_dialog::*;
 pub use components::avatar::*;
 pub use components::badge::*;
 pub use components::button::*;
+pub use components::button_group::*;
 pub use components::card::*;
 pub use components::checkbox::*;
+pub use components::collapsible::*;
+pub use components::dialog::*;
+pub use components::dropdown_menu::*;
+pub use components::hover_card::*;
 pub use components::input::*;
+pub use components::input_group::*;
 pub use components::kbd::*;
 pub use components::label::*;
+pub use components::overlay::{Align, Side};
+pub use components::popover::*;
 pub use components::progress::*;
+pub use components::radio_group::*;
+pub use components::scroll_area::*;
 pub use components::separator::*;
 pub use components::spinner::*;
 pub use components::switch::*;
 pub use components::tabs::*;
 pub use components::textarea::*;
+pub use components::tooltip::*;
+pub use icons::*;

@@ -5,20 +5,26 @@
 ## 1. 结论先行
 
 `packages/ui` 的 shadcn 风格原语组件（React + Radix + Tailwind）已经用
-**Rust + [Dioxus](https://dioxuslabs.com/) 0.6** 重写，落在 `rust/crates/zcode-ui`。
+**Rust + [Dioxus](https://dioxuslabs.com/) 0.6** 重写，落在 `rust/crates/zcode-ui`；
+在此之上又用移植出来的原语搭了一个**真能开窗口跑**的桌面应用 `rust/crates/zcode-app`。
 
-- **15 / 47** 个原语完成移植：`748` 行 TSX → `2,459` 行 Rust（含 65 个内联单测）
-  + `984` 行集成测试 + `1,007` 行预览生成器；
-- `cargo build` / `cargo test` **全绿**（工作区 123 个测试），且**不需要 wasm、不需要窗口、不需要浏览器**；
+- **27 / 47** 个原语完成移植（`6,569` 行 Rust，含 147 个内联单测）；
+- **应用外壳**：侧栏 / 会话流 / 输入区 / 详情面板 / 设置对话框 / 组件画廊，
+  `2,719` 行 + `645` 行冒烟测试；
+- `cargo build` / `cargo test` **全绿**（工作区 **242** 个测试），
+  且测试层**不需要 wasm、不需要窗口、不需要浏览器**；
 - 类名（`class`）输出与 TS 版本**逐字符对齐** —— 移植后仍复用 `packages/ui` 的
   同一套 Tailwind 样式与 `@custom-variant` 语义，不需要改一行 CSS。
 
 ```
-cargo build -p zcode-ui                  # 纯组件模型，任意环境可编译
-cargo test  -p zcode-ui                  # 65 单元 + 23 HTML 快照 + 11 mutation 记录 = 99 个测试
+cargo run   -p zcode-app                  # 开一个 1360×860 的桌面窗口（默认 feature = desktop）
+cargo build -p zcode-ui                   # 纯组件模型，任意环境可编译
+cargo test  --workspace                   # 242 个测试，全部在 host 上跑
 cargo run   -p zcode-ui --example preview # 生成可直接打开的 preview.html
-cargo build -p zcode-ui --features web    # 额外挂上 dioxus-web 渲染器（真机用）
 ```
+
+> 「能正常运行」的判定方式见 §5.5：除编译与测试外，还核对了进程存活、
+> 窗口句柄非零、`MainWindowTitle` 与 `WindowBuilder` 一致、`Responding=True`。
 
 ## 2. 为什么选 Dioxus
 
@@ -226,6 +232,12 @@ rsx! {
 | `Checkbox` 指示器 | 非 unchecked 才挂载 | 始终挂载，靠类名显隐 | TS 里本来就有 `[&[data-state=indeterminate]_…]:hidden` 规则，语义等价且省一次挂载 |
 | `Spinner` 文案 | `useZCodeIntl()` 取 `common.loading` | `label` prop（默认 `"Loading"`） | 不把 i18n 运行时依赖拖进组件库 |
 | `Button` `asChild` | Radix `Slot` 把样式委托给子元素 | 未移植 | Dioxus 0.6 无对应原语；需要时改用 `button_classes()` 自行贴类名 |
+| `CollapsibleContent` / `AccordionContent` | `Presence`：关闭后**卸载** DOM | 保持挂载 + `hidden` | 子树状态（输入框内容、滚动位置）在反复折叠时不丢；代价是退场动画不播放 |
+| `ScrollArea` | Radix 的 JS 滚动条（`ResizeObserver` 测量 + 自绘 thumb） | 原生 `overflow-auto`，可选隐藏滚动条 | 桌面端原生滚动更顺、可访问性更好；自绘滚动条需要浏览器运行时，无头环境无法验证 |
+| 浮层定位 | Radix `Portal` + `@floating-ui`（碰撞检测 / 自动翻转） | 锚点包裹层 + `absolute` 类名 | 见 §4.3；不做碰撞检测，位置由调用方给的 `side` / `align` / `side_offset` 决定 |
+| `DropdownMenu` 高亮态 | Radix 内部 roving focus | 每项一个 `Signal<bool>` 写 `data-highlighted` | 只做 hover 高亮，不做键盘漫游（见 `dropdown_menu.rs` 模块文档） |
+| `Collapsible` / `Accordion` 的 `id` | `useId()` 自动生成，并自动接 `aria-controls` | 显式 prop，**不传则不发该属性** | Dioxus 0.6 没有「每实例稳定 id」原语；Trigger 与 Content 是两个组件，拿不到同一个 id。发 `id=""` 是无效 HTML，所以宁可整个不发 |
+| `InputGroupButton` | 委托给 `Button` | 渲染裸 `button` + `button_classes()` | 与 TS 一致（TS 里它就是 `<button className={button({...})}>`，不是 `<Button>`） |
 
 ## 4. 已移植组件清单
 
@@ -248,23 +260,104 @@ rsx! {
 | `components/tabs.rs` | `tabs.tsx` | `Tabs` / `TabsList` / `TabsTrigger` / `TabsContent`、`TabsListVariant`、`TabsOrientation`、`use_tabs_value` |
 | `cn.rs` | `lib/utils.ts` | `cn`、`cn_opt` |
 
+### 4.1 第二批：折叠类 / 表单组合
+
+| Rust 模块 | TSX 来源 | 导出 |
+| --- | --- | --- |
+| `components/collapsible.rs` | `collapsible.tsx` | `Collapsible` / `CollapsibleTrigger` / `CollapsibleContent` |
+| `components/accordion.rs` | `accordion.tsx` | `Accordion` / `AccordionItem` / `AccordionTrigger` / `AccordionContent`、`AccordionType`、`AccordionOrientation` |
+| `components/radio_group.rs` | `radio-group.tsx` | `RadioGroup` / `RadioGroupItem` |
+| `components/button_group.rs` | `button-group.tsx` | `ButtonGroup` / `ButtonGroupText` / `ButtonGroupSeparator`、`ButtonGroupOrientation` |
+| `components/input_group.rs` | `input-group.tsx` | `InputGroup` / `InputGroupAddon` / `InputGroupButton` / `InputGroupText` / `InputGroupInput` / `InputGroupTextarea`、`InputGroupAddonAlign`、`InputGroupButtonSize` |
+| `components/scroll_area.rs` | `scroll-area.tsx` | `ScrollArea` / `ScrollBar` / `ScrollThumb`、`ScrollOrientation` |
+
+### 4.2 第二批：浮层类
+
+| Rust 模块 | TSX 来源 | 导出 |
+| --- | --- | --- |
+| `components/tooltip.rs` | `tooltip.tsx` | `TooltipProvider` / `Tooltip` / `TooltipTrigger` / `TooltipContent` |
+| `components/hover_card.rs` | `hover-card.tsx` | `HoverCard` / `HoverCardTrigger` / `HoverCardContent` |
+| `components/popover.rs` | `popover.tsx` | `Popover` / `PopoverTrigger` / `PopoverAnchor` / `PopoverContent` / `PopoverHeader` / `PopoverTitle` / `PopoverDescription` |
+| `components/dialog.rs` | `dialog.tsx` | `Dialog` / `DialogTrigger` / `DialogPortal` / `DialogOverlay` / `DialogContent` / `DialogClose` / `DialogHeader` / `DialogFooter` / `DialogTitle` / `DialogDescription` |
+| `components/alert_dialog.rs` | `alert-dialog.tsx` | `AlertDialog` / `AlertDialogTrigger` / `AlertDialogPortal` / `AlertDialogOverlay` / `AlertDialogContent` / `AlertDialogAction` / `AlertDialogCancel` / `AlertDialogHeader` / `AlertDialogFooter` / `AlertDialogTitle` / `AlertDialogDescription` |
+| `components/dropdown_menu.rs` | `dropdown-menu.tsx` | `DropdownMenu` / `…Trigger` / `…Portal` / `…Content` / `…Group` / `…Item` / `…CheckboxItem` / `…RadioGroup` / `…RadioItem` / `…Label` / `…Separator` / `…Shortcut` / `…Sub` / `…SubTrigger` / `…SubContent`、`DropdownMenuItemVariant` |
+
+### 4.3 支撑模块
+
+| Rust 模块 | 作用 |
+| --- | --- |
+| `icons.rs` | **内联 lucide 图标**，零图标库依赖。`lucide!` 宏把 `<svg>` 的公共属性（`viewBox` / `stroke` / `stroke-width` / `stroke-linecap` / `stroke-linejoin`）固化，手写几何；`data-slot` 默认取图标名（`plus` / `check` / `chevron-down`…），这样 TS 里 `**:data-[slot=accordion-trigger-icon]:size-4` 这类选择器能原样命中 |
+| `components/overlay.rs` | **浮层定位约定**。Radix 的 `Portal` + `@floating-ui` 在这里被替换成「锚点包裹层 + `absolute` 类名」：`Side`（Top/Right/Bottom/Left）、`Align`（Start/Center/End）、`side_align_classes(side, align, side_offset)` 生成形如 `absolute bottom-full left-1/2 -translate-x-1/2 mb-[4px]` 的类名，`OVERLAY_ANCHOR_BASE = "relative inline-flex"` 是锚点基准 |
+
+> **为什么 Dialog 不需要这套约定**：Dialog / AlertDialog 的内容用 `position: fixed`，
+> containing block 是**视口**而不是最近的定位祖先，所以没有 Portal 也能居中盖满整屏。
+> 只有相对锚点定位的浮层（Tooltip / HoverCard / Popover / DropdownMenu）才需要 §4.3 的约定。
+
+### 4.4 可运行的应用：`crates/zcode-app`
+把移植出的原语拼成一个 ZCode 风格的外壳，用来证明「组件库真的能用」。
+
+| 文件 | 内容 |
+| --- | --- |
+| `src/lib.rs` | `App` / `AppShell`；注入 `document::Title` + `document::Style`；`APP_CSS` 用 `include_str!` 内嵌 `assets/app.css` |
+| `src/main.rs` | 桌面入口：`LaunchBuilder::desktop().with_cfg(WindowBuilder::new().with_title(..).with_inner_size(1360×860))` |
+| `src/state.rs` | `AppState` / `AppCtx`（全部 `Signal`）/ `use_app()` / `demo_state()` |
+| `src/views/sidebar.rs` | 品牌行 + 搜索（`InputGroup`）+ 按「今天/昨天/更早」分组的会话列表 + 右键菜单（`DropdownMenu`，destructive 删除）+ 上下文用量（`Progress`）+ 头像 |
+| `src/views/topbar.rs` | 会话标题 + 分支 `Badge` + 视图 `Tabs` + 模型选择器（`DropdownMenuRadioItem`）+ 带 `Tooltip` 的图标按钮 |
+| `src/views/conversation.rs` | 消息流；助手头像挂 `HoverCard`；工具调用卡片（分段 `Progress`）；流式提示用受控 `Collapsible` + `Alert` |
+| `src/views/composer.rs` | `InputGroup`（`InlineStart` 回形针 / `Textarea` / `InlineEnd` 发送或停止）+ 审批模式选择器 |
+| `src/views/detail.rs` | 执行计划（受控 `Collapsible`）+ 变更文件 / 工具调用 / 上下文来源（`Accordion`）+ 权限 `RadioGroup` + 分段 `Progress` + 图例 + `AvatarGroup` + `ButtonGroup` |
+| `src/views/settings.rs` | 设置 `Dialog`（常规/外观/关于 三个 `Tabs`）+ 删除确认 `AlertDialog` |
+| `src/views/gallery.rs` | 组件画廊 `Dialog`，六个分页把所有原语和变体都渲染一遍 |
+
+### 4.5 样式表怎么来的
+
+仓库里**没有** Tailwind 安装，`packages/ui` 的样式来自 `shadcn/tailwind.css`
+（一个不在本仓库的依赖）。所以 `rust/.tailwind-build/build.sh` 手工拼了一份入口 CSS：
+
+1. `@import "tailwindcss" source(none)` —— 关掉自动扫描，只扫我们指定的路径；
+2. `@import "tw-animate-css"` —— 提供 `animate-in` / `fade-in-0` / `animate-collapsible-down` 等；
+3. `@source "../crates/**/*.rs"` —— 让 Tailwind 从 **Rust 源码**里提取类名
+   （注意路径相对 `.tailwind-build/`，写成 `../../crates` 会扫到空目录，产出的 CSS 会静默变空）；
+4. 手写补上 `shadcn/tailwind.css` 里那组 `@custom-variant`
+   （`data-open` / `data-closed` / `data-active` / `data-checked` / `data-horizontal` /
+   `data-vertical` / `data-disabled` / `data-highlighted` / `data-inset`）；
+5. 用 `sed` 从 `packages/ui/src/styles.css` 里抠出 `@theme { … }` 与 `.dark { … }` 两块原样粘贴。
+
+```bash
+cd rust/.tailwind-build && ./build.sh   # → rust/crates/zcode-app/assets/app.css（93,588 字节）
+```
+
+> ⚠️ Tailwind v4 会**按需裁剪** `@theme`：只有被实际用到的令牌才会作为 CSS 变量输出。
+> 所以「样式表里没有 `--text-ui-2xs`」不代表 `@theme` 没被导入 —— 只是当前代码没用它。
+> 冒烟测试因此既查具体令牌，也查 `--color-*` 的总量（>200）来确认整块 `@theme` 确实进来了。
+
 ## 5. 测试策略
 
-三层，**全部在 host 上跑**（无 wasm / 无窗口 / 无浏览器）：
+四层，**全部在 host 上跑**（无 wasm / 无窗口 / 无浏览器）：
 
 | 层 | 文件 | 数量 | 断言粒度 |
 | --- | --- | --- | --- |
-| 类名纯函数单测 | `src/**` 内联 `#[cfg(test)]` | 65 | 字符串包含 / 相等 |
-| mutation 记录式渲染 | `tests/render.rs` | 11 | 区分静态属性 / 动态属性 / 文本节点 |
-| HTML 快照 | `tests/html_snapshot.rs` | 23 | 序列化后的 HTML 字符串 |
+| 类名纯函数单测 | `zcode-ui/src/**` 内联 `#[cfg(test)]` | 147 | 字符串包含 / 相等 |
+| mutation 记录式渲染 | `zcode-ui/tests/render.rs` | 11 | 区分静态属性 / 动态属性 / 文本节点 |
+| HTML 快照 | `zcode-ui/tests/html_snapshot.rs` | 41 | 序列化后的 HTML 字符串 |
+| 整树冒烟 | `zcode-app/tests/smoke.rs` | 17 | 把整个应用（含浮层）真渲染一遍 |
 
-合计 **99** 个；加上 `zcode-rpc`（10）与 `zcode-shared`（14），工作区共 **123** 个测试。
+各 crate 明细：
 
-### 5.1 类名纯函数单测（65 个）
+| crate | 单元 | 集成 | 小计 |
+| --- | --- | --- | --- |
+| `zcode-rpc` | 10 | — | 10 |
+| `zcode-shared` | 14 | — | 14 |
+| `zcode-ui` | 147 | 41 + 11 | 199 |
+| `zcode-app` | 2 | 17 | 19 |
+| **合计** | **173** | **69** | **242** |
+
+### 5.1 类名纯函数单测（147 个）
 
 `*_classes()` 与 `cn()` 的直接断言。覆盖 variant/size 映射、用户 class 覆盖
 组件默认、`text-ui-*` 与文字颜色不互相覆盖、方括号修饰符切分、
-`ring` 宽度 vs 颜色、`shadow` 尺寸 vs 颜色等。
+`ring` 宽度 vs 颜色、`shadow` 尺寸 vs 颜色、负向定位前缀
+（`-translate-x-1/2` / `-inset-x-1` 的 tailwind-merge 分组）等。
 
 ### 5.2 mutation 记录式渲染（11 个）
 
@@ -289,7 +382,7 @@ vdom.rebuild(&mut rec);          // ← 不能是 rebuild_in_place()，见下
 SVG 命名空间与 `viewBox` / `stroke-*`、`Progress` 的宽度与分段 `flex-basis`、
 文本节点透传、受控 prop 在 DOM 上的反映。
 
-### 5.3 HTML 快照（23 个）
+### 5.3 HTML 快照（41 个）
 
 `dioxus-ssr`（**仅 dev-dependency**，库本身不依赖它）把组件序列化成
 浏览器会看到的 HTML，断言读起来跟看页面一样，适合做回归快照：
@@ -313,9 +406,11 @@ assert_eq!(html(|| rsx! { Separator {} }), r#"<div class="shrink-0 bg-border …
 这一层还抓出了几个「序列化细节」并固化成断言：
 
 - 数值属性不带引号：`rows=4`、`stroke-width=3`；
-- 布尔属性渲染成 `disabled=true`，为 `false` 时**整个属性省略**；
+- 布尔属性渲染成 `disabled=true` / `hidden=true`，为 `false` 时**整个属性省略**；
 - `BUTTON_BASE` 的 `text-ui-base/relaxed` 会被 size 的 `text-ui-base` 覆盖
-  （同属 `font-size` 组，tailwind-merge 语义下后者胜）—— 与 TS 版一致。
+  （同属 `font-size` 组，tailwind-merge 语义下后者胜）—— 与 TS 版一致；
+- `dioxus-ssr` **不转义**属性值里的 `&`，所以 `[&::-webkit-scrollbar]:hidden`
+  在 HTML 里就是原样，断言时不要写成 `&amp;`。
 
 ### 5.4 预览页生成器（`examples/preview.rs`）
 
@@ -329,36 +424,88 @@ cargo run -p zcode-ui --example preview            # → ./preview.html
 浏览器版 + 从 `packages/ui/src/styles.css` 复刻的 `@theme` / `@custom-variant`
 令牌驱动（需联网加载 CDN；离线打开会退化为无样式但结构正确的 HTML）。
 
+### 5.5 整树冒烟 + 「能正常运行」的判定（17 个）
+
+`zcode-app/tests/smoke.rs` 把 [`AppShell`] 整棵树、以及三个浮层（画廊 / 设置 /
+删除确认）**真渲染一遍**，断言：
+
+- 整棵树能挂载（任何 `use_context` 缺失或 hook 顺序错误都会在这里 panic）；
+- 各区域文案真的出现（说明分支没走空）；
+- 关键原语的 `data-slot` 锚点与 `data-*` 语义属性真的在 DOM 里 ——
+  这是 shadcn `@custom-variant` 生效的前提，也是移植中最容易漏的东西；
+- 浮层**默认关闭**时内容整体不渲染（`dialog-content` / `alert-dialog-content` 都不在）；
+- 需要展开才有 DOM 的浮层另建 `OverlaysOpen` 夹具，用受控
+  `open: Some(signal(true))` 强制打开后再断言内容标记。
+
+其中一条专门盯着「类名在 DOM 上、但样式表里没编译出规则」这个坑：
+断言 `[scrollbar-width:none]` 既出现在 DOM 里，也出现在内嵌 CSS 里。
+
+**开窗口**这一层没法在无头环境自动验证，所以用外部探针核对了四件事：
+
+```bash
+cargo run -p zcode-app            # 保持运行
+# 另一个终端：
+#   Get-Process zcode-app | Select Id, MainWindowHandle, MainWindowTitle, Responding
+```
+
+| 观测项 | 期望 | 实测 |
+| --- | --- | --- |
+| 进程存活 | 事件循环不退出 | 存活 12s 无输出 |
+| `MainWindowHandle` | 非 0（真的有窗口） | `44435456` |
+| `MainWindowTitle` | 与 `WindowBuilder` 一致 | `ZCode — Rust + Dioxus 移植` |
+| `Responding` | `True`（消息泵在跑） | `True`，工作集 36 MB |
+
+> ⚠️ `MainWindowTitle` 首次读可能是空串（.NET 侧缓存），`$p.Refresh()` 之后才对。
+
 ## 6. 未移植组件与原因
 
-`packages/ui/src/components/ui` 下还有 32 个 TSX 未移植，分三类：
+`packages/ui/src/components/ui` 下还有 **20 / 47** 个 TSX 未移植，分三类：
 
-**(a) 浮层类（需要 Portal + 定位计算）**
-`dialog` / `alert-dialog` / `popover` / `hover-card` / `tooltip` /
-`dropdown-menu` / `context-menu` / `select` / `command` / `toast` / `menubar`。
-它们的「类名表 + 状态机」是可移植的，但 Radix 的核心价值在于**焦点陷阱、
-层级管理、碰撞检测、键盘导航**，这些要配合 Dioxus 的 Portal 与定位逻辑
-单独设计，不能机械翻译。
+**(a) 浮层类（需要焦点陷阱 / 键盘导航）** —— 4 个
+`context-menu` / `select` / `command` / `toast`。
 
-**(b) 需要浏览器运行时能力**
+`dialog` / `alert-dialog` / `popover` / `hover-card` / `tooltip` / `dropdown-menu`
+已经在第二批里用 §4.3 的「锚点包裹层 + `absolute`」约定做掉了，证明这层不需要
+Portal 也能落地。剩下的 4 个卡在别处：
+
+- `select` / `command` 需要**键盘漫游 + 列表虚拟化 + 输入过滤**，
+  Radix 的 roving focus 没有 Rust 等价物；
+- `context-menu` 需要**光标坐标**定位（我们的约定是「相对锚点」，而右键菜单
+  的锚点就是鼠标位置），要额外一套 `position: fixed` + clientX/clientY 的路径；
+- `toast` 需要**全局队列 + 自动消失计时器**，属于运行时服务而不是纯组件。
+
+**(b) 需要浏览器运行时能力** —— 10 个
 `carousel`（滚动吸附 + 手势）、`resizable`（Pointer Events）、
-`scroll-area`（ResizeObserver）、`chart`（canvas/SVG 绘制）、
-`code-viewer` / `diff-viewer` / `pdf-viewer` / `pptx-preview-viewer`（重型渲染器）、
-`floating-particles` / `smooth-metric-value` / `flip-metric-value`（requestAnimationFrame 动画）。
+`chart`（canvas/SVG 绘制）、`code-viewer` / `diff-viewer` / `pdf-viewer` /
+`pptx-preview-viewer`（重型渲染器）、
+`floating-particles` / `smooth-metric-value` / `flip-metric-value`
+（`requestAnimationFrame` 动画）。
 
-**(c) 组合型（由 (a) 派生）**
-`button-group` / `input-group` / `radio-group` / `collapsible` / `accordion` /
-`scroll-fade-viewport` / `highlighted-lightweight-diff-preview` /
-`pptx-selection-action-bar` / `ZCodeAboutLogo` / `GlmMonochromeIcon`。
+> `scroll-area` 本来也在这类（Radix 用 `ResizeObserver` 自绘滚动条），
+> 第二批改用原生滚动绕开了（见 §3.7），所以从清单里划掉。
+
+**(c) 组合型 / 装饰型** —— 6 个
+`scroll-fade-viewport` / `lightweight-diff-preview` /
+`highlighted-lightweight-diff-preview` / `pptx-selection-action-bar` /
+`ZCodeAboutLogo` / `GlmMonochromeIcon`。
+
+`button-group` / `input-group` / `radio-group` / `collapsible` / `accordion`
+原先也在这类，第二批已完成。
 
 ## 7. 剩余工作
 
-1. 按 (a) → (c) 顺序推进，先做 **Portal + 浮层定位** 这层基础设施，
-   再批量移植浮层组件；
-2. 为 `packages/ui` 的 **组合型业务组件**（非 `components/ui` 下的原语）
-   建立第二批移植清单；
-3. 把 `packages/ui/src/styles.css` 的 `@theme` 令牌导出成 Rust 常量，
+1. **浮层定位的第二步**：给 `overlay.rs` 补 `position: fixed` + 光标坐标的路径，
+   用来接 `context-menu`；再补碰撞检测（视口边缘自动翻转），
+   这一步做完 `select` 之外的浮层就齐了；
+2. **键盘导航**：给 `DropdownMenu` 补 roving focus（当前只有 hover 高亮），
+   这是 `select` / `command` 的前置；
+3. **`toast` 的运行时服务**：需要一个挂在 `AppShell` 顶层的队列 + 定时器；
+4. **重型渲染器**（`code-viewer` / `diff-viewer` / `pdf-viewer`）建议独立评估，
+   它们是「换一个 Rust 库」而不是「移植 TSX」；
+5. 把 `packages/ui/src/styles.css` 的 `@theme` 令牌导出成 Rust 常量，
    让颜色/间距不再只存在于 CSS 里（当前 CSS 仍是唯一真源，组件只负责类名）；
-4. 补上 `--color-muted` / `--color-ring` / `--color-secondary-foreground`
+6. 补上 `--color-muted` / `--color-ring` / `--color-secondary-foreground`
    的权威取值 —— 它们由 `shadcn/tailwind.css` 提供，而该文件不在本仓库中，
-   预览页目前用的是等价回退值。
+   预览页目前用的是等价回退值；
+7. `packages/ui` 里 **`components/` 下非 `ui/` 的组合型业务组件**
+   （工作流时间线、文件树、diff 面板等）还没建立移植清单。

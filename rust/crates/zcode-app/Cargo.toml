@@ -1,0 +1,40 @@
+[package]
+name = "zcode-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ZCode 桌面/浏览器应用外壳（Rust + Dioxus，使用 zcode-ui 组件）"
+
+[lib]
+name = "zcode_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zcode-app"
+path = "src/main.rs"
+
+[features]
+default = ["desktop"]
+# 原生窗口渲染器（Windows / macOS / Linux）
+desktop = ["dioxus/desktop"]
+# 浏览器渲染器（需要 wasm32-unknown-unknown target）
+web = ["dioxus/web"]
+
+[dependencies]
+dioxus = { version = "0.6", default-features = false, features = [
+    "macro",
+    "hooks",
+    "html",
+    "signals",
+    "asset",
+    # `dioxus::launch()`（入口函数）本身也被 feature 门控，桌面/浏览器都要它
+    "launch",
+    # `document::Style` / `document::Title`（往 <head> 注入内嵌样式表与标题）
+    "document",
+] }
+zcode-ui = { path = "../zcode-ui" }
+
+[dev-dependencies]
+# 仅测试用：把组件树渲染成 HTML 字符串，验证锚点与文案
+dioxus-ssr = "0.6"

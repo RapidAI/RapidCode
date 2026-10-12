@@ -12,18 +12,31 @@
 //!    shadcn 的 `@custom-variant`（见 `packages/ui/src/styles.css` 注释）赖以
 //!    生效的锚点，缺失就会「类名在、效果不在」。
 
+pub mod accordion;
 pub mod alert;
+pub mod alert_dialog;
 pub mod avatar;
 pub mod badge;
 pub mod button;
+pub mod button_group;
 pub mod card;
 pub mod checkbox;
+pub mod collapsible;
+pub mod dialog;
+pub mod dropdown_menu;
+pub mod hover_card;
 pub mod input;
+pub mod input_group;
 pub mod kbd;
 pub mod label;
+pub mod overlay;
+pub mod popover;
 pub mod progress;
+pub mod radio_group;
+pub mod scroll_area;
 pub mod separator;
 pub mod spinner;
 pub mod switch;
 pub mod tabs;
 pub mod textarea;
+pub mod tooltip;

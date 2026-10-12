@@ -497,3 +497,677 @@ fn full_tree_renders_to_html() {
     assert!(!out.contains("data-slot=\"dynamic"));
     assert!(!out.contains("{{"));
 }
+
+// ===========================================================================
+// 第二批原语：折叠类 / 表单组合 / 浮层
+// ===========================================================================
+
+/// 取出包含 `data-slot="<slot>"` 的那个开标签的完整文本。
+///
+/// 断言「某个变体类名落在哪个元素上」时用得上 —— 直接对整棵树的字符串做
+/// `contains` 会误判（同一个类名可能在别处也出现）。
+fn tag_with_slot<'a>(out: &'a str, slot: &str) -> &'a str {
+    let needle = format!(r#"data-slot="{slot}""#);
+    let end = out
+        .find(&needle)
+        .unwrap_or_else(|| panic!("找不到 data-slot=\"{slot}\""))
+        + needle.len();
+    let start = out[..end].rfind('<').expect("slot 不在标签内");
+    let close = out[end..].find('>').expect("标签未闭合") + end;
+    &out[start..=close]
+}
+
+/// `hidden` 是布尔属性，dioxus-ssr 输出的是不带引号的 `hidden=true`。
+fn has_hidden(out: &str) -> bool {
+    out.contains("hidden=true") || out.contains(r#"hidden="true""#)
+}
+
+// ---------------------------------------------------------------------------
+// Collapsible
+// ---------------------------------------------------------------------------
+
+#[component]
+fn CollapsibleClosed() -> Element {
+    rsx! {
+        Collapsible {
+            CollapsibleTrigger { id: "sec", "展开" }
+            CollapsibleContent { id: "sec-content", "内容" }
+        }
+    }
+}
+
+#[component]
+fn CollapsibleOpen() -> Element {
+    rsx! {
+        Collapsible { default_open: true,
+            CollapsibleTrigger { id: "sec", "展开" }
+            CollapsibleContent { id: "sec-content", "内容" }
+        }
+    }
+}
+
+#[component]
+fn CollapsibleNoId() -> Element {
+    rsx! {
+        Collapsible {
+            CollapsibleTrigger { "展开" }
+            CollapsibleContent { "内容" }
+        }
+    }
+}
+
+#[test]
+fn collapsible_closed_keeps_subtree_mounted() {
+    let out = html(CollapsibleClosed);
+
+    assert!(out.contains(r#"data-slot="collapsible""#));
+    assert!(out.contains(r#"data-slot="collapsible-trigger""#));
+    assert!(out.contains(r#"data-slot="collapsible-content""#));
+    assert!(out.contains(r#"data-state="closed""#));
+    assert!(out.contains(r#"aria-expanded="false""#));
+    assert!(out.contains(r#"aria-controls="sec-content""#));
+    assert!(out.contains(r#"id="sec-content""#));
+
+    // 与 Radix 的关键差异：Content 走 `hidden` 而不是 `Presence` 卸载，
+    // 所以子树（含内部状态）在收起后仍然存在（见模块文档）。
+    assert!(has_hidden(&out), "收起时应带 hidden");
+    assert!(out.contains("内容"), "收起后子树应保持挂载");
+
+    // 内层包裹 div 没有自己的 data-state，靠 group-data-[state=..] 读父层
+    assert!(out.contains("group-data-[state=closed]/collapsible-content:animate-out"));
+}
+
+#[test]
+fn collapsible_open_drops_hidden() {
+    let out = html(CollapsibleOpen);
+
+    assert!(out.contains(r#"data-state="open""#));
+    assert!(out.contains(r#"aria-expanded="true""#));
+    assert!(!has_hidden(&out), "展开时不应有 hidden");
+    assert!(out.contains("group-data-[state=open]/collapsible-content:animate-in"));
+}
+
+#[test]
+fn collapsible_without_id_omits_the_attribute() {
+    // 发 `id=""` 是无效 HTML，而且 `aria-controls` 会指向不存在的 `-content`
+    let out = html(CollapsibleNoId);
+
+    assert!(!out.contains(r#"id="""#), "不应发出空 id");
+    assert!(
+        !out.contains("aria-controls"),
+        "没有 id 就不该有 aria-controls"
+    );
+    // 组件本身仍然可用
+    assert!(out.contains(r#"data-slot="collapsible-trigger""#));
+    assert!(out.contains(r#"aria-expanded="false""#));
+}
+
+// ---------------------------------------------------------------------------
+// Accordion
+// ---------------------------------------------------------------------------
+
+#[component]
+fn AccordionCase() -> Element {
+    rsx! {
+        Accordion { default_value: vec!["a".to_string()],
+            AccordionItem { value: "a",
+                AccordionTrigger { id: "t-a", "第一项" }
+                AccordionContent { id: "t-a-content", "第一项内容" }
+            }
+            AccordionItem { value: "b",
+                AccordionTrigger { id: "t-b", "第二项" }
+                AccordionContent { id: "t-b-content", "第二项内容" }
+            }
+        }
+    }
+}
+
+#[test]
+fn accordion_wires_items_and_appends_both_chevrons() {
+    let out = html(AccordionCase);
+
+    assert!(out.contains(r#"data-slot="accordion""#));
+    assert!(out.contains(r#"data-orientation="vertical""#));
+    assert_eq!(out.matches(r#"data-slot="accordion-item""#).count(), 2);
+
+    // `default_value: ["a"]` → 第一项展开、第二项收起
+    assert!(out.contains(r#"aria-expanded="true""#));
+    assert!(out.contains(r#"aria-expanded="false""#));
+    assert!(out.contains(r#"aria-controls="t-a-content""#));
+
+    // 触发器自动追加一上一下两个 lucide chevron，靠 group-aria-expanded 切换显隐
+    assert_eq!(
+        out.matches(r#"data-slot="accordion-trigger-icon""#).count(),
+        4,
+        "两个触发器各应带 2 个图标"
+    );
+    assert!(out.contains("group-aria-expanded/accordion-trigger:hidden"));
+    assert!(out.contains("group-aria-expanded/accordion-trigger:inline"));
+
+    // 收起项的内容保持挂载 + hidden（同 Collapsible 的取舍）
+    assert!(has_hidden(&out));
+    assert!(out.contains("第二项内容"));
+    assert!(out.contains(r#"role="region""#));
+}
+
+#[component]
+fn AccordionHorizontal() -> Element {
+    rsx! {
+        Accordion { kind: AccordionType::Multiple, orientation: AccordionOrientation::Horizontal,
+            AccordionItem { value: "x", AccordionTrigger { "X" } }
+        }
+    }
+}
+
+#[test]
+fn accordion_type_and_orientation_are_forwarded() {
+    let out = html(AccordionHorizontal);
+
+    // 方向下发给根、item、trigger、content 四处，`data-horizontal:` 才有输入
+    assert_eq!(out.matches(r#"data-orientation="horizontal""#).count(), 4);
+    assert!(!out.contains(r#"data-orientation="vertical""#));
+}
+
+// ---------------------------------------------------------------------------
+// RadioGroup
+// ---------------------------------------------------------------------------
+
+#[component]
+fn RadioCase() -> Element {
+    rsx! {
+        RadioGroup { default_value: "b",
+            RadioGroupItem { value: "a" }
+            RadioGroupItem { value: "b" }
+        }
+    }
+}
+
+#[test]
+fn radio_group_mounts_dot_only_when_checked() {
+    let out = html(RadioCase);
+
+    assert!(out.contains(r#"role="radiogroup""#));
+    assert_eq!(out.matches(r#"data-slot="radio-group-item""#).count(), 2);
+    assert!(out.contains(r#"data-value="a""#));
+    assert!(out.contains(r#"data-value="b""#));
+
+    // Radix 的 Indicator 只在选中时挂载，这里保持一致
+    assert_eq!(out.matches(r#"data-slot="radio-group-indicator""#).count(), 1);
+    assert!(out.contains(r#"data-state="checked""#));
+    assert!(out.contains(r#"data-state="unchecked""#));
+    assert!(out.contains(r#"aria-checked="true""#));
+    assert!(out.contains(r#"aria-checked="false""#));
+
+    // 圆点是小号实心图标
+    assert!(out.contains("h-2.5 w-2.5 fill-current text-current"));
+
+    // roving tabindex：选中项可 Tab 进入，其余靠方向键
+    assert!(out.contains(r#"tabindex="0""#));
+    assert!(out.contains(r#"tabindex="-1""#));
+}
+
+// ---------------------------------------------------------------------------
+// ButtonGroup
+// ---------------------------------------------------------------------------
+
+#[component]
+fn ButtonGroupCase() -> Element {
+    rsx! {
+        ButtonGroup { orientation: ButtonGroupOrientation::Vertical,
+            ButtonGroupText { "文字" }
+            ButtonGroupSeparator {}
+        }
+    }
+}
+
+#[test]
+fn button_group_forwards_orientation_and_reuses_separator() {
+    let out = html(ButtonGroupCase);
+
+    assert!(out.contains(r#"role="group""#));
+    assert!(out.contains(r#"data-slot="button-group""#));
+    assert!(out.contains(r#"data-orientation="vertical""#));
+    assert!(out.contains("flex-col"), "垂直方向要加 flex-col");
+    assert!(out.contains(r#"data-slot="button-group-text""#));
+
+    // 分隔器复用 Separator：默认垂直、装饰性（aria-hidden + role=none）
+    let sep = tag_with_slot(&out, "button-group-separator");
+    assert!(sep.contains(r#"data-orientation="vertical""#));
+    assert!(sep.contains(r#"role="none""#));
+    assert!(sep.contains(r#"aria-hidden="true""#));
+}
+
+// ---------------------------------------------------------------------------
+// InputGroup
+// ---------------------------------------------------------------------------
+
+#[component]
+fn InputGroupCase() -> Element {
+    rsx! {
+        InputGroup {
+            InputGroupAddon { align: InputGroupAddonAlign::BlockEnd,
+                InputGroupButton { size: InputGroupButtonSize::IconXs, "x" }
+            }
+            InputGroupText { "前缀" }
+            InputGroupInput { placeholder: "占位" }
+        }
+    }
+}
+
+#[test]
+fn input_group_overrides_inner_slots() {
+    let out = html(InputGroupCase);
+
+    assert!(out.contains(r#"data-slot="input-group""#));
+    assert!(out.contains(r#"data-slot="input-group-text""#));
+    assert!(out.contains(r#"data-slot="input-group-addon""#));
+    assert!(out.contains(r#"data-align="block-end""#));
+
+    // 内层 input 的 slot 被覆盖成 input-group-control（对应 TS 里 {...props} 的覆盖顺序）
+    assert!(out.contains(r#"data-slot="input-group-control""#));
+    assert!(
+        !out.contains(r#"data-slot="input""#),
+        "内层 input 不应保留原始 slot"
+    );
+
+    // InputGroupButton 渲染的是裸 button（不委托给 Button），但类名走 button()
+    let btn = tag_with_slot(&out, "button");
+    assert!(btn.starts_with("<button"));
+    assert!(btn.contains(r#"data-size="icon-xs""#));
+
+    assert!(out.contains(r#"placeholder="占位""#));
+}
+
+// ---------------------------------------------------------------------------
+// ScrollArea
+// ---------------------------------------------------------------------------
+
+#[component]
+fn ScrollCase() -> Element {
+    rsx! {
+        ScrollArea { hide_scrollbar: true, class: "h-24", "滚动内容" }
+    }
+}
+
+#[test]
+fn scroll_area_swaps_radix_js_scrollbar_for_native_scrolling() {
+    let out = html(ScrollCase);
+
+    assert!(out.contains(r#"data-slot="scroll-area""#));
+    let vp = tag_with_slot(&out, "scroll-area-viewport");
+    assert!(vp.contains("overflow-auto"), "视口必须真的能滚");
+    assert!(vp.contains(r#"tabindex="0""#), "视口要可聚焦以便键盘滚动");
+
+    // 这是本移植最实质的功能性差异：Radix 的 JS 滚动条被换成原生滚动 + 隐藏滚动条
+    assert!(vp.contains("[scrollbar-width:none]"));
+    assert!(vp.contains("[&::-webkit-scrollbar]:hidden"));
+    assert!(out.contains("滚动内容"));
+}
+
+// ---------------------------------------------------------------------------
+// 浮层：Tooltip / HoverCard / Popover
+// ---------------------------------------------------------------------------
+
+#[component]
+fn TooltipClosed() -> Element {
+    rsx! {
+        Tooltip {
+            TooltipTrigger { Button { "触发" } }
+            TooltipContent { "提示" }
+        }
+    }
+}
+
+#[component]
+fn TooltipOpen() -> Element {
+    let o = use_signal(|| true);
+    rsx! {
+        Tooltip { open: Some(o),
+            TooltipTrigger { Button { "触发" } }
+            TooltipContent { side: Side::Right, align: Align::Start, side_offset: 8.0, "提示" }
+        }
+    }
+}
+
+#[test]
+fn tooltip_closed_renders_only_the_anchor() {
+    let out = html(TooltipClosed);
+
+    // 锚点包裹层是定位基准（替代 Radix 的 Portal + floating-ui）
+    let anchor = tag_with_slot(&out, "tooltip");
+    assert!(anchor.contains("relative inline-flex"));
+    assert!(out.contains(r#"data-slot="tooltip-trigger""#));
+
+    // 关闭时内容整体不渲染，不会留一个透明浮层挡住底下的点击
+    assert!(!out.contains(r#"data-slot="tooltip-content""#));
+    assert!(!out.contains("提示"));
+}
+
+#[test]
+fn tooltip_open_carries_side_align_and_offset() {
+    let out = html(TooltipOpen);
+
+    assert!(out.contains(r#"data-slot="tooltip-content""#));
+    assert!(out.contains(r#"role="tooltip""#));
+    assert!(out.contains(r#"data-state="open""#));
+    assert!(out.contains(r#"data-side="right""#));
+    assert!(out.contains(r#"data-align="start""#));
+
+    // 没有 floating-ui：位置完全由类名表达（absolute + inset + 偏移）
+    let content = tag_with_slot(&out, "tooltip-content");
+    assert!(content.contains("absolute"));
+    assert!(content.contains("left-full"));
+    assert!(content.contains("ml-[8px]"), "side_offset: 8.0 应变成 ml-[8px]");
+}
+
+#[component]
+fn HoverCardOpen() -> Element {
+    let o = use_signal(|| true);
+    rsx! {
+        HoverCard { open: Some(o),
+            HoverCardTrigger { Button { "触发" } }
+            HoverCardContent { "悬停卡" }
+        }
+    }
+}
+
+#[test]
+fn hover_card_defaults_to_bottom_center() {
+    let out = html(HoverCardOpen);
+
+    assert!(out.contains(r#"data-slot="hover-card-content""#));
+    // 与 TS 一致：未显式传值时 side=bottom、align=center、sideOffset=4
+    assert!(out.contains(r#"data-side="bottom""#));
+    assert!(out.contains(r#"data-align="center""#));
+
+    let content = tag_with_slot(&out, "hover-card-content");
+    assert!(content.contains("absolute"));
+    assert!(content.contains("top-full"));
+    assert!(content.contains("left-1/2"));
+    assert!(content.contains("-translate-x-1/2"));
+    assert!(content.contains("mt-[4px]"));
+}
+
+#[component]
+fn PopoverOpen() -> Element {
+    let o = use_signal(|| true);
+    rsx! {
+        Popover { open: Some(o),
+            PopoverTrigger { Button { "触发" } }
+            PopoverAnchor { "锚" }
+            PopoverContent {
+                PopoverHeader {
+                    PopoverTitle { "标题" }
+                    PopoverDescription { "描述" }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn popover_open_renders_all_parts() {
+    let out = html(PopoverOpen);
+
+    for slot in [
+        "popover",
+        "popover-trigger",
+        "popover-anchor",
+        "popover-content",
+        "popover-header",
+        "popover-title",
+        "popover-description",
+    ] {
+        assert!(out.contains(&format!(r#"data-slot="{slot}""#)), "缺少 {slot}");
+    }
+
+    assert!(out.contains(r#"data-state="open""#));
+    assert!(out.contains("标题"));
+    assert!(out.contains("描述"));
+    // Popover 比 Tooltip 高一档 z-index
+    assert!(tag_with_slot(&out, "popover-content").contains("z-[60]"));
+}
+
+// ---------------------------------------------------------------------------
+// 浮层：Dialog / AlertDialog
+// ---------------------------------------------------------------------------
+
+#[component]
+fn DialogClosed() -> Element {
+    rsx! {
+        Dialog {
+            DialogTrigger { "打开" }
+            DialogContent { "对话框" }
+        }
+    }
+}
+
+#[component]
+fn DialogOpen() -> Element {
+    let o = use_signal(|| true);
+    rsx! {
+        Dialog { open: Some(o),
+            DialogTrigger { "打开" }
+            DialogContent {
+                DialogHeader {
+                    DialogTitle { "标题" }
+                    DialogDescription { "描述" }
+                }
+                DialogFooter { DialogClose { "关闭" } }
+            }
+        }
+    }
+}
+
+#[test]
+fn dialog_closed_renders_only_the_trigger() {
+    let out = html(DialogClosed);
+
+    assert!(out.contains(r#"data-slot="dialog-trigger""#));
+    assert!(out.contains(r#"data-state="closed""#));
+    assert!(!out.contains(r#"data-slot="dialog-content""#));
+    assert!(!out.contains(r#"data-slot="dialog-overlay""#));
+}
+
+#[test]
+fn dialog_open_is_modal_and_fixed_positioned() {
+    let out = html(DialogOpen);
+
+    assert!(out.contains(r#"role="dialog""#));
+    assert!(out.contains(r#"aria-modal="true""#));
+    assert!(out.contains(r#"tabindex="-1""#));
+
+    // 遮罩用 `fixed inset-0`：containing block 是视口本身，
+    // 所以不需要 Portal 也能盖满整屏（见 PORTING-UI.md §4.3）
+    let overlay = tag_with_slot(&out, "dialog-overlay");
+    assert!(overlay.contains("fixed inset-0"));
+    assert!(overlay.contains("z-50"));
+
+    for slot in [
+        "dialog-content",
+        "dialog-header",
+        "dialog-title",
+        "dialog-description",
+        "dialog-footer",
+    ] {
+        assert!(out.contains(&format!(r#"data-slot="{slot}""#)), "缺少 {slot}");
+    }
+
+    // 自动右上角关闭按钮 + Footer 里手写的 DialogClose
+    assert_eq!(out.matches(r#"data-slot="dialog-close""#).count(), 2);
+    assert!(out.contains(r#"<span class="sr-only">Close</span>"#));
+
+    // 内容面板居中：fixed + top/left 50% + 负位移
+    let content = tag_with_slot(&out, "dialog-content");
+    assert!(content.contains("fixed"));
+    assert!(content.contains("top-1/2") && content.contains("left-1/2"));
+    assert!(content.contains("-translate-x-1/2") && content.contains("-translate-y-1/2"));
+}
+
+#[component]
+fn AlertDialogOpen() -> Element {
+    let o = use_signal(|| true);
+    rsx! {
+        AlertDialog { open: Some(o),
+            AlertDialogTrigger { "删除" }
+            AlertDialogContent {
+                AlertDialogHeader {
+                    AlertDialogTitle { "确认？" }
+                    AlertDialogDescription { "不可撤销" }
+                }
+                AlertDialogFooter {
+                    AlertDialogCancel { "取消" }
+                    AlertDialogAction { "删除" }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn alert_dialog_uses_the_alertdialog_role() {
+    let out = html(AlertDialogOpen);
+
+    assert!(out.contains(r#"role="alertdialog""#));
+    assert!(out.contains(r#"aria-modal="true""#));
+    assert!(out.contains(r#"data-slot="alert-dialog-overlay""#));
+    assert!(out.contains(r#"data-slot="alert-dialog-content""#));
+    assert!(out.contains(r#"data-slot="alert-dialog-header""#));
+    assert!(out.contains(r#"data-slot="alert-dialog-title""#));
+    assert!(out.contains(r#"data-slot="alert-dialog-description""#));
+    assert!(out.contains(r#"data-slot="alert-dialog-footer""#));
+
+    // AlertDialog 没有右上角关闭按钮（强制用户二选一）
+    assert!(!out.contains(r#"<span class="sr-only">Close</span>"#));
+
+    // Cancel 默认 outline、Action 默认 primary
+    let cancel = tag_with_slot(&out, "alert-dialog-cancel");
+    assert!(cancel.contains("border-border"));
+    assert!(cancel.contains("hover:border-border-hover"));
+
+    let action = tag_with_slot(&out, "alert-dialog-action");
+    assert!(action.contains("bg-primary text-primary-foreground"));
+}
+
+// ---------------------------------------------------------------------------
+// DropdownMenu
+// ---------------------------------------------------------------------------
+
+#[component]
+fn DropdownOpen() -> Element {
+    let o = use_signal(|| true);
+    let s = use_signal(|| true);
+    rsx! {
+        DropdownMenu { open: Some(o),
+            DropdownMenuTrigger { "菜单" }
+            DropdownMenuContent {
+                DropdownMenuLabel { "标签" }
+                DropdownMenuGroup {
+                    DropdownMenuItem { variant: DropdownMenuItemVariant::Destructive, "删除"
+                        DropdownMenuShortcut { "⌘D" }
+                    }
+                    DropdownMenuCheckboxItem { checked: true, "勾选" }
+                    DropdownMenuRadioItem { checked: true, "单选" }
+                }
+                DropdownMenuSeparator {}
+                DropdownMenuSub { open: Some(s),
+                    DropdownMenuSubTrigger { "子菜单" }
+                    DropdownMenuSubContent { DropdownMenuItem { "子项" } }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn dropdown_menu_open_lays_out_every_item_kind() {
+    let out = html(DropdownOpen);
+
+    for slot in [
+        "dropdown-menu",
+        "dropdown-menu-trigger",
+        "dropdown-menu-content",
+        "dropdown-menu-label",
+        "dropdown-menu-group",
+        "dropdown-menu-item",
+        "dropdown-menu-checkbox-item",
+        "dropdown-menu-checkbox-item-indicator",
+        "dropdown-menu-radio-item",
+        "dropdown-menu-separator",
+        "dropdown-menu-shortcut",
+        "dropdown-menu-sub",
+        "dropdown-menu-sub-trigger",
+        "dropdown-menu-sub-content",
+    ] {
+        assert!(out.contains(&format!(r#"data-slot="{slot}""#)), "缺少 {slot}");
+    }
+
+    // 三种菜单项各用正确的 ARIA role
+    assert!(out.contains(r#"role="menu""#));
+    assert!(out.contains(r#"role="menuitem""#));
+    assert!(out.contains(r#"role="menuitemcheckbox""#));
+    assert!(out.contains(r#"role="menuitemradio""#));
+    assert!(out.contains(r#"role="separator""#));
+
+    // 高亮态由逐项 Signal 写成 `data-highlighted`，
+    // 样式表里的 `data-[highlighted]:bg-menu-hover` 才有输入
+    assert!(out.contains("data-[highlighted]:bg-menu-hover"));
+
+    assert!(out.contains(r#"data-variant="destructive""#));
+    assert!(out.contains("⌘D"));
+
+    // 子菜单默认从右侧展开
+    assert!(out.contains(r#"data-side="right""#));
+    assert!(tag_with_slot(&out, "dropdown-menu-sub-content").contains("left-full"));
+
+    // 指示器只在选中时挂载
+    assert_eq!(
+        out.matches(r#"data-slot="dropdown-menu-checkbox-item-indicator""#)
+            .count(),
+        1
+    );
+    assert_eq!(
+        out.matches(r#"data-slot="dropdown-menu-radio-item-indicator""#)
+            .count(),
+        1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Icons
+// ---------------------------------------------------------------------------
+
+#[component]
+fn IconsCase() -> Element {
+    rsx! {
+        IconPlus {}
+        IconCheck {}
+        IconChevronDown {}
+        IconSearch {}
+    }
+}
+
+#[test]
+fn icons_are_inline_lucide_svgs() {
+    let out = html(IconsCase);
+
+    assert_eq!(out.matches("<svg").count(), 4);
+    assert_eq!(out.matches("</svg>").count(), 4);
+    // 全部走 24×24 网格 + currentColor 描边，继承文字颜色
+    assert_eq!(out.matches(r#"viewBox="0 0 24 24""#).count(), 4);
+    assert_eq!(out.matches(r#"stroke="currentColor""#).count(), 4);
+    assert_eq!(out.matches(r#"fill="none""#).count(), 4);
+
+    // data-slot 用图标名，方便 `**:data-[slot=accordion-trigger-icon]` 这类选择器命中
+    for name in ["plus", "check", "chevron-down", "search"] {
+        assert!(
+            out.contains(&format!(r#"data-slot="{name}""#)),
+            "缺少图标 {name}"
+        );
+    }
+
+    // 几何是照抄 lucide 的 path，不是占位方块
+    assert!(out.contains(r#"<path d="M20 6 9 17l-5-5">"#));
+    assert!(out.contains(r#"<circle cx="11" cy="11" r="8">"#));
+    assert!(out.contains(r#"<path d="M5 12h14">"#));
+}

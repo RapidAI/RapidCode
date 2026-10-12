@@ -1,0 +1,10 @@
+{
+  "name": "zcode-rust-tailwind-build",
+  "private": true,
+  "description": "仅在需要重新生成 crates/zcode-app/assets/app.css 时使用（见 rust/PORTING-UI.md）",
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.11",
+    "tailwindcss": "^4.1.11",
+    "tw-animate-css": "^1.3.4"
+  }
+}

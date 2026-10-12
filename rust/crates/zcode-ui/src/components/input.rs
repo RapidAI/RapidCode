@@ -53,6 +53,9 @@ pub fn Input(
     #[props(default)] disabled: bool,
     /// 对应 TS 的 `htmlSize`（透传给原生 `size` 属性）。
     #[props(default)] html_size: Option<i64>,
+    /// 覆盖 `data-slot`（TS 的 `{...props}` 展开在 `data-slot="input"` 之后，
+    /// 所以 `InputGroupInput` 能把它改成 `input-group-control`）。
+    #[props(default = "input")] slot: &'static str,
     #[props(default)] oninput: EventHandler<FormEvent>,
     #[props(default)] onchange: EventHandler<FormEvent>,
 ) -> Element {
@@ -61,7 +64,7 @@ pub fn Input(
         input {
             class: cls,
             r#type: input_type,
-            "data-slot": "input",
+            "data-slot": slot,
             placeholder: placeholder,
             value: value,
             disabled: disabled,

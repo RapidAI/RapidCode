@@ -128,6 +128,11 @@ pub fn Button(
     #[props(default)] disabled: bool,
     /// 对应 TS 里透传的 `type`（默认 `button`）。
     #[props(default = "button".to_string())] html_type: String,
+    /// 覆盖 `data-slot`。
+    #[props(default = "button")] slot: &'static str,
+    /// 覆盖 `data-size`。TS 里 `InputGroupButton` 用 cva 的 size 覆盖了
+    /// `buttonVariants` 的 size 属性，但类名仍走 `className`，两者不一致。
+    #[props(default)] data_size: Option<&'static str>,
     #[props(default)] onclick: EventHandler<MouseEvent>,
     children: Element,
 ) -> Element {
@@ -137,9 +142,9 @@ pub fn Button(
             class: cls,
             r#type: html_type,
             disabled: disabled,
-            "data-slot": "button",
+            "data-slot": slot,
             "data-variant": variant.as_str(),
-            "data-size": size.as_str(),
+            "data-size": data_size.unwrap_or(size.as_str()),
             onclick: move |e| onclick.call(e),
             {children}
         }

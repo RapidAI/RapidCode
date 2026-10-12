@@ -142,6 +142,14 @@ const GROUP_PREFIXES: &[(&str, &str)] = &[
     ("bottom-", "bottom"),
     ("left-", "left"),
     ("z-", "z"),
+    // ---- 负值定位（`-inset-x-3` 这类）----
+    ("-inset-x-", "inset-x"),
+    ("-inset-y-", "inset-y"),
+    ("-inset-", "inset"),
+    ("-top-", "top"),
+    ("-right-", "right"),
+    ("-bottom-", "bottom"),
+    ("-left-", "left"),
     // ---- 布局 ----
     ("items-", "items"),
     ("justify-", "justify"),
@@ -193,8 +201,12 @@ const GROUP_PREFIXES: &[(&str, &str)] = &[
     ("animate-", "animate"),
     ("translate-x-", "translate-x"),
     ("translate-y-", "translate-y"),
+    ("-translate-x-", "translate-x"),
+    ("-translate-y-", "translate-y"),
     ("scale-", "scale"),
     ("rotate-", "rotate"),
+    ("-scale-", "scale"),
+    ("-rotate-", "rotate"),
     ("origin-", "origin"),
     // ---- 交互 ----
     ("cursor-", "cursor"),

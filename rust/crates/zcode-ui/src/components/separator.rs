@@ -40,11 +40,15 @@ pub fn Separator(
     /// 对应 Radix 的 `decorative`（默认 `true`，即纯装饰、对无障碍树不可见）。
     #[props(default = true)] decorative: bool,
     #[props(default, into)] class: String,
+    /// 覆盖 `data-slot`。TS 里 `<Separator data-slot="button-group-separator" />`
+    /// 是在 `{...props}` 中覆盖的（props 展开在 `data-slot="separator"` 之后），
+    /// 所以这里也必须可覆盖，否则 `ButtonGroupSeparator` 的锚点会错。
+    #[props(default = "separator")] slot: &'static str,
 ) -> Element {
     rsx! {
         div {
             class: separator_classes(&class),
-            "data-slot": "separator",
+            "data-slot": slot,
             "data-orientation": orientation.as_str(),
             role: if decorative { "none" } else { "separator" },
             "aria-hidden": decorative.then_some("true"),

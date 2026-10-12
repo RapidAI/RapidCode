@@ -1,1 +1,4 @@
 /target
+# Tailwind 入口 CSS 由 .tailwind-build/build.sh 每次重新拼装（见 PORTING-UI.md §4.5），
+# 产物 crates/zcode-app/assets/app.css 才入库。
+/.tailwind-build/entry.css
