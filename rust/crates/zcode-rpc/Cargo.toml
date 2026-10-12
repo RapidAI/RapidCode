@@ -1,0 +1,14 @@
+[package]
+name = "zcode-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VS Code 风格 IPC 通信抽象框架（Rust 移植自 packages/rpc）"
+
+[lib]
+name = "zcode_rpc"
+path = "src/lib.rs"
+
+[dependencies]
+# 刻意保持零外部依赖：仅使用 std。

@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/zcode-rpc", "crates/zcode-shared"]
+
+[workspace.package]
+version = "3.15.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/RapidAI/RapidCode"
+description = "Rust port of the ZCode core logic layer"
+
+[profile.release]
+opt-level = 3
