@@ -137,6 +137,23 @@ pub struct GitHeadInfo {
     pub behind: u32,
 }
 
+/// 一次提交的结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitCommitResult {
+    /// `git rev-parse HEAD` 的结果（完整 40 位哈希）。
+    pub commit_hash: String,
+}
+
+/// 一次 push 的结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitPushResult {
+    pub branch_name: String,
+    pub tracking_branch_name: Option<String>,
+    pub remote_name: Option<String>,
+    /// 本次是否执行了 `--set-upstream`。
+    pub set_upstream: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -14,13 +14,14 @@
 **Rust + [Dioxus](https://dioxuslabs.com/) 0.6** 全量重写，落在 `crates/zcode-ui`；
 在此之上又用移植出来的原语搭了一个 ZCode 风格的桌面应用 `crates/zcode-app`。
 
-- **47 / 47** 个原语完成移植（`26,390` 行 Rust，含 **742** 个内联单测）；
+- **47 / 47** 个原语完成移植（`26,397` 行 Rust，含 **742** 个内联单测）；
 - **应用外壳**：侧栏 / 会话流 / 输入区 / 详情面板 / 设置对话框 / 组件画廊，
-  `2,719` 行 + `653` 行冒烟测试；
-- **「变更」页已接真实数据**：走 `crates/zcode-services` 里移植过来的 git 工作区
-  状态链路（见 [PORTING.md](./PORTING.md) §2.4 与 §3.5），界面上列出的分支、
-  变更文件、`+N/-M` 都来自真实 `git status` / `git diff`，不是硬编码；
-- `cargo build` / `cargo test` **全绿**（工作区 **981** 个测试，零警告），
+  `4,598` 行 + `1,010` 行冒烟测试；
+- **「变更」页已接真实数据，并且可操作**：走 `crates/zcode-services` 里移植过来的
+  git 工作区状态链路（见 [PORTING.md](./PORTING.md) §2.4 / §2.5 与 §3.5），
+  界面上列出的分支、变更文件、`+N/-M` 都来自真实 `git status` / `git diff`，
+  不是硬编码；`暂存` / `取消暂存` / `丢弃` / `提交` / `推送` 五个动作也是真的在跑 `git`；
+- `cargo build` / `cargo test` **全绿**（工作区 **1028** 个测试，零警告），
   且测试层**不需要 wasm、不需要窗口、不需要浏览器**；
 - 类名（`class`）输出与 TS 版本**逐字符对齐** —— 移植后仍复用 `packages/ui` 的
   同一套 Tailwind 样式与 `@custom-variant` 语义，不需要改一行 CSS。
@@ -36,7 +37,7 @@
 ```
 cargo run   -p zcode-app                  # 开一个 1360×860 的桌面窗口（默认 feature = desktop）
 cargo build -p zcode-ui                   # 纯组件模型，任意环境可编译
-cargo test  --workspace                   # 981 个测试，全部在 host 上跑
+cargo test  --workspace                   # 1028 个测试，全部在 host 上跑
 cargo run   -p zcode-ui --example preview # 生成可直接打开的 preview.html
 ```
 
@@ -409,10 +410,10 @@ rsx! {
 | `src/lib.rs` | `App` / `AppShell` / `WorkspaceBootstrap` / `WorkspaceSeed`；注入 `document::Title` + `document::Style`；`APP_CSS` 用 `include_str!` 内嵌 `assets/app.css` |
 | `src/main.rs` | 桌面入口：`LaunchBuilder::desktop().with_cfg(WindowBuilder::new().with_title(..).with_inner_size(1360×860))` |
 | `src/state.rs` | `AppState` / `AppCtx`（全部 `Signal`）/ `use_app()` / `demo_state()` |
-| `src/workspace.rs` | **真实数据桥**：`WorkspaceRequester`（后台线程 + `futures-channel`）、`use_workspace_requester()`、`WorkspaceStatus` 四态 |
+| `src/workspace.rs` | **真实数据桥**：`WorkspaceRequester`（后台线程 + `futures-channel`）、`use_workspace_requester()`、`WorkspaceStatus` 四态；`refresh()` 读、`run(WorkspaceAction)` 写，两者共用同一个 `busy` 原子量**串行化**；`WorkspaceNotice` 回传单次写操作的成败 |
 | `src/views/sidebar.rs` | 品牌行 + 搜索（`InputGroup`）+ 按「今天/昨天/更早」分组的会话列表 + 右键菜单（`DropdownMenu`，destructive 删除）+ 上下文用量（`Progress`）+ 头像；**底部显示真实工作区目录名与「分支 · N 个变更」** |
 | `src/views/topbar.rs` | 会话标题 + **`WorkspaceBadge`**（五态：失败 / 加载中 / 未扫描 / 非仓库 / 真实分支 + ahead-behind + 变更数）+ 视图 `Tabs` + 模型选择器（`DropdownMenuRadioItem`）+ 带 `Tooltip` 的图标按钮（刷新按钮接 `requester.refresh()`） |
-| `src/views/changes.rs` | **「变更」页**：`WorkspaceBar`（分支 / 仓库根 / 汇总 / 刷新）+ 按「已暂存 / 未暂存 / 未跟踪 / 冲突」分节 + `ChangeRow`（`+N/-M`）+ 加载 / 干净 / 非仓库 / 失败 / 空 五种落空态 + `NotPortedPane` |
+| `src/views/changes.rs` | **「变更」页**：`WorkspaceBar`（分支 / 仓库根 / 汇总 / 刷新 + **推送按钮** + **提交输入框与提交按钮**）+ 按「已暂存 / 未暂存 / 未跟踪 / 冲突」分节（每组带 **全部暂存 / 全部丢弃**）+ `ActionableChangeRow`（`+N/-M` + 行内 **暂存** 按钮 + 垃圾桶按钮，默认 `opacity-40`、hover 才完全显形）+ `NoticeBanner`（成功 / 失败提示条）+ 丢弃前的 `AlertDialog` 二次确认 + 加载 / 干净 / 非仓库 / 失败 / 空 五种落空态 + `NotPortedPane` |
 | `src/views/conversation.rs` | 消息流；助手头像挂 `HoverCard`；工具调用卡片（分段 `Progress`）；流式提示用受控 `Collapsible` + `Alert` |
 | `src/views/composer.rs` | `InputGroup`（`InlineStart` 回形针 / `Textarea` / `InlineEnd` 发送或停止）+ 审批模式选择器 |
 | `src/views/detail.rs` | 执行计划（受控 `Collapsible`）+ **变更文件（`ChangesSection`，真实数据）** + 工具调用 / 上下文来源（`Accordion`）+ 权限 `RadioGroup` + 分段 `Progress` + 图例 + `AvatarGroup` + `ButtonGroup` |
@@ -429,7 +430,7 @@ rsx! {
 ```bash
 cargo run -p zcode-app --example app_preview
 # → ./app-preview.html          （对话页，自包含，约 245 KB）
-# → ./app-preview-changes.html  （变更页，自包含，约 249 KB）
+# → ./app-preview-changes.html  （变更页，自包含，约 285 KB）
 ```
 
 把 [`AppShell`] 用 `dioxus-ssr` 渲染成 HTML，再把 `APP_CSS` 原样包进 `<style>`，
@@ -471,12 +472,14 @@ cargo run -p zcode-app --example app_preview
 `tokens.css` 顶部注释里。
 
 > 验证方式：把 vendored 版本生成的 `app.css` 与改动前逐字节比对。
-> 注意**每次新增组件或改类名都要重新跑一遍 build.sh** —— 本轮的「变更」页
+> 注意**每次新增组件或改类名都要重新跑一遍 build.sh** —— 上一轮的「变更」页
 > 就引入了 6 个此前没被扫到的类名（`border-destructive` / `break-all` / `h-11` /
-> `last:border-b-0` / `p-8` / `py-12`），漏掉它们界面会「类名在、效果不在」。
+> `last:border-b-0` / `p-8` / `py-12`）；这一轮接写操作时又多了 5 个
+> （`group` / `group-hover:opacity-100` / `opacity-40` / `pr-1.5` / `transition-opacity`），
+> 漏掉它们界面会「类名在、效果不在」—— 行内按钮会**永远半透明**。
 
 ```bash
-bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,214 字节）
+bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,728 字节）
 ```
 
 > ⚠️ Tailwind v4 会**按需裁剪** `@theme`：只有被实际用到的令牌才会作为 CSS 变量输出。
@@ -492,9 +495,9 @@ bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,214 
 | 纯函数单测 | `zcode-ui/src/**` 内联 `#[cfg(test)]` | 742 | 字符串包含 / 相等 / 数值 |
 | mutation 记录式渲染 | `zcode-ui/tests/render.rs` | 11 | 区分静态属性 / 动态属性 / 文本节点 |
 | HTML 快照 | `zcode-ui/tests/html_snapshot.rs` | 75 | 序列化后的 HTML 字符串 |
-| 整树冒烟（真实数据注入） | `zcode-app/tests/smoke.rs` | 23（+1 ignored） | 把整个应用（含浮层）真渲染一遍，变更页用 fixture 注入四种状态 |
-| 跨线程取数链路 | `zcode-app/tests/workspace_loader.rs` | 3 | 手写 executor 驱动 `refresh → 后台线程 → 通道 → 结果`，不依赖 dioxus 运行时 |
-| git 端到端 | `zcode-services/tests/git_workspace.rs` | 6 | 真起临时仓库，跑真实 `git status` |
+| 整树冒烟（真实数据注入） | `zcode-app/tests/smoke.rs` | 30（+1 ignored） | 把整个应用（含浮层）真渲染一遍，变更页用 fixture 注入四种数据状态 + 写操作入口与提示条 |
+| 跨线程读 / 写链路 | `zcode-app/tests/workspace_loader.rs` | 6 | 手写 executor 驱动 `refresh` / `run → 后台线程 → 通道 → 结果`，不依赖 dioxus 运行时 |
+| git 端到端 | `zcode-services/tests/git_workspace.rs` | 20 | 真起临时仓库，跑真实 `git status`（读 6）与 `stage` / `unstage` / `discard` / `commit` / `push`（写 14） |
 
 各 crate 明细：
 
@@ -502,16 +505,21 @@ bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,214 
 | --- | --- | --- | --- |
 | `zcode-rpc` | 10 | — | 10 |
 | `zcode-shared` | 18 | — | 18 |
-| `zcode-services` | 76 | 6 | 82 |
+| `zcode-services` | 91 | 20 | 111 |
 | `zcode-ui` | 742 | 75 + 11 | 828 |
-| `zcode-app` | 17 | 23 + 3 | 43 |
-| **合计** | **863** | **118** | **981** |
+| `zcode-app` | 25 | 30 + 6 | 61 |
+| **合计** | **886** | **142** | **1028** |
 
 > **为什么「变更」页的冒烟测试不跑真 git**：快照测试只跑同步代码，
 > `spawn` 出来的 future 根本不会被 poll，所以 `AppShell` 在拿不到
 > `WorkspaceBootstrap` 时不会发起扫描。测试用 `WorkspaceHarness` 直接注入
-> `WorkspaceSeed`（`changes` / `clean` / `not-repo` / `failed` / `loading` 五个 fixture），
+> `WorkspaceSeed`（`changes` / `clean` / `not-repo` / `failed` / `loading` 五个 fixture）
+> 与 `WorkspaceNotice`（成功 / 失败两种），
 > 于是**渲染层测试完全确定**，真 git 的行为交给 `zcode-services` 那两层去测。
+>
+> 写操作那条路因此被拆成三段各自验证：**渲染**（smoke 断言按钮 / 提交框 /
+> 确认弹窗在不在）、**通道语义**（loader 断言 `Loading → Notice → Loaded`
+> 的顺序与内容）、**git 行为**（services 断言文件真的进了索引 / 真的回到 HEAD）。
 
 ### 5.1 纯函数单测（742 个）
 
@@ -599,7 +607,7 @@ cargo run -p zcode-ui --example preview            # → ./preview.html
 浏览器版 + 从 `packages/ui/src/styles.css` 复刻的 `@theme` / `@custom-variant`
 令牌驱动（需联网加载 CDN；离线打开会退化为无样式但结构正确的 HTML）。
 
-### 5.5 整树冒烟 + 「能正常运行」的判定（23 + 1 ignored）
+### 5.5 整树冒烟 + 「能正常运行」的判定（30 + 1 ignored）
 
 `zcode-app/tests/smoke.rs` 把 [`AppShell`] 整棵树、以及三个浮层（画廊 / 设置 /
 删除确认）**真渲染一遍**，断言：
@@ -613,16 +621,28 @@ cargo run -p zcode-ui --example preview            # → ./preview.html
   `open: Some(signal(true))` 强制打开后再断言内容标记；
 - **「变更」页在五种数据状态下分别渲染出正确的内容**（真实变更列表 / 干净 /
   非仓库 / 加载失败 / 加载中），且失败态**必须显示错误信息而不是空白**；
+- **写操作入口真的在**：每行有 `暂存` 与垃圾桶按钮、每个分组有 `全部暂存` /
+  `全部丢弃`、`WorkspaceBar` 有提交输入框与提交按钮；非仓库时不渲染提交框
+  （因为提交必然失败，留着只会误导）；
+- **丢弃必须先确认**：默认渲染里 `alert-dialog-content` **不在** DOM 中，
+  点垃圾桶才会出现 —— 「唯一会丢数据的操作」不能靠一次误点触发；
+- **提示条能读出内容**：成功（绿）与失败（红）两种 `WorkspaceNotice`
+  都渲染出完整文案，且在「非仓库」状态下也照样显示；
 - 顶栏 `WorkspaceBadge` 的五个分支各命中一次；「任务」tab 渲染 `NotPortedPane`
   而不是静默空白。
 
 其中一条专门盯着「类名在 DOM 上、但样式表里没编译出规则」这个坑：
 断言 `[scrollbar-width:none]` 既出现在 DOM 里，也出现在内嵌 CSS 里。
 
-**跨线程取数链路**（`workspace_loader.rs`）另起一组：不启动 dioxus 运行时，
-用手写的 `FlagWaker` + `poll_fn` 驱动 `WorkspaceRequester::refresh()`，
-断言「加载成功」「不是仓库也是一种正常状态而不是失败」「上一次没跑完时重复
-`refresh` 会被忽略（`busy` 标志）」。
+**跨线程读 / 写链路**（`workspace_loader.rs`）另起一组：不启动 dioxus 运行时，
+用手写的 `FlagWaker` + `poll_fn` 驱动 `WorkspaceRequester`，断言：
+
+- `refresh`：「加载成功」「不是仓库也是一种正常状态而不是失败」
+  「上一次没跑完时重复 `refresh` 会被忽略（`busy` 标志）」；
+- `run`：`Loading → Notice → Loaded` 的**顺序**（先报结果、再刷新）、暂存后
+  重新扫描拿到的是**新状态**（文件从「未跟踪」挪到「已暂存」）、
+  失败时提示里带得上 git 给的原因**且仍然刷新**、`discard` 之后
+  **磁盘上的内容真的回到了 HEAD 版本**。
 
 **开窗口**这一层没法在无头环境自动验证，只能上外部探针。下面这张表记的是一次
 **踩坑**：起初只核对前四项就下了「跑通了」的结论，其实**窗口是空白的**。
@@ -715,11 +735,13 @@ cargo run -p zcode-ui --example preview            # → ./preview.html
 6. **桌面窗口仍然渲染不出内容** —— dioxus-desktop 0.6.3 与 WebView2
    `154.0.4258.62` 的兼容性问题，成因与出路见 [README.md](./README.md)
    「已知问题」。这是目前**唯一**挡住「真的在窗口里看到界面」的东西；
-   组件树本身已被 SSR 快照与 23 条冒烟断言证明是对的。
-7. **「变更」页只读** —— git 的读路径已全部移植（见 [PORTING.md](./PORTING.md) §2.4），
-   但 `stage` / `unstage` / `discard` / `commit` 这些写操作还没接。
-   `ChangeRow` 目前只是展示行，还没有右键菜单 / 勾选框 / 提交入口 ——
-   等写操作移植到位后再补 UI。
+   组件树本身已被 SSR 快照与 30 条冒烟断言证明是对的。
+7. **「变更」页的写操作已接上，但还缺几块** —— `stage` / `unstage` / `discard` /
+   `commit` / `push` 五个动作已可用（见 [PORTING.md](./PORTING.md) §2.5），
+   还没有的是：**右键菜单 / 勾选框式多选**（现在只能逐行或整组操作）、
+   **提交信息生成**（`gitCommitMessageGenerator` 依赖 LLM，属未移植子系统）、
+   **部分提交**（上游的 `stagedOnly` 变体靠临时 `GIT_INDEX_FILE`，本移植有意未做）、
+   以及**冲突解决入口**（冲突现在只在「冲突」分组里列出来，点不了）。
 8. **其余页面仍是演示数据** —— 会话流 / 输入区 / 设置里的内容还是 `demo_state()`
    的硬编码值。它们要接的是会话与消息存储，那是 `packages/services` 里
    体量大得多的另一块。

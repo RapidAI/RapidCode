@@ -6,7 +6,7 @@
 //! 它们是「这个服务层的契约」的一部分，删掉会让后续补写操作时无据可依。
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 /// 探测 `git --version` 的单次超时。
@@ -188,6 +188,54 @@ fn strip_leading_dot_slash(value: &str) -> &str {
     }
 }
 
+/// 纯词法地消解 `.` / `..`，**不碰文件系统**。
+///
+/// 用途是「路径还不存在 / 已不存在」的场景：`discard` 要处理的正是被删掉的
+/// 文件，`canonicalize` 对它必然失败。起点是 `..` 时保留，不越过根。
+pub fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// `realpath` 的 Rust 等价物，带兜底。
+///
+/// 两个细节：
+///
+/// 1. `std::fs::canonicalize` 在 Windows 上返回 `\\?\C:\...` 这种 **verbatim 前缀**
+///    形式，和普通路径做 `strip_prefix` 会永远比不中 —— 所以剥掉前缀。
+///    `\\?\UNC\server\share` 要还原成 `\\server\share`。
+/// 2. 失败时退回 [`normalize_lexically`]，与上游 `realpath(...).catch(() => raw)`
+///    的兜底一致。**两边都必须走这个函数**，否则一边 verbatim 一边普通，
+///    比较结果不可信。
+pub fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => strip_verbatim_prefix(canonical),
+        Err(_) => normalize_lexically(path),
+    }
+}
+
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return path;
+    };
+    match rest.strip_prefix("UNC\\") {
+        Some(unc) => PathBuf::from(format!(r"\\{unc}")),
+        None => PathBuf::from(rest.to_string()),
+    }
+}
+
 /// 读取一个「存在且非空」的环境变量。
 fn non_empty_env(name: &str) -> Option<OsString> {
     let value = std::env::var_os(name)?;
@@ -223,6 +271,32 @@ mod tests {
     fn normalize_git_path_converts_backslashes() {
         assert_eq!(normalize_git_path(r"a\b\c.rs"), "a/b/c.rs");
         assert_eq!(normalize_git_path("a/b/c.rs"), "a/b/c.rs");
+    }
+
+    #[test]
+    fn canonicalize_best_effort_never_returns_a_verbatim_prefix() {
+        // 真实存在的路径走 canonicalize；不存在的走词法兜底。两者都不能带
+        // Windows 的 `\\?\` 前缀，否则和普通路径 strip_prefix 会比不中。
+        let existing = std::env::temp_dir();
+        let canonical = canonicalize_best_effort(&existing);
+        assert!(
+            !canonical.to_string_lossy().starts_with(r"\\?\"),
+            "verbatim 前缀没被剥掉：{}",
+            canonical.display()
+        );
+
+        let missing = existing.join("zcode-does-not-exist-12345").join("a.rs");
+        let fallback = canonicalize_best_effort(&missing);
+        assert_eq!(fallback, normalize_lexically(&missing));
+    }
+
+    #[test]
+    fn canonicalize_best_effort_agrees_with_itself_on_both_sides() {
+        // 归一化必须幂等：调用方靠「两边都过同一个函数」来做 strip_prefix。
+        let path = std::env::temp_dir().join("zcode-idempotent-probe");
+        let once = canonicalize_best_effort(&path);
+        let twice = canonicalize_best_effort(&once);
+        assert_eq!(once, twice);
     }
 
     #[test]

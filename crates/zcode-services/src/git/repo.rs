@@ -17,7 +17,7 @@
 //! 这是纯粹的省时优化，与并发模型无关，因此照搬。
 
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use zcode_shared::git::{
@@ -26,15 +26,17 @@ use zcode_shared::git::{
 };
 
 use super::cli_helpers::{
-    build_untracked_stats, ensure_git_command_succeeded, is_missing_working_directory_result,
-    is_not_repository_result, parse_numstat, parse_status_porcelain, GitCommandFailure,
+    build_untracked_stats, ensure_git_command_succeeded, ensure_git_command_succeeded_with,
+    ensure_repository_available, is_missing_working_directory_result, is_not_repository_result,
+    normalize_input_paths, parse_numstat, parse_status_porcelain, GitCommandFailure,
     GitCommandFailureKind,
 };
 use super::config::{
-    normalize_workspace_in_repo_path, DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_GIT_OUTPUT_BYTES,
+    normalize_lexically, normalize_workspace_in_repo_path, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    DEFAULT_GIT_OUTPUT_BYTES, DEFAULT_GIT_PUSH_OUTPUT_BYTES, DEFAULT_GIT_PUSH_TIMEOUT_MS,
 };
 use super::provider::{GitCommandProvider, GitCommandRequest};
-use super::types::{GitResolvedRepository, GitStatusSnapshot};
+use super::types::{GitCommitResult, GitPushResult, GitResolvedRepository, GitStatusSnapshot};
 
 /// `git status` 的未跟踪模式。
 ///
@@ -271,6 +273,295 @@ impl GitCliRepo {
         })
     }
 
+    // -----------------------------------------------------------------
+    // 写操作
+    //
+    // 全部对应上游 `gitCliRepo.ts` 里的同名方法。四条共同约定：
+    //
+    // 1. 先 `ensure_repository_available`，再跑命令 —— 非仓库/无 git 时报的是
+    //    「为什么不能做」而不是 git 的原始报错；
+    // 2. 路径一律过 `normalize_input_paths`（归一 + 去重 + 越界拦截）；
+    // 3. 空路径列表**直接返回成功**，不跑命令（上游同样如此）；
+    // 4. 成功后调用方负责重新扫描 —— 上游用 `invalidate(workspacePath)` 清缓存，
+    //    本移植没有缓存（见模块文档），所以这里只返回结果。
+    // -----------------------------------------------------------------
+
+    /// `git add -- <paths>`。
+    pub fn stage(&self, workspace_path: &Path, paths: &[String]) -> Result<(), GitCommandFailure> {
+        let resolution = self.resolve_repository(workspace_path)?;
+        let resolution = ensure_repository_available(&resolution, "stage paths")?;
+        let repo_paths = normalize_input_paths(resolution, paths)?;
+        if repo_paths.is_empty() {
+            return Ok(());
+        }
+
+        let mut args = vec!["add".to_string(), "--".to_string()];
+        args.extend(repo_paths);
+        let result = self.provider.run(
+            &GitCommandRequest::new(&resolution.repo_root, args)
+                .with_timeout_ms(DEFAULT_GIT_COMMAND_TIMEOUT_MS),
+        )?;
+        ensure_git_command_succeeded("git add", &result)
+    }
+
+    /// `git restore --staged -- <paths>`。
+    pub fn unstage(&self, workspace_path: &Path, paths: &[String]) -> Result<(), GitCommandFailure> {
+        let resolution = self.resolve_repository(workspace_path)?;
+        let resolution = ensure_repository_available(&resolution, "unstage paths")?;
+        let repo_paths = normalize_input_paths(resolution, paths)?;
+        if repo_paths.is_empty() {
+            return Ok(());
+        }
+
+        let mut args = vec![
+            "restore".to_string(),
+            "--staged".to_string(),
+            "--".to_string(),
+        ];
+        args.extend(repo_paths);
+        let result = self.provider.run(
+            &GitCommandRequest::new(&resolution.repo_root, args)
+                .with_timeout_ms(DEFAULT_GIT_COMMAND_TIMEOUT_MS),
+        )?;
+        ensure_git_command_succeeded("git restore --staged", &result)
+    }
+
+    /// 丢弃改动。
+    ///
+    /// `staged = true` 时连暂存区一起回退到 HEAD（`--source=HEAD --staged --worktree`），
+    /// 否则只回退工作区（`--worktree`）。
+    ///
+    /// ⚠️ **这是本 crate 里唯一会丢数据的操作**，不可撤销。调用方必须先拿到用户确认。
+    pub fn discard(
+        &self,
+        workspace_path: &Path,
+        paths: &[String],
+        staged: bool,
+    ) -> Result<(), GitCommandFailure> {
+        let resolution = self.resolve_repository(workspace_path)?;
+        let resolution = ensure_repository_available(&resolution, "discard paths")?;
+        let repo_paths = normalize_input_paths(resolution, paths)?;
+        if repo_paths.is_empty() {
+            return Ok(());
+        }
+
+        let mut args: Vec<String> = if staged {
+            ["restore", "--source=HEAD", "--staged", "--worktree", "--"]
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect()
+        } else {
+            ["restore", "--worktree", "--"]
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect()
+        };
+        args.extend(repo_paths);
+        let result = self.provider.run(
+            &GitCommandRequest::new(&resolution.repo_root, args)
+                .with_timeout_ms(DEFAULT_GIT_COMMAND_TIMEOUT_MS),
+        )?;
+        ensure_git_command_succeeded("git restore", &result)
+    }
+
+    /// `git commit -m <message>`，返回新提交的哈希。
+    ///
+    /// `paths` 非空时走 `git commit -m <msg> -- <paths>`（只提交这些路径）。
+    ///
+    /// 上游还有一个 `stagedOnly` 变体：用临时 `GIT_INDEX_FILE` 只把选中的
+    /// 已暂存路径写进新提交。**本移植有意未实现**（见 `lib.rs` 的未移植清单），
+    /// 因此调用方不要期待「部分提交已暂存内容」这个能力。
+    pub fn commit(
+        &self,
+        workspace_path: &Path,
+        message: &str,
+        paths: &[String],
+    ) -> Result<GitCommitResult, GitCommandFailure> {
+        let resolution = self.resolve_repository(workspace_path)?;
+        let resolution = ensure_repository_available(&resolution, "commit changes")?;
+
+        let trimmed_message = message.trim();
+        if trimmed_message.is_empty() {
+            return Err(GitCommandFailure {
+                label: "git commit".to_string(),
+                kind: GitCommandFailureKind::InvalidArgument,
+                message: "Commit message cannot be empty".to_string(),
+            });
+        }
+
+        let repo_paths = normalize_input_paths(resolution, paths)?;
+
+        let mut args = vec!["commit".to_string(), "-m".to_string(), trimmed_message.to_string()];
+        if !repo_paths.is_empty() {
+            args.push("--".to_string());
+            args.extend(repo_paths);
+        }
+
+        let result = self.provider.run(
+            &GitCommandRequest::new(&resolution.repo_root, args)
+                .with_timeout_ms(DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+                .with_max_output_bytes(DEFAULT_GIT_OUTPUT_BYTES),
+        )?;
+        ensure_git_command_succeeded("git commit", &result)?;
+
+        let hash_result = self.provider.run(
+            &GitCommandRequest::new(&resolution.repo_root, ["rev-parse", "HEAD"])
+                .with_timeout_ms(DEFAULT_GIT_COMMAND_TIMEOUT_MS),
+        )?;
+        ensure_git_command_succeeded("git rev-parse HEAD", &hash_result)?;
+
+        Ok(GitCommitResult {
+            commit_hash: hash_result.stdout.trim().to_string(),
+        })
+    }
+
+    /// `git push`（无上游时补 `--set-upstream <remote> <branch>`）。
+    ///
+    /// 超时与输出上限都用 push 专用的放宽配额：pre-push hook 可能跑完整测试套件，
+    /// 用 15s / 512KiB 会把「还在跑」误判成「失败」。
+    pub fn push(&self, workspace_path: &Path) -> Result<GitPushResult, GitCommandFailure> {
+        let status = self.get_status(workspace_path)?;
+        let resolution = ensure_repository_available(&status.resolution, "push changes")?;
+
+        let branch_name = status
+            .summary
+            .branch_name
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        if status.summary.head_ref_type != GitHeadRefType::Branch || branch_name.is_empty() {
+            return Err(GitCommandFailure {
+                label: "git push".to_string(),
+                kind: GitCommandFailureKind::RepositoryUnavailable,
+                message: "Cannot push while HEAD is detached.".to_string(),
+            });
+        }
+
+        let tracking_branch_name = status.summary.tracking_branch_name.clone();
+        let has_tracking_branch = tracking_branch_name
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        let remote_name = if has_tracking_branch {
+            tracking_branch_name
+                .as_deref()
+                .and_then(parse_tracking_remote_name)
+        } else {
+            Some(self.resolve_push_remote(resolution, &branch_name)?)
+        };
+
+        let args: Vec<String> = if has_tracking_branch {
+            vec!["push".to_string()]
+        } else {
+            vec![
+                "push".to_string(),
+                "--set-upstream".to_string(),
+                remote_name.clone().unwrap_or_else(|| "origin".to_string()),
+                branch_name.clone(),
+            ]
+        };
+
+        let result = self.provider.run(
+            &GitCommandRequest::new(&resolution.repo_root, args)
+                .with_timeout_ms(DEFAULT_GIT_PUSH_TIMEOUT_MS)
+                .with_max_output_bytes(DEFAULT_GIT_PUSH_OUTPUT_BYTES),
+        )?;
+        ensure_git_command_succeeded("git push", &result)?;
+
+        // 重新读一次状态，拿到 push 之后的 tracking 关系（可能刚建立）。
+        let next_status = self.get_status(workspace_path)?;
+        Ok(GitPushResult {
+            branch_name,
+            tracking_branch_name: next_status.summary.tracking_branch_name.clone(),
+            remote_name: remote_name
+                .or_else(|| next_status.summary.tracking_branch_name.as_deref().and_then(parse_tracking_remote_name)),
+            set_upstream: !has_tracking_branch,
+        })
+    }
+
+    /// 决定「没有 upstream 时该推到哪个 remote」。
+    ///
+    /// 优先级与上游一致：`branch.<name>.remote` → `remote.pushDefault` →
+    /// 叫 `origin` 的 remote → 唯一的一个 remote → 报错。
+    fn resolve_push_remote(
+        &self,
+        resolution: &GitResolvedRepository,
+        branch_name: &str,
+    ) -> Result<String, GitCommandFailure> {
+        if let Some(remote) = self.read_optional_git_config(
+            resolution,
+            &format!("branch.{branch_name}.remote"),
+        )? {
+            return Ok(remote);
+        }
+
+        if let Some(remote) = self.read_optional_git_config(resolution, "remote.pushDefault")? {
+            return Ok(remote);
+        }
+
+        let remotes = self.list_remotes(resolution)?;
+        if remotes.iter().any(|name| name == "origin") {
+            return Ok("origin".to_string());
+        }
+
+        match remotes.len() {
+            0 => Err(GitCommandFailure {
+                label: "git push".to_string(),
+                kind: GitCommandFailureKind::RepositoryUnavailable,
+                message: "No Git remote is configured for the current repository.".to_string(),
+            }),
+            1 => Ok(remotes[0].clone()),
+            _ => Err(GitCommandFailure {
+                label: "git push".to_string(),
+                kind: GitCommandFailureKind::RepositoryUnavailable,
+                message:
+                    "Multiple Git remotes are configured. Configure branch.<name>.remote or remote.pushDefault first."
+                        .to_string(),
+            }),
+        }
+    }
+
+    /// 读一条 git config；键不存在（退出码 1）返回 `None` 而不是报错。
+    fn read_optional_git_config(
+        &self,
+        resolution: &GitResolvedRepository,
+        key: &str,
+    ) -> Result<Option<String>, GitCommandFailure> {
+        let result = self.provider.run(
+            &GitCommandRequest::new(&resolution.repo_root, ["config", "--get", key])
+                .with_timeout_ms(DEFAULT_GIT_COMMAND_TIMEOUT_MS),
+        )?;
+
+        // 退出码 1 = 键不存在，属于正常情况。
+        ensure_git_command_succeeded_with(&format!("git config --get {key}"), &result, &[0, 1])?;
+        let value = result.stdout.trim();
+        Ok(if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        })
+    }
+
+    /// `git remote` —— 每行一个 remote 名。
+    fn list_remotes(
+        &self,
+        resolution: &GitResolvedRepository,
+    ) -> Result<Vec<String>, GitCommandFailure> {
+        let result = self.provider.run(
+            &GitCommandRequest::new(&resolution.repo_root, ["remote"])
+                .with_timeout_ms(DEFAULT_GIT_COMMAND_TIMEOUT_MS),
+        )?;
+        ensure_git_command_succeeded("git remote", &result)?;
+        Ok(result
+            .stdout
+            .split('\n')
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     /// 跑 `git status`，必要时降级到目录折叠模式。
     fn run_git_status(
         &self,
@@ -377,6 +668,23 @@ pub fn parse_branch_ref_records(stdout: &str, current_branch_name: Option<&str>)
     branches
 }
 
+/// 从 `origin/main` 这类上游名里取出 remote 名（`origin`）。
+///
+/// 对应上游 `parseTrackingRemoteName`。取不到（空串 / 没有 `/` 之前的段）时返回
+/// `None`，与上游返回 `null` 一致。
+pub fn parse_tracking_remote_name(tracking_branch_name: &str) -> Option<String> {
+    let remote_name = tracking_branch_name
+        .split('/')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+    if remote_name.is_empty() {
+        None
+    } else {
+        Some(remote_name.to_string())
+    }
+}
+
 /// 构造 Git 元数据的刷新边界。
 ///
 /// 只输出 Git 元数据目录，不输出 workspacePath：Linux 上对整棵 workspace 做
@@ -440,26 +748,6 @@ fn is_windows_drive_root(value: &str) -> bool {
         && bytes.len() >= 2
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
-}
-
-/// 纯词法地消解 `.` / `..`（对应 Node 的 `path.resolve`）。
-///
-/// 刻意不用 [`std::fs::canonicalize`]：它要求路径存在，且在 Windows 上会加上
-/// `\\?\` 前缀，两者都不是我们想要的。
-fn normalize_lexically(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    normalized.push("..");
-                }
-            }
-            Component::CurDir => {}
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
 }
 
 /// 加锁时忽略中毒状态：集合里只有字符串，中毒也不会让它变成坏数据。
@@ -550,6 +838,29 @@ mod tests {
         );
         // 起点就是 .. 时保留，不越过根
         assert_eq!(normalize_lexically(Path::new("../x")), PathBuf::from("../x"));
+    }
+
+    #[test]
+    fn tracking_remote_name_takes_the_first_segment() {
+        assert_eq!(
+            parse_tracking_remote_name("origin/main"),
+            Some("origin".to_string())
+        );
+        // 远端名里带 `/`（例如 gitlab 的 subgroup）时只取第一段，与上游一致
+        assert_eq!(
+            parse_tracking_remote_name("upstream/release/1.x"),
+            Some("upstream".to_string())
+        );
+        // 没有 `/` → 整串就是 remote 名
+        assert_eq!(
+            parse_tracking_remote_name("origin"),
+            Some("origin".to_string())
+        );
+        // 空串 / 只有空白 → None（上游返回 null）
+        assert_eq!(parse_tracking_remote_name(""), None);
+        assert_eq!(parse_tracking_remote_name("   "), None);
+        // `/main` → 第一段是空串 → None
+        assert_eq!(parse_tracking_remote_name("/main"), None);
     }
 
     #[test]

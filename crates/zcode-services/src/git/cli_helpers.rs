@@ -32,11 +32,11 @@ use std::sync::Mutex;
 use zcode_shared::git::{GitChangeKind, GitHeadRefType};
 
 use super::config::{
-    normalize_git_path, GIT_UNTRACKED_STAT_CHUNK_BYTES, GIT_UNTRACKED_STAT_CONCURRENCY,
-    GIT_UNTRACKED_STAT_MAX_BYTES,
+    canonicalize_best_effort, normalize_git_path, GIT_UNTRACKED_STAT_CHUNK_BYTES,
+    GIT_UNTRACKED_STAT_CONCURRENCY, GIT_UNTRACKED_STAT_MAX_BYTES,
 };
 use super::provider::{GitCommandExecutionResult, GitSpawnErrorKind};
-use super::types::{GitLineStat, GitStatusEntry};
+use super::types::{GitLineStat, GitResolvedRepository, GitStatusEntry};
 
 /// [`ensure_git_command_succeeded`] 的默认退出码白名单。
 pub const DEFAULT_ALLOWED_EXIT_CODES: [i32; 1] = [0];
@@ -48,6 +48,15 @@ pub enum GitCommandFailureKind {
     OutputTruncated,
     /// 退出码不在白名单里（含 spawn 失败导致的 `-2`）。
     NonZeroExit,
+    /// 前置条件不满足：没有可用的 git，或 workspace 不在仓库里。
+    ///
+    /// 上游在写操作入口用 `ensureRepositoryAvailable` 抛 `Error` 表达这一种；
+    /// Rust 侧归到同一个错误类型里，调用方只需处理 [`GitCommandFailure`]。
+    RepositoryUnavailable,
+    /// 传入的路径落在仓库范围之外。
+    PathOutsideRepository,
+    /// 参数本身非法（目前只有「提交信息为空」）。
+    InvalidArgument,
 }
 
 /// 一条 Git 命令失败。
@@ -172,6 +181,95 @@ pub fn is_missing_working_directory_result(result: &GitCommandExecutionResult) -
     let stderr = result.stderr.to_lowercase();
     stderr.contains("unable to read current working directory")
         || stderr.contains("no such file or directory")
+}
+
+/// 写操作的前置校验：git 可用 **且** workspace 确实在仓库里。
+///
+/// 对应上游 `ensureRepositoryAvailable(resolution, label)`。
+/// 上游在这里抛 `Error`；Rust 侧归到 [`GitCommandFailureKind::RepositoryUnavailable`]，
+/// 让调用方只需要处理一种错误类型。
+pub fn ensure_repository_available<'a>(
+    resolution: &'a GitResolvedRepository,
+    label: &str,
+) -> Result<&'a GitResolvedRepository, GitCommandFailure> {
+    if !resolution.is_git_available {
+        return Err(GitCommandFailure {
+            label: label.to_string(),
+            kind: GitCommandFailureKind::RepositoryUnavailable,
+            message: format!("Cannot {label}: Git binary is not available"),
+        });
+    }
+
+    if !resolution.is_repository {
+        return Err(GitCommandFailure {
+            label: label.to_string(),
+            kind: GitCommandFailureKind::RepositoryUnavailable,
+            message: format!("Cannot {label}: workspace is not inside a Git repository"),
+        });
+    }
+
+    Ok(resolution)
+}
+
+/// 把用户给的路径归一成「仓库相对路径」。
+///
+/// 对应上游 `normalizeInputPath(resolution, path)`。三条规则：
+///
+/// 1. 绝对路径直接用；**相对路径以 workspace 为基准**（不是仓库根）——
+///    界面上给的就是 workspace 相对路径；
+/// 2. 先试 `realpath`（消解符号链接），失败退回词法归一。
+///    `discard` 处理的正是「已被删除的文件」，它当然不存在；
+/// 3. 落在仓库外一律报错。`git add -- <repo 外的路径>` 会被 git 自己拒掉，
+///    但错误信息很不直观，这里提前拦掉。
+pub fn normalize_input_path(
+    resolution: &GitResolvedRepository,
+    path: &str,
+) -> Result<String, GitCommandFailure> {
+    let raw_absolute = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        Path::new(&resolution.workspace_path).join(path.replace('/', std::path::MAIN_SEPARATOR_STR))
+    };
+    let absolute = canonicalize_best_effort(&raw_absolute);
+    let repo_root = canonicalize_best_effort(Path::new(&resolution.repo_root));
+
+    let repo_relative = absolute
+        .strip_prefix(&repo_root)
+        .map(|rest| normalize_git_path(&rest.to_string_lossy()))
+        .unwrap_or_default();
+
+    if repo_relative.is_empty()
+        || repo_relative == "."
+        || repo_relative == ".."
+        || repo_relative.starts_with("../")
+    {
+        return Err(GitCommandFailure {
+            label: "normalize path".to_string(),
+            kind: GitCommandFailureKind::PathOutsideRepository,
+            message: format!("Path is outside repository scope: {path}"),
+        });
+    }
+
+    Ok(repo_relative)
+}
+
+/// 批量归一化并去重（保持首次出现的顺序）。
+///
+/// 对应上游的 `Array.from(new Set(await Promise.all(paths.map(normalizeInputPath))))`。
+/// 去重很重要：界面上「已暂存」和「未暂存」两节可能选中同一个文件，
+/// 重复的 pathspec 会让 `git add` 报歧义。
+pub fn normalize_input_paths(
+    resolution: &GitResolvedRepository,
+    paths: &[String],
+) -> Result<Vec<String>, GitCommandFailure> {
+    let mut normalized = Vec::with_capacity(paths.len());
+    for path in paths {
+        let repo_relative = normalize_input_path(resolution, path)?;
+        if !normalized.contains(&repo_relative) {
+            normalized.push(repo_relative);
+        }
+    }
+    Ok(normalized)
 }
 
 /// 单个状态码归一成变更性质。
@@ -1039,5 +1137,116 @@ mod tests {
         // 目录记录（超限降级时 Git 会输出末尾带 `/` 的目录）
         let joined = join_repo_relative(Path::new("/repo"), "build/");
         assert_eq!(joined, Path::new("/repo/build"));
+    }
+
+    // ---------------------------------------------------------------
+    // 写操作的前置校验与路径归一
+    // ---------------------------------------------------------------
+
+    /// 造一个 resolution。路径刻意指向**不存在的目录**，
+    /// 这样 `canonicalize` 必然失败、走词法兜底，测试就是纯的、不碰真实文件系统。
+    fn resolution(workspace: &str, repo_root: &str, is_git_available: bool, is_repository: bool) -> GitResolvedRepository {
+        GitResolvedRepository {
+            workspace_path: workspace.to_string(),
+            repo_root: repo_root.to_string(),
+            workspace_in_repo_path: ".".to_string(),
+            auto_refresh_watch_paths: Vec::new(),
+            is_git_available,
+            is_repository,
+        }
+    }
+
+    #[test]
+    fn ensure_repository_available_reports_missing_git_first() {
+        let unavailable = resolution("/repo", "/repo", false, false);
+        let failure = ensure_repository_available(&unavailable, "stage paths").unwrap_err();
+        assert_eq!(failure.kind, GitCommandFailureKind::RepositoryUnavailable);
+        // 「没有 git」要优先于「不是仓库」报出来 —— 否则用户会去查错方向
+        assert_eq!(
+            failure.message,
+            "Cannot stage paths: Git binary is not available"
+        );
+    }
+
+    #[test]
+    fn ensure_repository_available_reports_non_repository() {
+        let plain_dir = resolution("/plain", "/plain", true, false);
+        let failure = ensure_repository_available(&plain_dir, "commit changes").unwrap_err();
+        assert_eq!(failure.kind, GitCommandFailureKind::RepositoryUnavailable);
+        assert_eq!(
+            failure.message,
+            "Cannot commit changes: workspace is not inside a Git repository"
+        );
+    }
+
+    #[test]
+    fn ensure_repository_available_passes_through_usable_resolution() {
+        let usable = resolution("/repo", "/repo", true, true);
+        let checked = ensure_repository_available(&usable, "stage paths").unwrap();
+        assert_eq!(checked.repo_root, "/repo");
+    }
+
+    #[test]
+    fn normalize_input_path_is_relative_to_workspace_not_repo_root() {
+        // workspace 是仓库的子目录：界面上给的是 workspace 相对路径
+        let res = resolution("/repo/sub", "/repo", true, true);
+        let normalized = normalize_input_path(&res, "a/b.rs").unwrap();
+        assert_eq!(normalized, "sub/a/b.rs");
+    }
+
+    #[test]
+    fn normalize_input_path_converts_windows_separators_and_dot_segments() {
+        let res = resolution("/repo", "/repo", true, true);
+        // 反斜杠与 `..` 都要被消解；结果统一用 `/`
+        let normalized = normalize_input_path(&res, r"src\..\src\a.rs").unwrap();
+        assert_eq!(normalized, "src/a.rs");
+    }
+
+    #[test]
+    fn normalize_input_path_rejects_paths_outside_the_repository() {
+        let res = resolution("/repo", "/repo", true, true);
+        let failure = normalize_input_path(&res, "../outside.txt").unwrap_err();
+        assert_eq!(failure.kind, GitCommandFailureKind::PathOutsideRepository);
+        assert!(
+            failure.message.contains("outside repository scope"),
+            "实际消息：{}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn normalize_input_path_rejects_the_repository_root_itself() {
+        let res = resolution("/repo", "/repo", true, true);
+        // `.` 会归一到仓库根 → 空相对路径 → 必须拒绝（git 不接受空 pathspec）
+        let failure = normalize_input_path(&res, ".").unwrap_err();
+        assert_eq!(failure.kind, GitCommandFailureKind::PathOutsideRepository);
+    }
+
+    #[test]
+    fn normalize_input_paths_dedupes_while_keeping_order() {
+        let res = resolution("/repo", "/repo", true, true);
+        let paths = vec![
+            "b.rs".to_string(),
+            "a.rs".to_string(),
+            // 同一个文件的两种写法，归一后必须只剩一条
+            "./b.rs".to_string(),
+            r"a.rs".to_string(),
+        ];
+        let normalized = normalize_input_paths(&res, &paths).unwrap();
+        assert_eq!(normalized, vec!["b.rs".to_string(), "a.rs".to_string()]);
+    }
+
+    #[test]
+    fn normalize_input_paths_propagates_the_first_bad_path() {
+        let res = resolution("/repo", "/repo", true, true);
+        let paths = vec!["ok.rs".to_string(), "../bad.rs".to_string()];
+        let failure = normalize_input_paths(&res, &paths).unwrap_err();
+        assert_eq!(failure.kind, GitCommandFailureKind::PathOutsideRepository);
+    }
+
+    #[test]
+    fn normalize_input_paths_is_empty_for_no_input() {
+        let res = resolution("/repo", "/repo", true, true);
+        assert!(normalize_input_paths(&res, &[]).unwrap().is_empty());
     }
 }

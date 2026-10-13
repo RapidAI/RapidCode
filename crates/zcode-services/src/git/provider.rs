@@ -24,7 +24,7 @@
 //!   `force_kill_attempted` 的含义收敛成「超时时确实调用了 kill」。
 //! - spawn 失败时额外带上 [`GitSpawnErrorKind`]，判定「cwd 不存在」不再依赖 stderr 文案。
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -152,6 +152,12 @@ pub struct GitCommandRequest {
     pub args: Vec<String>,
     pub timeout_ms: u64,
     pub max_output_bytes: usize,
+    /// 单条命令的环境变量覆盖。
+    ///
+    /// **在 [`apply_git_command_env`] 之后叠加**，所以能盖掉被清掉的
+    /// `GIT_*`（例如部分提交要临时指定 `GIT_INDEX_FILE`）。
+    /// 上游是 `{ ...createCommandEnv(), ...command.env }`，顺序一致。
+    pub env: Vec<(OsString, OsString)>,
 }
 
 impl GitCommandRequest {
@@ -166,6 +172,7 @@ impl GitCommandRequest {
             args: args.into_iter().map(Into::into).collect(),
             timeout_ms: DEFAULT_GIT_COMMAND_TIMEOUT_MS,
             max_output_bytes: DEFAULT_GIT_OUTPUT_BYTES,
+            env: Vec::new(),
         }
     }
 
@@ -176,6 +183,12 @@ impl GitCommandRequest {
 
     pub fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
         self.max_output_bytes = max_output_bytes;
+        self
+    }
+
+    /// 追加一条环境变量覆盖（同名后者胜）。
+    pub fn with_env(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.push((name.into(), value.into()));
         self
     }
 }
@@ -259,6 +272,10 @@ impl GitCommandProvider {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         apply_git_command_env(&mut command);
+        // 单条命令的覆盖要**后**加，否则会被上面的 env_remove 清掉。
+        for (name, value) in &request.env {
+            command.env(name, value);
+        }
         hide_console(&mut command);
 
         let mut child = match command.spawn() {
@@ -702,6 +719,54 @@ mod tests {
         let request = request.with_timeout_ms(123).with_max_output_bytes(456);
         assert_eq!(request.timeout_ms, 123);
         assert_eq!(request.max_output_bytes, 456);
+    }
+
+    #[test]
+    fn request_builder_accumulates_env_overrides() {
+        let request = GitCommandRequest::new("/tmp", ["status"])
+            .with_env("GIT_INDEX_FILE", "/tmp/index")
+            .with_env("ZCODE_MARKER", "1");
+
+        assert_eq!(request.env.len(), 2);
+        assert_eq!(request.env[0].0, OsString::from("GIT_INDEX_FILE"));
+        assert_eq!(request.env[0].1, OsString::from("/tmp/index"));
+        assert_eq!(request.env[1].0, OsString::from("ZCODE_MARKER"));
+    }
+
+    /// 单条命令的 env 必须在 `apply_git_command_env` **之后**叠加。
+    ///
+    /// 这条测试直接看 `Command::get_envs()` 的最终结果：`GIT_INDEX_FILE` 在
+    /// 清理清单里被 `env_remove`，只有后加的覆盖能把它救回来。
+    #[test]
+    fn per_command_env_overrides_the_sanitized_environment() {
+        let mut command = Command::new("git");
+        apply_git_command_env(&mut command);
+        for (name, value) in [("GIT_INDEX_FILE", "/tmp/index")] {
+            command.env(name, value);
+        }
+
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        let entry = envs
+            .iter()
+            .find(|(key, _)| key == "GIT_INDEX_FILE")
+            .expect("GIT_INDEX_FILE 应当出现在最终环境里");
+        assert_eq!(entry.1.as_deref(), Some("/tmp/index"));
+
+        // 清理清单里其它变量仍然是「移除」状态
+        let dir_entry = envs
+            .iter()
+            .find(|(key, _)| key == "GIT_DIR")
+            .expect("GIT_DIR 应当被显式处理");
+        assert!(dir_entry.1.is_none(), "GIT_DIR 应当保持被移除");
     }
 
     #[test]

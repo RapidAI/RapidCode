@@ -18,7 +18,10 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use futures_channel::mpsc::UnboundedReceiver;
-use zcode_app::workspace::{create_workspace_channel, next_workspace_message, WorkspaceMessage};
+use zcode_app::workspace::{
+    create_workspace_channel, next_workspace_message, WorkspaceAction, WorkspaceMessage,
+};
+use zcode_shared::git::GitChangeSectionId;
 
 /// 本机能不能跑 git。
 fn git_available() -> bool {
@@ -133,6 +136,30 @@ fn build_repository(name: &str) -> TempDir {
     dir
 }
 
+/// 读文件并把行尾统一成 `\n`。
+///
+/// Windows 上 `core.autocrlf` 默认为 `true`，`git restore` 写回工作区的内容是
+/// CRLF。直接比字符串会得到「内容其实对、断言却失败」的假故障。
+fn read_text(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("读 {} 失败: {error}", path.display()))
+        .replace("\r\n", "\n")
+}
+
+/// 变更条目上展示用的相对路径（和界面一致：优先 workspace 相对）。
+fn paths_in(section: GitChangeSectionId, data: &zcode_app::workspace::WorkspaceData) -> Vec<String> {
+    data.changes_in(section)
+        .iter()
+        .map(|change| {
+            if change.workspace_relative_path.is_empty() {
+                change.repo_relative_path.clone()
+            } else {
+                change.workspace_relative_path.clone()
+            }
+        })
+        .collect()
+}
+
 #[test]
 fn refresh_loads_a_real_repository_through_the_background_channel() {
     if !git_available() {
@@ -239,4 +266,195 @@ fn a_second_refresh_is_ignored_while_one_is_running() {
         matches!(messages.last(), Some(WorkspaceMessage::Loaded(_))),
         "最终应当拿到 Loaded，实际 {messages:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 写操作
+// ---------------------------------------------------------------------------
+//
+// 这里测的是 `refresh` 之外的那条路：`run` 除了重新扫描，还要先把写操作的
+// **结果**报回界面。顺序是刻意的 —— Loading → Notice → Loaded，
+// 用户先看到「暂存成功」再看到列表刷新，而不是先刷新再猜刚才那下成没成。
+
+/// 把写操作的三条消息拆开，顺带断言顺序。
+fn split_write_messages(messages: Vec<WorkspaceMessage>) -> (WorkspaceMessage, WorkspaceMessage) {
+    assert_eq!(
+        messages.len(),
+        3,
+        "应当收到 Loading + Notice + Loaded，实际 {messages:?}"
+    );
+
+    assert!(
+        matches!(messages[0], WorkspaceMessage::Loading),
+        "第一条应当是 Loading，实际 {:?}",
+        messages[0]
+    );
+
+    // 后两条要按「先结果、后刷新」的顺序回传。
+    let mut iter = messages.into_iter();
+    let _ = iter.next();
+    let notice = iter.next().expect("第二条");
+    let loaded = iter.next().expect("第三条");
+    (notice, loaded)
+}
+
+#[test]
+fn run_stages_a_file_and_reloads_through_the_background_channel() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-app-loader-stage");
+    let channel = create_workspace_channel();
+    let receiver = channel.take_receiver().expect("第一次应当能取到结果端");
+
+    assert!(
+        channel.requester().run(
+            dir.path().to_path_buf(),
+            WorkspaceAction::Stage(vec!["untracked.txt".to_string()]),
+        ),
+        "写操作应当被接受"
+    );
+
+    let (notice, loaded) = split_write_messages(collect_messages(
+        receiver,
+        3,
+        Duration::from_secs(30),
+    ));
+
+    match notice {
+        WorkspaceMessage::Notice(notice) => {
+            assert!(!notice.is_error, "暂存应当成功：{}", notice.message);
+            assert!(
+                notice.message.starts_with("暂存成功"),
+                "提示应当带动作名，实际：{}",
+                notice.message
+            );
+        }
+        other => panic!("第二条应当是 Notice，实际 {other:?}"),
+    }
+
+    match loaded {
+        WorkspaceMessage::Loaded(data) => {
+            // 关键：写操作之后界面拿到的必须是**重新扫出来的**状态，
+            // 否则用户点完暂存，文件还挂在「未跟踪」里，会以为没生效。
+            assert!(
+                paths_in(GitChangeSectionId::Staged, &data).contains(&"untracked.txt".to_string()),
+                "untracked.txt 应当已进入「已暂存」，实际：{:?}",
+                paths_in(GitChangeSectionId::Staged, &data)
+            );
+            assert!(
+                !paths_in(GitChangeSectionId::Untracked, &data).contains(&"untracked.txt".to_string()),
+                "同一个文件不该同时留在「未跟踪」里"
+            );
+        }
+        other => panic!("第三条应当是 Loaded，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn a_failed_write_still_reloads_and_reports_the_reason() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-app-loader-failure");
+    let channel = create_workspace_channel();
+    let receiver = channel.take_receiver().unwrap();
+
+    // 空提交信息在服务层就被拦下了（根本不跑 git），所以这里能稳定复现失败。
+    assert!(channel.requester().run(
+        dir.path().to_path_buf(),
+        WorkspaceAction::Commit {
+            message: "   ".to_string(),
+        },
+    ));
+
+    let (notice, loaded) = split_write_messages(collect_messages(
+        receiver,
+        3,
+        Duration::from_secs(30),
+    ));
+
+    match notice {
+        WorkspaceMessage::Notice(notice) => {
+            assert!(notice.is_error, "空提交信息应当失败");
+            assert!(
+                notice.message.starts_with("提交失败"),
+                "实际：{}",
+                notice.message
+            );
+            assert!(
+                notice.message.contains("Commit message cannot be empty"),
+                "提示里应当带上 git 侧的原因，实际：{}",
+                notice.message
+            );
+        }
+        other => panic!("第二条应当是 Notice，实际 {other:?}"),
+    }
+
+    // 失败之后**仍然要刷新**：否则界面上还留着上一次的状态，
+    // 而用户刚刚明明动过工作区，两边的差异会一直藏在那儿。
+    match loaded {
+        WorkspaceMessage::Loaded(data) => {
+            assert!(data.is_repository());
+            assert!(
+                paths_in(GitChangeSectionId::Unstaged, &data).contains(&"tracked.txt".to_string()),
+                "工作区没被改动，tracked.txt 应当还在「未暂存」"
+            );
+        }
+        other => panic!("第三条应当是 Loaded，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn discard_through_the_channel_restores_the_working_tree() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-app-loader-discard");
+    let target = dir.path().join("tracked.txt");
+    assert_eq!(read_text(&target), "one\ntwo\n", "前置条件：改动已在工作区");
+
+    let channel = create_workspace_channel();
+    let receiver = channel.take_receiver().unwrap();
+
+    assert!(channel.requester().run(
+        dir.path().to_path_buf(),
+        WorkspaceAction::Discard {
+            paths: vec!["tracked.txt".to_string()],
+            staged: false,
+        },
+    ));
+
+    let (notice, loaded) = split_write_messages(collect_messages(
+        receiver,
+        3,
+        Duration::from_secs(30),
+    ));
+
+    match notice {
+        WorkspaceMessage::Notice(notice) => {
+            assert!(!notice.is_error, "丢弃应当成功：{}", notice.message);
+        }
+        other => panic!("第二条应当是 Notice，实际 {other:?}"),
+    }
+
+    // 这条是唯一会丢数据的操作，所以除了「提示说成功」之外，
+    // 还要真的去磁盘上确认内容回到了 HEAD 版本。
+    assert_eq!(read_text(&target), "one\n", "丢弃后应当回到 HEAD 内容");
+
+    match loaded {
+        WorkspaceMessage::Loaded(data) => {
+            assert!(
+                !paths_in(GitChangeSectionId::Unstaged, &data).contains(&"tracked.txt".to_string()),
+                "tracked.txt 已经干净了，不该再出现在「未暂存」里"
+            );
+        }
+        other => panic!("第三条应当是 Loaded，实际 {other:?}"),
+    }
 }

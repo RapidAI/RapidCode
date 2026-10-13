@@ -6,6 +6,17 @@
 //!
 //! 分组（已暂存 / 未暂存 / 未跟踪 / 冲突）直接来自
 //! `zcode_services::git::changes` 的分组结果，视图层只负责排序与展示。
+//!
+//! ## 写操作
+//!
+//! 每一行的「暂存 / 取消暂存 / 丢弃」和顶部的「提交 / 推送」都是真的在跑 git
+//! （`git add` / `git restore` / `git commit` / `git push`）。三条设计约束：
+//!
+//! 1. **不阻塞渲染线程**：全部经 [`crate::workspace::WorkspaceRequester`] 丢到
+//!    worker 线程，结果回来后自动重新扫描；
+//! 2. **失败必须看得见**：写操作的结果走 `workspace_notice`，渲染成顶部横幅 ——
+//!    上一轮「只有个壳子」的根因就是一个被吞掉的错误；
+//! 3. **会丢数据的操作要二次确认**：只有「丢弃」属于这一类，走 `AlertDialog`。
 
 use std::path::PathBuf;
 
@@ -15,16 +26,38 @@ use zcode_ui::*;
 
 use crate::state::use_app;
 use crate::workspace::{
-    default_workspace_path, display_path, kind_label, section_label, use_workspace_requester,
-    WorkspaceData, WorkspaceStatus,
+    action_paths, default_workspace_path, display_path, kind_label, section_label,
+    use_workspace_requester, WorkspaceAction, WorkspaceData, WorkspaceNotice, WorkspaceStatus,
 };
+
+/// 待确认的「丢弃」请求。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingDiscard {
+    paths: Vec<String>,
+    staged: bool,
+    /// 展示用：确认框里列出文件名。
+    labels: Vec<String>,
+}
 
 /// 主区域里的「变更」页。
 #[component]
 pub fn ChangesView() -> Element {
     let ctx = use_app();
+    let requester = use_workspace_requester();
     let data = ctx.workspace.read().clone();
     let status = ctx.workspace_status.read().clone();
+    let notice = ctx.workspace_notice.read().clone();
+
+    // 写操作需要的上下文：路径 + 当前是否已经有 git 在跑
+    let workspace_path = data
+        .as_ref()
+        .map(|data| PathBuf::from(&data.summary.workspace_path))
+        .unwrap_or_else(default_workspace_path);
+    let busy = status.is_loading();
+
+    // 「丢弃」的二次确认
+    let mut pending_discard = use_signal(|| None::<PendingDiscard>);
+    let mut discard_open = use_signal(|| false);
 
     let body = if let Some(message) = status.failure() {
         rsx! { FailurePane { message: message.to_string() } }
@@ -33,25 +66,143 @@ pub fn ChangesView() -> Element {
             None => rsx! { LoadingPane {} },
             Some(data) if !data.is_repository() => rsx! { NotARepositoryPane {} },
             Some(data) if data.changes.is_empty() => rsx! { CleanPane { data } },
-            Some(data) => rsx! { ChangeSections { data } },
+            Some(data) => rsx! {
+                ChangeSections {
+                    data,
+                    workspace_path: workspace_path.clone(),
+                    busy,
+                    on_discard: move |request: PendingDiscard| {
+                        pending_discard.set(Some(request));
+                        discard_open.set(true);
+                    },
+                }
+            },
         }
     };
 
+    // 确认框里要显示的路径（取前几个，其余折叠）
+    let discard_detail = pending_discard
+        .read()
+        .as_ref()
+        .map(|pending| summarize_paths(&pending.labels))
+        .unwrap_or_default();
+    let discard_staged = pending_discard
+        .read()
+        .as_ref()
+        .map(|pending| pending.staged)
+        .unwrap_or(false);
+
     rsx! {
         section { class: "flex min-h-0 flex-1 flex-col",
-            WorkspaceBar { data: ctx.workspace.read().clone(), status: ctx.workspace_status.read().clone() }
+            WorkspaceBar {
+                data: ctx.workspace.read().clone(),
+                status: ctx.workspace_status.read().clone(),
+            }
+            if let Some(notice) = notice {
+                NoticeBanner { notice }
+            }
             ScrollArea { class: "min-h-0 flex-1", hide_scrollbar: true,
                 div { class: "flex flex-col gap-4 p-4", {body} }
+            }
+
+            AlertDialog { open: Some(discard_open),
+                AlertDialogContent {
+                    AlertDialogHeader {
+                        AlertDialogTitle { "丢弃这些改动？" }
+                        AlertDialogDescription {
+                            if discard_staged {
+                                "会同时回退暂存区与工作区，改动将无法找回：{discard_detail}"
+                            } else {
+                                "会把工作区文件恢复到 HEAD 的内容，改动将无法找回：{discard_detail}"
+                            }
+                        }
+                    }
+                    AlertDialogFooter {
+                        AlertDialogCancel { "取消" }
+                        AlertDialogAction {
+                            variant: ButtonVariant::Destructive,
+                            onclick: move |_| {
+                                let pending = pending_discard.write().take();
+                                discard_open.set(false);
+                                if let Some(pending) = pending {
+                                    requester.run(
+                                        workspace_path.clone(),
+                                        WorkspaceAction::Discard {
+                                            paths: pending.paths,
+                                            staged: pending.staged,
+                                        },
+                                    );
+                                }
+                            },
+                            IconTrash {}
+                            "丢弃"
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-/// 顶部信息条：分支、ahead/behind、仓库根、汇总、刷新。
+/// 把路径列表压成一行提示文案（最多列 3 个）。
+fn summarize_paths(paths: &[String]) -> String {
+    const MAX: usize = 3;
+    if paths.len() <= MAX {
+        return paths.join("、");
+    }
+    let shown = paths
+        .iter()
+        .take(MAX)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("、");
+    format!("{shown} 等 {} 个文件", paths.len())
+}
+
+/// 写操作结果的横幅。
+///
+/// 成功用主色、失败用 destructive。**失败不能被静默掉** —— 这正是上一轮
+/// 「窗口里只有个壳子」的成因。
+#[component]
+fn NoticeBanner(notice: WorkspaceNotice) -> Element {
+    let ctx = use_app();
+    let mut current = ctx.workspace_notice;
+
+    let (class, icon) = if notice.is_error {
+        (
+            "flex items-start gap-2 border-b border-destructive/40 bg-destructive/10 px-4 py-2",
+            rsx! { IconTriangleAlert { class: "mt-0.5 size-3.5 shrink-0 text-destructive" } },
+        )
+    } else {
+        (
+            "flex items-start gap-2 border-b border-border bg-primary/10 px-4 py-2",
+            rsx! { IconCheck { class: "mt-0.5 size-3.5 shrink-0 text-primary" } },
+        )
+    };
+
+    rsx! {
+        div { class: "{class}", "data-slot": "workspace-notice",
+            {icon}
+            span { class: "min-w-0 flex-1 break-all text-ui-xs text-foreground",
+                {notice.message}
+            }
+            Button {
+                variant: ButtonVariant::Ghost,
+                size: ButtonSize::IconSm,
+                onclick: move |_| current.set(None),
+                IconX { class: "size-3" }
+            }
+        }
+    }
+}
+
+/// 顶部信息条：分支、ahead/behind、仓库根、汇总、提交、推送、刷新。
 #[component]
 pub fn WorkspaceBar(data: Option<WorkspaceData>, status: WorkspaceStatus) -> Element {
     let requester = use_workspace_requester();
     let loading = status.is_loading();
+    let commit_message = use_signal(String::new);
+    let mut message_signal = commit_message;
 
     let workspace_path = data
         .as_ref()
@@ -83,33 +234,104 @@ pub fn WorkspaceBar(data: Option<WorkspaceData>, status: WorkspaceStatus) -> Ele
     };
     let repo_root_hint = repo_root.clone();
 
+    // 有已暂存内容才允许提交；消息为空也不允许（服务层还会再挡一次）
+    let staged_count = data
+        .as_ref()
+        .map(|data| data.changes_in(GitChangeSectionId::Staged).len())
+        .unwrap_or(0);
+    let is_repository = data
+        .as_ref()
+        .map(WorkspaceData::is_repository)
+        .unwrap_or(false);
+    let can_commit = !loading && staged_count > 0 && !commit_message.read().trim().is_empty();
+    let can_push = !loading && is_repository;
+
+    let workspace_for_commit = workspace_path.clone();
+    let workspace_for_push = workspace_path.clone();
+    let workspace_for_refresh = workspace_path.clone();
+    let requester_for_commit = requester.clone();
+    let requester_for_push = requester.clone();
+    let requester_for_refresh = requester.clone();
+
     rsx! {
-        div { class: "flex h-11 shrink-0 items-center gap-2 border-b border-border px-4",
-            IconGitBranch { class: "size-3.5 shrink-0 text-foreground-subtle" }
-            span { class: "shrink-0 text-ui-base font-medium", {branch} }
-            if let Some(ahead_behind) = ahead_behind {
-                Badge { variant: BadgeVariant::Secondary, class: "h-4 px-1.5 text-ui-xs",
-                    {ahead_behind}
+        div { class: "flex flex-col border-b border-border",
+            div { class: "flex h-11 shrink-0 items-center gap-2 px-4",
+                IconGitBranch { class: "size-3.5 shrink-0 text-foreground-subtle" }
+                span { class: "shrink-0 text-ui-base font-medium", {branch} }
+                if let Some(ahead_behind) = ahead_behind {
+                    Badge { variant: BadgeVariant::Secondary, class: "h-4 px-1.5 text-ui-xs",
+                        {ahead_behind}
+                    }
+                }
+                span { class: "shrink-0 text-ui-xs text-foreground-subtlest", "·" }
+                span {
+                    class: "min-w-0 truncate text-ui-xs text-foreground-subtlest",
+                    title: "{repo_root_hint}",
+                    {repo_root}
+                }
+                span { class: "ml-auto shrink-0 text-ui-xs text-foreground-subtle", {totals_label} }
+
+                Button {
+                    variant: ButtonVariant::Outline,
+                    size: ButtonSize::Sm,
+                    class: "h-7",
+                    disabled: !can_push,
+                    onclick: move |_| {
+                        requester_for_push.run(workspace_for_push.clone(), WorkspaceAction::Push);
+                    },
+                    IconUpload { class: "size-3.5" }
+                    "推送"
+                }
+
+                Button {
+                    variant: ButtonVariant::Ghost,
+                    size: ButtonSize::IconSm,
+                    disabled: loading,
+                    onclick: move |_| {
+                        requester_for_refresh.refresh(workspace_for_refresh.clone());
+                    },
+                    if loading {
+                        Spinner { class: "size-3.5" }
+                    } else {
+                        IconRefresh { class: "size-3.5" }
+                    }
                 }
             }
-            span { class: "shrink-0 text-ui-xs text-foreground-subtlest", "·" }
-            span {
-                class: "min-w-0 truncate text-ui-xs text-foreground-subtlest",
-                title: "{repo_root_hint}",
-                {repo_root}
-            }
-            span { class: "ml-auto shrink-0 text-ui-xs text-foreground-subtle", {totals_label} }
-            Button {
-                variant: ButtonVariant::Ghost,
-                size: ButtonSize::IconSm,
-                disabled: loading,
-                onclick: move |_| {
-                    requester.refresh(workspace_path.clone());
-                },
-                if loading {
-                    Spinner { class: "size-3.5" }
-                } else {
-                    IconRefresh { class: "size-3.5" }
+
+            // 提交行：只在确实是仓库时出现
+            if is_repository {
+                div { class: "flex shrink-0 items-center gap-2 px-4 pb-2",
+                    Input {
+                        class: "h-8 flex-1 text-ui-xs",
+                        placeholder: if staged_count > 0 {
+                            format!("提交信息（{staged_count} 个已暂存文件）")
+                        } else {
+                            "先暂存一些改动再提交".to_string()
+                        },
+                        value: commit_message.read().clone(),
+                        disabled: loading,
+                        oninput: move |event: FormEvent| message_signal.set(event.value()),
+                    }
+                    Button {
+                        variant: ButtonVariant::Default,
+                        size: ButtonSize::Sm,
+                        class: "h-8",
+                        disabled: !can_commit,
+                        onclick: move |_| {
+                            let message = message_signal.read().trim().to_string();
+                            if message.is_empty() {
+                                return;
+                            }
+                            if requester_for_commit.run(
+                                workspace_for_commit.clone(),
+                                WorkspaceAction::Commit { message },
+                            ) {
+                                message_signal.set(String::new());
+                            }
+                        },
+                        IconCheck { class: "size-3.5" }
+                        "提交"
+                    }
                 }
             }
         }
@@ -118,20 +340,47 @@ pub fn WorkspaceBar(data: Option<WorkspaceData>, status: WorkspaceStatus) -> Ele
 
 /// 按分组展示变更。
 #[component]
-fn ChangeSections(data: WorkspaceData) -> Element {
+fn ChangeSections(
+    data: WorkspaceData,
+    workspace_path: PathBuf,
+    busy: bool,
+    on_discard: EventHandler<PendingDiscard>,
+) -> Element {
     rsx! {
         for section in data.populated_sections() {
-            ChangeSection { key: "{section.as_str()}", section, data: data.clone() }
+            ChangeSection {
+                key: "{section.as_str()}",
+                section,
+                data: data.clone(),
+                workspace_path: workspace_path.clone(),
+                busy,
+                on_discard,
+            }
         }
     }
 }
 
 /// 一个分组。
 #[component]
-fn ChangeSection(section: GitChangeSectionId, data: WorkspaceData) -> Element {
+fn ChangeSection(
+    section: GitChangeSectionId,
+    data: WorkspaceData,
+    workspace_path: PathBuf,
+    busy: bool,
+    on_discard: EventHandler<PendingDiscard>,
+) -> Element {
+    let requester = use_workspace_requester();
     let changes = data.changes_in(section);
     let added: u32 = changes.iter().map(|change| change.added).sum();
     let removed: u32 = changes.iter().map(|change| change.removed).sum();
+
+    // 整组一起操作
+    let all_paths = action_paths(&changes);
+    let group_paths = all_paths.clone();
+    let group_paths_for_discard = all_paths.clone();
+    let workspace_for_group = workspace_path.clone();
+    let requester_for_group = requester.clone();
+    let is_staged_section = section == GitChangeSectionId::Staged;
 
     rsx! {
         div { class: "flex flex-col gap-1",
@@ -144,10 +393,112 @@ fn ChangeSection(section: GitChangeSectionId, data: WorkspaceData) -> Element {
                 }
                 span { class: "ml-auto text-ui-xs text-primary", "+{added}" }
                 span { class: "text-ui-xs text-destructive", "-{removed}" }
+
+                if !all_paths.is_empty() {
+                    Button {
+                        variant: ButtonVariant::Ghost,
+                        size: ButtonSize::Sm,
+                        class: "h-5 px-1.5 text-ui-xs",
+                        disabled: busy,
+                        onclick: move |_| {
+                            let action = if is_staged_section {
+                                WorkspaceAction::Unstage(group_paths.clone())
+                            } else {
+                                WorkspaceAction::Stage(group_paths.clone())
+                            };
+                            requester_for_group.run(workspace_for_group.clone(), action);
+                        },
+                        if is_staged_section { "全部取消暂存" } else { "全部暂存" }
+                    }
+                    Button {
+                        variant: ButtonVariant::Ghost,
+                        size: ButtonSize::Sm,
+                        class: "h-5 px-1.5 text-ui-xs text-destructive",
+                        disabled: busy,
+                        onclick: move |_| {
+                            on_discard.call(PendingDiscard {
+                                paths: group_paths_for_discard.clone(),
+                                staged: is_staged_section,
+                                labels: group_paths_for_discard.clone(),
+                            });
+                        },
+                        "全部丢弃"
+                    }
+                }
             }
             div { class: "flex flex-col overflow-hidden rounded-md border border-card-border bg-card",
                 for change in changes {
-                    ChangeRow { key: "{change.repo_relative_path}", change: change.clone() }
+                    ActionableChangeRow {
+                        key: "{change.repo_relative_path}",
+                        change: change.clone(),
+                        workspace_path: workspace_path.clone(),
+                        busy,
+                        on_discard,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 带操作按钮的一行变更。
+///
+/// 按钮默认半透明，hover 时才完全显形 —— 否则每一行都挂着两个按钮，
+/// 变更列表会变成一片按钮墙。
+#[component]
+fn ActionableChangeRow(
+    change: GitFileChange,
+    workspace_path: PathBuf,
+    busy: bool,
+    on_discard: EventHandler<PendingDiscard>,
+) -> Element {
+    let requester = use_workspace_requester();
+    let path = action_paths(&[&change]);
+
+    // 已暂存的条目给「取消暂存」，其余给「暂存」
+    let is_staged = change.section == GitChangeSectionId::Staged;
+    let (action, label) = if is_staged {
+        (WorkspaceAction::Unstage(path.clone()), "取消暂存")
+    } else {
+        (WorkspaceAction::Stage(path.clone()), "暂存")
+    };
+    let action_for_click = action;
+    let workspace_for_stage = workspace_path.clone();
+
+    let discard_paths = path;
+    let discard_label = display_path(&change).to_string();
+
+    rsx! {
+        div { class: "group flex items-center gap-1 border-b border-border pr-1.5 last:border-b-0",
+            div { class: "min-w-0 flex-1",
+                ChangeRow { change: change.clone() }
+            }
+            div { class: "flex shrink-0 items-center gap-0.5 opacity-40 transition-opacity group-hover:opacity-100",
+                Button {
+                    variant: ButtonVariant::Ghost,
+                    size: ButtonSize::Sm,
+                    class: "h-5 px-1.5 text-ui-xs",
+                    disabled: busy,
+                    aria_label: "{label}",
+                    onclick: move |_| {
+                        requester.run(workspace_for_stage.clone(), action_for_click.clone());
+                    },
+                    {label}
+                }
+                Button {
+                    variant: ButtonVariant::Ghost,
+                    size: ButtonSize::IconSm,
+                    class: "size-5 text-destructive",
+                    disabled: busy,
+                    aria_label: "丢弃改动",
+                    onclick: move |_| {
+                        on_discard.call(PendingDiscard {
+                            paths: discard_paths.clone(),
+                            staged: is_staged,
+                            labels: vec![discard_label.clone()],
+                        });
+                    },
+                    IconTrash { class: "size-3" }
                 }
             }
         }

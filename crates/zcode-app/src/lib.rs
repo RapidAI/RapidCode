@@ -53,7 +53,9 @@ pub mod workspace;
 
 use dioxus::prelude::*;
 use state::{AppCtx, ApprovalMode};
-use workspace::{WorkspaceData, WorkspaceMessage, WorkspaceRequester, WorkspaceStatus};
+use workspace::{
+    WorkspaceData, WorkspaceMessage, WorkspaceNotice, WorkspaceRequester, WorkspaceStatus,
+};
 use zcode_ui::*;
 
 /// 构建期生成的样式表（见 crate 文档）。
@@ -154,6 +156,7 @@ pub fn AppShell() -> Element {
     // 真实工作区数据
     let workspace_data = use_signal(move || seeded_data);
     let workspace_status = use_signal(move || seeded_status.unwrap_or_default());
+    let workspace_notice = use_signal(|| None::<WorkspaceNotice>);
 
     // 请求端 / 结果端只建一次；请求端要通过 context 给顶栏与变更页用。
     let workspace_channel = use_hook(workspace::create_workspace_channel);
@@ -170,6 +173,7 @@ pub fn AppShell() -> Element {
         let mut receiver = channel_for_poller.take_receiver();
         let mut workspace_data = workspace_data;
         let mut workspace_status = workspace_status;
+        let mut workspace_notice = workspace_notice;
         spawn(async move {
             let Some(receiver) = receiver.as_mut() else {
                 // 理论上不可达（`use_hook` 保证初始化只跑一次）。
@@ -188,6 +192,7 @@ pub fn AppShell() -> Element {
                     WorkspaceMessage::Failed(message) => {
                         workspace_status.set(WorkspaceStatus::Failed(message));
                     }
+                    WorkspaceMessage::Notice(notice) => workspace_notice.set(Some(notice)),
                 }
             }
         })
@@ -219,6 +224,7 @@ pub fn AppShell() -> Element {
         approval_value,
         workspace: workspace_data,
         workspace_status,
+        workspace_notice,
     });
 
     let dark = state.read().dark;

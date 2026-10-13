@@ -37,7 +37,7 @@
 > 并为 UI 层选定 Rust 等价框架（Dioxus）从原语组件开始迁移，  
 > 最后从 `packages/services` 里挑自包含的链路接上真实 IO。**
 
-产出保证：`cargo build` 与 `cargo test` 全部通过（零警告、981 个测试全绿）。
+产出保证：`cargo build` 与 `cargo test` 全部通过（零警告、1028 个测试全绿）。
 
 ---
 
@@ -119,7 +119,7 @@ Rust 侧与 React 语义最贴近的等价框架是 **Dioxus 0.6**（RSX ≈ JSX
 | `providers/gitCommandProvider.ts` | `git/provider.rs` | ✅ 语义等价（见下方差异） |
 | `repo/gitCliTypes.ts` | `git/types.rs` | ✅ 完整 |
 | `repo/gitCliHelpers.ts` | `git/cli_helpers.rs` | ✅ 完整（porcelain v2 / numstat 解析） |
-| `repo/gitCliRepo.ts`（读路径） | `git/repo.rs` | ✅ 只读部分（`resolve` / `getStatus` / `listLocalBranches`） |
+| `repo/gitCliRepo.ts` | `git/repo.rs` | ✅ 读路径（`resolve` / `getStatus` / `listLocalBranches`）+ 写路径（`stage` / `unstage` / `discard` / `commit` / `push`） |
 | `gitService.ts` 的 `getChanges` | `git/changes.rs` | ✅ 完整（按暂存区分组 + 汇总） |
 | `packages/shared/src/git.ts` | `crates/zcode-shared/src/git.rs` | ✅ 类型层完整 |
 
@@ -128,7 +128,9 @@ Rust 侧与 React 语义最贴近的等价框架是 **Dioxus 0.6**（RSX ≈ JSX
 - `gitCommitMessageGenerator*` —— 依赖 LLM provider；
 - `gitCheckpoint*` —— 依赖检查点存储（另一个未移植的子系统）；
 - `commitMessageFileScope`、`getIgnoredPaths` / `getDiff` / `getCommitGraph` / `getIdentity`；
-- **全部写操作** `stage` / `unstage` / `discard` / `commit` / `push`。
+- `commit` 的 **`stagedOnly` 部分提交变体** —— 上游靠临时 `GIT_INDEX_FILE`
+  只提交索引里的内容；本移植的 `commit` 走的是「整索引 + 可选 pathspec」那条路，
+  所以调用方**不要**期待这个能力。
 
 清单与理由也写在 `crates/zcode-services/src/lib.rs` 的模块文档里。
 
@@ -143,6 +145,28 @@ Rust 侧与 React 语义最贴近的等价框架是 **Dioxus 0.6**（RSX ≈ JSX
    遇到不存在的 `cwd` 返回 `ERROR_DIRECTORY`(267)，Rust 把它映射成
    `ErrorKind::Other` 而**不是** `NotFound` —— 所以 `classify_spawn_error`
    必须**先查 `cwd.is_dir()`**，否则会把「目录不存在」误判成「git 没装」。
+
+### 2.5 写路径（`stage` / `unstage` / `discard` / `commit` / `push`）
+
+对应上游 `gitCliRepo.ts` 的同名方法（`stage` 1423 / `unstage` 1444 /
+`discard` 1465 / `commit` 1488 / `push` 1638 行附近）。五条约定：
+
+1. **前置检查**：没有可用的 git、或 workspace 不在仓库里 → `RepositoryUnavailable`。
+   顺序是先 git 后仓库 —— 「没装 git」比「这不是仓库」更根本，报错也更该先说。
+2. **路径归一**：`normalizeInputPath` 的等价物把用户给的相对路径**以 workspace
+   （不是 repo 根）为基准**解析，`realpath` 后转成仓库相对路径，越界报
+   `PathOutsideRepository`。`realpath` 必须带兜底 —— `discard` 要处理的正是
+   **被删掉的文件**，对它 `canonicalize` 必然失败。
+3. **空列表是 no-op**：不报错，也不跑 git。
+4. **写操作不返回新状态**：调用方自己重新扫描。界面因此在动作完成后
+   先收到一条 `Notice`（成功 / 失败），再收到刷新后的 `Loaded`。
+5. **`discard` 是唯一会丢数据的操作**（`git restore` 之后 git 也找不回），
+   所以在应用层被标成 `is_destructive()`，必须过二次确认弹窗。
+
+平台相关的一处坑：Windows 上 `std::fs::canonicalize` 返回 `\\?\C:\...` 这种
+verbatim 前缀，它永远 `strip_prefix` 匹配不上普通路径，于是所有路径比较都会
+静默失败。`config.rs` 的 `canonicalize_best_effort` 负责剥掉前缀
+（`\\?\UNC\server\share` → `\\server\share`），**两边都必须走它**。
 
 ---
 
@@ -213,6 +237,21 @@ while let Some(message) = next_workspace_message(receiver).await { … }
   所以持有 `Arc` 的 `WorkspaceRequester` 走**另一个** context
   （`use_context_provider`），不能塞进 `AppCtx`。
 
+写操作（`run`）复用同一条通道，但有两点不同：
+
+- **所有 git 操作共用同一个 `busy` 原子量，刻意串行化**。并发的 `git add`
+  与 `git commit` 会争 `index.lock`，失败信息还很难懂；而且并发写同一个仓库
+  本来就没什么意义。
+- **被拒绝的操作要说明原因**。`refresh` 被拒时静默返回 `false` 就够了（用户
+  只是多点了一下刷新）；但写操作被拒时如果也静默，用户看到的就是「按钮点了
+  没反应」，会以为界面卡死 —— 所以这时会补一条
+  `Notice`（`上一个 Git 操作还在进行中，「提交」没有执行`）。这是「失败必须
+  看得见」那条教训的直接延续。
+
+消息顺序也是刻意的：`Loading` → `Notice` → `Loaded`。先让用户看到
+「提交成功：1b79077」，再刷新列表；反过来会变成「列表刷新了，但刚才那下
+到底成没成？」。
+
 副作用是：SSR 快照测试**不会**驱动 `spawn` 出来的 future（`rebuild_in_place`
 只跑同步代码）。这反而帮了忙 —— 快照测试因此永远不会真的去跑 git。
 `AppShell` 只在存在 `WorkspaceBootstrap`（真实 `App` 根）时才发起扫描，
@@ -224,7 +263,7 @@ while let Some(message) = next_workspace_message(receiver).await { … }
 
 ```bash
 cargo build                              # 编译整个工作区
-cargo test                               # 工作区 981 个测试
+cargo test                               # 工作区 1028 个测试
 cargo run -p zcode-app                   # 桌面窗口（⚠️ 本机能开窗但内容空白，见 README「已知问题」）
 cargo run -p zcode-ui --example preview  # 生成 UI 预览页 ./preview.html
 cargo build --release
@@ -236,9 +275,9 @@ cargo build --release
 | --- | ---: | ---: | --- |
 | `zcode-rpc` | 10 | — | 序列化 / 事件 / 端到端 RPC |
 | `zcode-shared` | 18 | — | 行级变更统计 / 供应商族 / 套餐身份 / git 类型 |
-| `zcode-services` | 76 | 6 | git 解析纯函数 / **真起临时仓库**的端到端 |
+| `zcode-services` | 91 | 20 | git 解析 / 路径归一纯函数、**真起临时仓库**的端到端（读 6 + 写 14） |
 | `zcode-ui` | 742 | 75 + 11 | 类名 / 几何 / 键盘纯函数、渲染指令、HTML 快照 |
-| `zcode-app` | 17 | 23 + 3 | 应用外壳 + 整树冒烟 + 跨线程取数链路 |
+| `zcode-app` | 25 | 30 + 6 | 应用外壳 + 整树冒烟（含写操作入口）+ 跨线程读 / 写链路 |
 
 逻辑层测试覆盖：
 
@@ -259,7 +298,19 @@ cargo build --release
   `cleanup=` / `forceKill=` / `orphaned=` 都出现在消息里；
 - **端到端**（`tests/git_workspace.rs`，真建临时仓库）：解析仓库根 / 子目录
   作用域 / 本地分支列表（当前分支排最前）/ 普通目录不是错误 / 工作目录不存在时
-  降级而不是报错。没有 git 时跳过并打印说明。
+  降级而不是报错（读 6 条）；
+- **写操作端到端**（同一文件，写 14 条）：`stage` 把未跟踪文件推进索引、
+  `unstage` 退回工作区（并断言 `M.` → `.M` 的往返）、`discard` 还原未暂存改动 /
+  连带清索引 / 处理**已被删除**的文件、`commit` 真的产出带指定信息的提交 /
+  拒绝空信息 / 只提交指定 pathspec、`push` 在没有 remote 或 detached HEAD 时
+  给出明确错误、以及写操作统一拒绝「非仓库」与「越界路径」、空路径列表是 no-op。
+
+  > 这一组踩过一个值得记的坑：`CARGO_TARGET_TMPDIR` 落在仓库自己的 `target/`
+  > 里，而 `target/` 只是被 `.gitignore` 掉了 —— `git rev-parse` 依然会解析到
+  > **真实仓库**。于是「拒绝非仓库」那条测试其实对着真实工作区跑了一次
+  > `git push`。现在改用 `std::env::temp_dir()` 并先探一次
+  > `git rev-parse --show-toplevel` 确认真的不在任何仓库里，测试从 93 秒
+  > 降到 9.7 秒。
 
 ---
 
@@ -273,16 +324,17 @@ cargo build --release
 2. **`packages/rpc` 的补充**：真实 `Socket` 实现（TCP / WebSocket）、  
    `MessagePortLike` 的 Electron/浏览器绑定、与 `packages/provider*` 的对接。
 3. **UI 层**（见 [PORTING-UI.md](./PORTING-UI.md) §6/§7）：  
-   **47 / 47 个原语已全部移植完毕**，并拼出了可运行的 `zcode-app`（981 个测试全绿）。
+   **47 / 47 个原语已全部移植完毕**，并拼出了可运行的 `zcode-app`（1028 个测试全绿）。
    剩余的是**宿主接线**而非移植：`overlay.rs` 的边缘翻转碰撞检测，以及为
    `code_viewer` / `diff_viewer` / `pdf_viewer` / `pptx_preview_viewer` / `chart` /
    `carousel` 接上各自的 JS 引擎等价物（这些属于宿主应用职责，见 §4.4）。
 4. **服务层核心逻辑**（`packages/services`，224k 行）：按领域切分，优先迁移  
    纯计算/状态机模块；I/O 与第三方 SDK 调用保留边界。  
-   **已完成第一条：git 工作区状态（§2.4）。** 下一步的自然延伸是补齐
-   git 的**写操作**（`stage` / `unstage` / `discard` / `commit`）—— 读路径已经
-   全部就位，写路径在 TS 侧也只是拼命令行 + 复用同一套 `GitCommandProvider`，
-   移植成本低，且能让「变更」页从只读变成可操作。
+   **已完成两条**：git 工作区状态的**读路径**（§2.4）与**写路径**（§2.5，
+   `stage` / `unstage` / `discard` / `commit` / `push`），「变更」页因此从只读
+   变成了可操作。下一步的自然延伸是 `getDiff` / `getCommitGraph` /
+   `getIdentity` 这几个读接口 —— 它们同样只是拼命令行 + 复用同一套
+   `GitCommandProvider`，而且能直接喂给已经移植好的 `diff_viewer` 原语。
 5. **不可移植部分**：桌面/浏览器外壳（Electron / Vite / Node 主进程）不迁移；
    UI 层则**改用 Dioxus 重写**而不是机械翻译（React 运行时无法移植，但组件语义可以）。
 

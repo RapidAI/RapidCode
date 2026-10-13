@@ -332,6 +332,12 @@ lucide!(IconDownload, "download",
     line { x1: "12", x2: "12", y1: "15", y2: "3" }
 );
 
+lucide!(IconUpload, "upload",
+    path { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }
+    polyline { points: "17 8 12 3 7 8" }
+    line { x1: "12", x2: "12", y1: "3", y2: "15" }
+);
+
 lucide!(IconSend, "send",
     path { d: "M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z" }
     path { d: "m21.854 2.147-10.94 10.939" }
@@ -425,6 +431,7 @@ mod tests {
         let _ = IconMessageSquare as fn(IconMessageSquareProps) -> Element;
         let _ = IconGitBranch as fn(IconGitBranchProps) -> Element;
         let _ = IconDownload as fn(IconDownloadProps) -> Element;
+        let _ = IconUpload as fn(IconUploadProps) -> Element;
         let _ = IconSend as fn(IconSendProps) -> Element;
         let _ = IconPaperclip as fn(IconPaperclipProps) -> Element;
         let _ = IconStop as fn(IconStopProps) -> Element;

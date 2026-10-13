@@ -13,7 +13,7 @@
 
 use dioxus::prelude::*;
 use zcode_app::state::{demo_state, AppCtx};
-use zcode_app::workspace::{WorkspaceData, WorkspaceStatus};
+use zcode_app::workspace::{WorkspaceData, WorkspaceNotice, WorkspaceStatus};
 use zcode_ui::*;
 
 /// 把组件渲染成 HTML 字符串。
@@ -79,6 +79,7 @@ fn Harness(
         // 真实数据的渲染另见 `changes_view_*` 一组测试。
         workspace: use_signal(|| None::<WorkspaceData>),
         workspace_status: use_signal(WorkspaceStatus::default),
+        workspace_notice: use_signal(|| None::<WorkspaceNotice>),
     };
     use_context_provider(|| ctx);
 
@@ -756,7 +757,12 @@ fn workspace_fixture(case: &str) -> (Option<WorkspaceData>, WorkspaceStatus) {
 
 /// 注入 AppCtx + 一个不会真跑 git 的请求端，然后渲染主区域。
 #[component]
-fn WorkspaceHarness(case: &'static str, #[props(default = "changes")] tab: &'static str) -> Element {
+fn WorkspaceHarness(
+    case: &'static str,
+    #[props(default = "changes")] tab: &'static str,
+    /// 注入一条写操作反馈（`None` = 没有反馈）。
+    #[props(default)] notice: Option<WorkspaceNotice>,
+) -> Element {
     let channel = use_hook(zcode_app::workspace::create_workspace_channel);
     let requester = channel.requester();
     use_context_provider(move || requester);
@@ -775,6 +781,7 @@ fn WorkspaceHarness(case: &'static str, #[props(default = "changes")] tab: &'sta
         approval_value: use_signal(|| "ask".to_string()),
         workspace: use_signal(move || data),
         workspace_status: use_signal(move || status),
+        workspace_notice: use_signal(move || notice),
     };
     use_context_provider(|| ctx);
 
@@ -887,4 +894,117 @@ fn workspace_tab_switches_the_main_pane() {
     let conversation = html(ConversationTabFixture);
     assert!(conversation.contains("继续完成剩余移植工作"));
     assert!(!conversation.contains("任务页尚未移植"));
+}
+
+// ---------------------------------------------------------------------------
+// 写操作（暂存 / 取消暂存 / 丢弃 / 提交 / 推送）
+// ---------------------------------------------------------------------------
+//
+// 这一组只断言**界面有没有给出正确的入口与反馈**，不断言 git 真的被调用了
+// ——后者由 `crates/zcode-services/tests/git_workspace.rs` 在真实仓库上覆盖。
+// 分层的理由：如果「按钮没渲染出来」和「git 命令拼错了」混在一个测试里，
+// 失败信息分不清是哪一边。
+
+#[component]
+fn SuccessNoticeFixture() -> Element {
+    rsx! {
+        WorkspaceHarness {
+            case: "changes",
+            notice: Some(WorkspaceNotice::success("提交成功：1b79077")),
+        }
+    }
+}
+
+#[component]
+fn ErrorNoticeFixture() -> Element {
+    rsx! {
+        WorkspaceHarness {
+            case: "changes",
+            notice: Some(WorkspaceNotice::error("暂存失败：fatal: pathspec did not match")),
+        }
+    }
+}
+
+#[component]
+fn NotRepoNoticeFixture() -> Element {
+    rsx! {
+        WorkspaceHarness {
+            case: "not-repo",
+            notice: Some(WorkspaceNotice::error("推送失败：没有配置 remote")),
+        }
+    }
+}
+
+#[test]
+fn changes_view_offers_stage_and_discard_per_row() {
+    let out = html(ChangesFixture);
+
+    // 未暂存 / 未跟踪 / 冲突三节给「暂存」，已暂存那节给「取消暂存」
+    assert!(out.contains("暂存"), "缺少暂存入口");
+    assert!(out.contains("取消暂存"), "缺少取消暂存入口");
+    assert!(out.contains("丢弃改动"), "缺少丢弃入口（aria-label）");
+    // 整组操作
+    assert!(out.contains("全部暂存"), "缺少整组暂存");
+    assert!(out.contains("全部丢弃"), "缺少整组丢弃");
+}
+
+#[test]
+fn changes_view_offers_a_commit_box_and_push() {
+    let out = html(ChangesFixture);
+
+    assert!(out.contains("提交"), "缺少提交按钮");
+    assert!(out.contains("推送"), "缺少推送按钮");
+    // 已暂存文件数会写进占位符，用户才知道这次提交会带上什么
+    assert!(
+        out.contains("1 个已暂存文件"),
+        "提交输入框应当说明有几个已暂存文件"
+    );
+}
+
+#[test]
+fn commit_box_is_absent_for_a_non_repository() {
+    // 非仓库时不该出现提交入口 —— 点了必然失败，摆在那里只会误导
+    let out = html(NotRepoFixture);
+    assert!(!out.contains("先暂存一些改动再提交"));
+    assert!(!out.contains("1 个已暂存文件"));
+}
+
+#[test]
+fn discard_asks_for_confirmation_before_doing_anything() {
+    // 「丢弃」是会丢数据的操作，默认必须是关闭的确认框，而不是直接执行。
+    let out = html(ChangesFixture);
+    assert!(
+        !out.contains("alert-dialog-content"),
+        "确认框默认必须关闭"
+    );
+    assert!(!out.contains("丢弃这些改动？"));
+}
+
+#[test]
+fn success_notice_is_rendered_and_readable() {
+    let out = html(SuccessNoticeFixture);
+    assert!(out.contains("workspace-notice"), "成功提示应当渲染出来");
+    assert!(out.contains("提交成功：1b79077"));
+}
+
+#[test]
+fn failure_notice_is_rendered_with_the_reason() {
+    // 这一条延续「失败必须看得见」：写操作失败不能悄悄吞掉。
+    let out = html(ErrorNoticeFixture);
+    assert!(out.contains("workspace-notice"));
+    assert!(out.contains("暂存失败"));
+    assert!(
+        out.contains("pathspec did not match"),
+        "失败原因必须原样带出来，否则用户没法自查"
+    );
+}
+
+#[test]
+fn notices_still_render_on_top_of_a_non_repository_state() {
+    // 提示条挂在信息条下方，不受主体内容影响 ——
+    // 否则「在非仓库目录点了推送」这类反馈会消失得无影无踪。
+    let out = html(NotRepoNoticeFixture);
+    assert!(out.contains("workspace-notice"));
+    assert!(out.contains("推送失败：没有配置 remote"));
+    assert!(out.contains("当前目录不是 Git 仓库"));
 }

@@ -9,7 +9,7 @@
 
 use dioxus::prelude::*;
 
-use crate::workspace::{WorkspaceData, WorkspaceStatus};
+use crate::workspace::{WorkspaceData, WorkspaceNotice, WorkspaceStatus};
 
 /// 会话列表里的一条会话。
 #[derive(Clone, PartialEq, Debug)]
@@ -251,6 +251,12 @@ pub struct AppCtx {
     pub workspace: Signal<Option<WorkspaceData>>,
     /// 工作区数据的加载状态。
     pub workspace_status: Signal<WorkspaceStatus>,
+    /// 最近一次写操作的反馈（暂存 / 提交 / 推送的成败）。
+    ///
+    /// 与 [`AppCtx::workspace_status`] 分开：那个说的是「工作区读不读得到」，
+    /// 这个说的是「刚才那个动作成没成」。写操作失败时界面上的数据依然有效，
+    /// 不该被一个整屏错误面板盖掉。
+    pub workspace_notice: Signal<Option<WorkspaceNotice>>,
 }
 
 impl AppCtx {

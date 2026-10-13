@@ -122,9 +122,84 @@ pub enum WorkspaceMessage {
     /// 结果用 `Box` 包一层，免得消息枚举被一个大结构撑大。
     Loaded(Box<WorkspaceData>),
     Failed(String),
+    /// 写操作的即时反馈（成功或失败）。
+    Notice(WorkspaceNotice),
 }
 
-/// 发起扫描的那一半，可以自由克隆 / 放进 context。
+/// 上一次写操作的结果，用于给用户即时反馈。
+///
+/// 和 [`WorkspaceStatus::Failed`] 分开是因为**语义完全不同**：
+/// 那个说的是「读不到工作区，界面没内容可显示」；
+/// 这个说的是「读得到，只是刚才那个动作没成」—— 此时界面上的数据仍然有效，
+/// 不该被一个红色整屏面板盖掉。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceNotice {
+    pub is_error: bool,
+    pub message: String,
+}
+
+impl WorkspaceNotice {
+    pub fn success(message: impl Into<String>) -> Self {
+        Self {
+            is_error: false,
+            message: message.into(),
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            is_error: true,
+            message: message.into(),
+        }
+    }
+}
+
+/// 用户能对工作区发起的写操作。
+///
+/// 路径一律是 **workspace 相对路径**（就是界面上显示的那条），
+/// 不是仓库相对路径 —— `zcode-services` 的 `normalize_input_path` 以 workspace
+/// 为基准解析相对路径。workspace 是仓库子目录时，这两者不一样。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkspaceAction {
+    Stage(Vec<String>),
+    Unstage(Vec<String>),
+    Discard { paths: Vec<String>, staged: bool },
+    Commit { message: String },
+    Push,
+}
+
+impl WorkspaceAction {
+    /// 动作的中文名，用于按钮文案与提示前缀。
+    pub fn label(&self) -> &'static str {
+        match self {
+            WorkspaceAction::Stage(_) => "暂存",
+            WorkspaceAction::Unstage(_) => "取消暂存",
+            WorkspaceAction::Discard { .. } => "丢弃改动",
+            WorkspaceAction::Commit { .. } => "提交",
+            WorkspaceAction::Push => "推送",
+        }
+    }
+
+    /// 是否**会丢数据**（需要在界面上二次确认）。
+    ///
+    /// 只有 `discard` 是：`git restore` 之后改动就没了，git 也没法找回。
+    pub fn is_destructive(&self) -> bool {
+        matches!(self, WorkspaceAction::Discard { .. })
+    }
+
+    /// 按钮上的短文案。
+    pub fn button_label(&self) -> &'static str {
+        match self {
+            WorkspaceAction::Stage(_) => "暂存",
+            WorkspaceAction::Unstage(_) => "取消暂存",
+            WorkspaceAction::Discard { .. } => "丢弃",
+            WorkspaceAction::Commit { .. } => "提交",
+            WorkspaceAction::Push => "推送",
+        }
+    }
+}
+
+/// 发起扫描 / 写操作的那一半，可以自由克隆 / 放进 context。
 ///
 /// `Send + Sync`：内部只有 `Arc` 与原子量，所以能安全地交给 worker 线程。
 #[derive(Clone)]
@@ -140,7 +215,29 @@ impl WorkspaceRequester {
     /// 返回 `false` 表示上一次还没跑完 —— 这时**不排队**，
     /// 因为用户连点刷新时排队只会让最后看到的结果更旧。
     pub fn refresh(&self, workspace: PathBuf) -> bool {
+        self.dispatch(workspace, None)
+    }
+
+    /// 发起一次写操作；成功后会自动重新扫描一遍。
+    ///
+    /// 返回 `false` 表示当前正有一个 git 操作在跑 —— 所有操作共用同一个
+    /// `busy` 标志，**串行化**是刻意的：并发的 `git add` 与 `git commit`
+    /// 会争 `index.lock`，失败信息还很难懂。
+    pub fn run(&self, workspace: PathBuf, action: WorkspaceAction) -> bool {
+        self.dispatch(workspace, Some(action))
+    }
+
+    /// `refresh` 与 `run` 的公共部分。
+    fn dispatch(&self, workspace: PathBuf, action: Option<WorkspaceAction>) -> bool {
         if self.busy.swap(true, Ordering::SeqCst) {
+            if let Some(action) = &action {
+                let _ = self.sender.unbounded_send(WorkspaceMessage::Notice(
+                    WorkspaceNotice::error(format!(
+                        "上一个 Git 操作还在进行中，「{}」没有执行",
+                        action.label()
+                    )),
+                ));
+            }
             return false;
         }
 
@@ -152,6 +249,30 @@ impl WorkspaceRequester {
         let spawned = std::thread::Builder::new()
             .name("zcode-workspace-git".to_string())
             .spawn(move || {
+                // 先跑写操作并立刻回报结果，再重新扫描 —— 用户先看到「提交成功」，
+                // 而不是先看到界面刷新再猜刚才那下成没成。
+                if let Some(action) = action {
+                    match run_workspace_action(&repo, &workspace, &action) {
+                        Ok(detail) => {
+                            let message = match detail {
+                                Some(detail) => format!("{}成功：{detail}", action.label()),
+                                None => format!("{}成功", action.label()),
+                            };
+                            let _ = sender.unbounded_send(WorkspaceMessage::Notice(
+                                WorkspaceNotice::success(message),
+                            ));
+                        }
+                        Err(message) => {
+                            let _ = sender.unbounded_send(WorkspaceMessage::Notice(
+                                WorkspaceNotice::error(format!(
+                                    "{}失败：{message}",
+                                    action.label()
+                                )),
+                            ));
+                        }
+                    }
+                }
+
                 let message = load_workspace(&repo, &workspace);
                 busy.store(false, Ordering::SeqCst);
                 let _ = sender.unbounded_send(message);
@@ -160,7 +281,7 @@ impl WorkspaceRequester {
         if let Err(error) = spawned {
             self.busy.store(false, Ordering::SeqCst);
             let _ = self.sender.unbounded_send(WorkspaceMessage::Failed(format!(
-                "无法启动工作区扫描线程：{error}"
+                "无法启动工作区线程：{error}"
             )));
             return false;
         }
@@ -258,6 +379,52 @@ fn load_workspace(repo: &GitCliRepo, workspace: &Path) -> WorkspaceMessage {
         }
         Err(failure) => WorkspaceMessage::Failed(failure.message),
     }
+}
+
+/// 真正跑写操作的地方（在 worker 线程上）。
+///
+/// `Ok(Some(detail))` 用于把「新提交的前 7 位」这类信息带回界面。
+fn run_workspace_action(
+    repo: &GitCliRepo,
+    workspace: &Path,
+    action: &WorkspaceAction,
+) -> Result<Option<String>, String> {
+    match action {
+        WorkspaceAction::Stage(paths) => repo.stage(workspace, paths).map(|_| None),
+        WorkspaceAction::Unstage(paths) => repo.unstage(workspace, paths).map(|_| None),
+        WorkspaceAction::Discard { paths, staged } => {
+            repo.discard(workspace, paths, *staged).map(|_| None)
+        }
+        WorkspaceAction::Commit { message } => repo
+            .commit(workspace, message, &[])
+            .map(|result| Some(short_hash(&result.commit_hash))),
+        WorkspaceAction::Push => repo.push(workspace).map(|result| {
+            Some(match result.remote_name.as_deref() {
+                Some(remote) => format!("{} → {remote}", result.branch_name),
+                None => result.branch_name.clone(),
+            })
+        }),
+    }
+    .map_err(|failure| failure.message)
+}
+
+/// 40 位哈希取前 7 位，和 `git log --oneline` 的观感一致。
+pub fn short_hash(hash: &str) -> String {
+    hash.chars().take(7).collect()
+}
+
+/// 把一次写操作需要的路径从变更条目上取出来。
+///
+/// 用 `workspace_relative_path` 而不是 `repo_relative_path`：服务层解析相对路径时
+/// 以 **workspace** 为基准（见 [`WorkspaceAction`] 的说明）。
+pub fn action_paths(changes: &[&GitFileChange]) -> Vec<String> {
+    changes
+        .iter()
+        .map(|change| {
+            let path = display_path(change);
+            path.to_string()
+        })
+        .collect()
 }
 
 /// 变更性质的中文标签。
@@ -478,5 +645,138 @@ mod tests {
         // 确保应用层能直接拿到 services 的解析结果类型（避免只导出部分 API）
         let resolution = GitResolvedRepository::unavailable("/repo", true);
         assert!(!resolution.is_usable());
+    }
+
+    // ---------------------------------------------------------------
+    // 写操作
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn only_discard_is_destructive() {
+        assert!(WorkspaceAction::Discard {
+            paths: vec!["a.rs".into()],
+            staged: false,
+        }
+        .is_destructive());
+
+        for action in [
+            WorkspaceAction::Stage(vec!["a.rs".into()]),
+            WorkspaceAction::Unstage(vec!["a.rs".into()]),
+            WorkspaceAction::Commit {
+                message: "msg".into(),
+            },
+            WorkspaceAction::Push,
+        ] {
+            assert!(
+                !action.is_destructive(),
+                "{} 不该被标成会丢数据的操作",
+                action.label()
+            );
+        }
+    }
+
+    #[test]
+    fn action_labels_are_non_empty_and_distinct() {
+        let actions = [
+            WorkspaceAction::Stage(Vec::new()),
+            WorkspaceAction::Unstage(Vec::new()),
+            WorkspaceAction::Discard {
+                paths: Vec::new(),
+                staged: true,
+            },
+            WorkspaceAction::Commit {
+                message: String::new(),
+            },
+            WorkspaceAction::Push,
+        ];
+
+        let mut labels: Vec<&str> = Vec::new();
+        for action in &actions {
+            assert!(!action.label().is_empty());
+            assert!(!action.button_label().is_empty());
+            labels.push(action.label());
+        }
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), actions.len(), "每个动作的文案应当各不相同");
+    }
+
+    #[test]
+    fn short_hash_takes_seven_characters() {
+        assert_eq!(
+            short_hash("1b790776924d78394b8b71029eb9114695ec0098"),
+            "1b79077"
+        );
+        // 短哈希（或空串）不能 panic
+        assert_eq!(short_hash("abc"), "abc");
+        assert_eq!(short_hash(""), "");
+    }
+
+    #[test]
+    fn action_paths_uses_the_workspace_relative_path() {
+        let mut staged = change("a.rs", GitChangeSectionId::Staged);
+        // workspace 是仓库子目录时，两者不同 —— 必须用 workspace 那条
+        staged.workspace_relative_path = "sub/a.rs".into();
+        let untracked = change("b.rs", GitChangeSectionId::Untracked);
+
+        let paths = action_paths(&[&staged, &untracked]);
+        assert_eq!(paths, vec!["sub/a.rs".to_string(), "b.rs".to_string()]);
+    }
+
+    #[test]
+    fn action_paths_is_empty_for_no_changes() {
+        assert!(action_paths(&[]).is_empty());
+    }
+
+    #[test]
+    fn notices_distinguish_success_from_error() {
+        let ok = WorkspaceNotice::success("提交成功：1b79077");
+        assert!(!ok.is_error);
+        assert_eq!(ok.message, "提交成功：1b79077");
+
+        let bad = WorkspaceNotice::error("暂存失败：boom");
+        assert!(bad.is_error);
+        assert_eq!(bad.message, "暂存失败：boom");
+    }
+
+    #[test]
+    fn run_on_a_detached_channel_does_not_panic() {
+        let channel = create_workspace_channel();
+        drop(channel.take_receiver());
+        let _ = channel
+            .requester()
+            .run(PathBuf::from("."), WorkspaceAction::Push);
+    }
+
+    #[test]
+    fn a_busy_requester_reports_why_the_action_was_skipped() {
+        // 手工把 busy 立起来，模拟「上一个操作还在跑」。
+        let (sender, mut receiver) = futures_channel::mpsc::unbounded();
+        let requester = WorkspaceRequester {
+            repo: Arc::new(GitCliRepo::new()),
+            sender,
+            busy: Arc::new(AtomicBool::new(true)),
+        };
+
+        assert!(
+            !requester.run(PathBuf::from("."), WorkspaceAction::Push),
+            "busy 时应当拒绝新操作"
+        );
+
+        // 拒绝要**说出来**，否则用户点了按钮没反应会以为是界面卡了。
+        // `try_recv` 与 `std::sync::mpsc` 同形：队列空时返回 Err(Empty)，
+        // 所以这里 expect 是安全的 —— 上面那次调用必然已经塞进一条消息。
+        let message = receiver.try_recv().expect("应当立刻收到一条被拒绝的提示");
+        match message {
+            WorkspaceMessage::Notice(notice) => {
+                assert!(notice.is_error);
+                assert!(
+                    notice.message.contains("推送"),
+                    "提示里应当说明是哪个动作被跳过：{}",
+                    notice.message
+                );
+            }
+            other => panic!("期望收到 Notice，实际：{other:?}"),
+        }
     }
 }

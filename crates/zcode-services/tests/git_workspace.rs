@@ -67,6 +67,47 @@ impl Drop for TempDir {
     }
 }
 
+/// 读一个文件并把换行统一成 `\n`。
+///
+/// Windows 上 `core.autocrlf` 默认开启，`git restore` / `checkout` 会把仓库里的
+/// LF 写成工作区的 CRLF。断言文件内容时必须先归一，否则测的是「本机的 git 配置」
+/// 而不是「我们的代码有没有把文件恢复对」。
+fn read_text(root: &Path, relative: &str) -> String {
+    std::fs::read_to_string(root.join(relative))
+        .unwrap_or_else(|error| panic!("读不到 {relative}: {error}"))
+        .replace("\r\n", "\n")
+}
+
+/// 这个目录是不是落在某个 Git 仓库里（含被 .gitignore 忽略的情况）。
+fn is_inside_a_repository(path: &Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// 造一个**确定不在任何仓库里**的临时目录；造不出来就返回 `None`（调用方跳过）。
+///
+/// 为什么不能直接用 [`TempDir`]：它建在 `CARGO_TARGET_TMPDIR` 下，也就是本仓库的
+/// `target/` 里 —— `target/` 只是被 `.gitignore` 忽略，**仍然在 work tree 内**，
+/// `git rev-parse --show-toplevel` 会一路找到 `RapidCode` 仓库根。
+///
+/// 这个坑的代价很实在：`push` 测试曾经因此对着**真实 origin** 跑了一次 `git push`。
+/// 所以这里换到系统临时目录，并且仍然做一次探测兜底。
+fn dir_outside_any_repository(name: &str) -> Option<TempDir> {
+    let candidate = std::env::temp_dir().join(format!("zcode-services-{name}"));
+    let _ = std::fs::remove_dir_all(&candidate);
+    std::fs::create_dir_all(&candidate).expect("创建系统临时目录");
+    let dir = TempDir { path: candidate };
+    if is_inside_a_repository(dir.path()) {
+        eprintln!("跳过：{} 恰好位于某个 Git 仓库内", dir.path().display());
+        return None;
+    }
+    Some(dir)
+}
+
 /// 建一个仓库，里面覆盖四类变更：已暂存、未暂存、未跟踪、以及一个已跟踪的子目录。
 fn build_repository(name: &str) -> TempDir {
     let dir = TempDir::new(name);
@@ -324,4 +365,461 @@ fn missing_working_directory_degrades_instead_of_erroring() {
     assert!(snapshot.summary.is_git_available);
     assert!(!snapshot.summary.is_repository);
     assert!(snapshot.entries.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 写操作
+//
+// 这一组的意义和上面的只读测试一样：证明「拼出来的命令行真的能被 git 接受」。
+// 每条测试都从「跑写操作」走到「重新读状态」，验证**副作用真的发生了** ——
+// 只断言「函数返回 Ok」是不够的，那样 `git add` 拼错参数也测不出来。
+// ---------------------------------------------------------------------------
+
+/// 从快照里找某个路径的条目，返回 (x, y) 状态码。
+fn status_of(snapshot: &zcode_services::git::types::GitStatusSnapshot, path: &str) -> Option<String> {
+    snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.path == path)
+        .map(|entry| {
+            format!(
+                "{}{}",
+                entry.x.as_deref().unwrap_or("."),
+                entry.y.as_deref().unwrap_or(".")
+            )
+        })
+}
+
+#[test]
+fn stage_moves_an_untracked_file_into_the_index() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-stage");
+    let repo = GitCliRepo::new();
+
+    // 未跟踪 → 不在暂存区
+    let before = repo.get_status(dir.path()).unwrap();
+    let changes = get_workspace_changes(&before);
+    assert!(
+        changes
+            .iter()
+            .any(|change| change.repo_relative_path == "untracked.txt"
+                && change.section == GitChangeSectionId::Untracked),
+        "前置条件：untracked.txt 应当出现在未跟踪区"
+    );
+
+    repo.stage(dir.path(), &["untracked.txt".to_string()])
+        .expect("git add 应当成功");
+
+    let after = repo.get_status(dir.path()).unwrap();
+    let changes = get_workspace_changes(&after);
+    assert!(
+        changes
+            .iter()
+            .any(|change| change.repo_relative_path == "untracked.txt"
+                && change.section == GitChangeSectionId::Staged),
+        "stage 之后 untracked.txt 应当出现在已暂存区，实际：{changes:#?}"
+    );
+    assert!(
+        !changes
+            .iter()
+            .any(|change| change.repo_relative_path == "untracked.txt"
+                && change.section == GitChangeSectionId::Untracked),
+        "stage 之后不应再出现在未跟踪区"
+    );
+}
+
+#[test]
+fn unstage_puts_a_file_back_into_the_working_tree() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-unstage");
+    let repo = GitCliRepo::new();
+
+    // staged.txt 在 fixture 里已经是已暂存状态
+    let before = repo.get_status(dir.path()).unwrap();
+    assert!(
+        get_workspace_changes(&before)
+            .iter()
+            .any(|change| change.repo_relative_path == "staged.txt"
+                && change.section == GitChangeSectionId::Staged),
+        "前置条件：staged.txt 应当已在暂存区"
+    );
+
+    repo.unstage(dir.path(), &["staged.txt".to_string()])
+        .expect("git restore --staged 应当成功");
+
+    let after = repo.get_status(dir.path()).unwrap();
+    let changes = get_workspace_changes(&after);
+    assert!(
+        !changes
+            .iter()
+            .any(|change| change.repo_relative_path == "staged.txt"
+                && change.section == GitChangeSectionId::Staged),
+        "unstage 之后不应再出现在已暂存区"
+    );
+    // 文件变成未跟踪（之前从未提交过）
+    assert!(
+        changes
+            .iter()
+            .any(|change| change.repo_relative_path == "staged.txt"
+                && change.section == GitChangeSectionId::Untracked),
+        "unstage 之后应当回到未跟踪区"
+    );
+}
+
+#[test]
+fn stage_then_unstage_round_trips() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-round-trip");
+    let repo = GitCliRepo::new();
+    let paths = vec!["tracked.txt".to_string()];
+
+    repo.stage(dir.path(), &paths).unwrap();
+    let staged = repo.get_status(dir.path()).unwrap();
+    assert_eq!(
+        status_of(&staged, "tracked.txt").as_deref(),
+        Some("M."),
+        "stage 后 index 与 worktree 都干净 → X=M, Y=."
+    );
+
+    repo.unstage(dir.path(), &paths).unwrap();
+    let unstaged = repo.get_status(dir.path()).unwrap();
+    assert_eq!(
+        status_of(&unstaged, "tracked.txt").as_deref(),
+        Some(".M"),
+        "unstage 后改动回到 worktree → X=., Y=M"
+    );
+}
+
+#[test]
+fn discard_restores_an_unstaged_modification() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-discard-unstaged");
+    let repo = GitCliRepo::new();
+
+    // 前置条件：tracked.txt 确实被改过
+    assert_eq!(
+        read_text(dir.path(), "tracked.txt"),
+        "line one\nline two changed\n"
+    );
+
+    repo.discard(dir.path(), &["tracked.txt".to_string()], false)
+        .expect("git restore --worktree 应当成功");
+
+    assert_eq!(
+        read_text(dir.path(), "tracked.txt"),
+        "line one\nline two\n",
+        "丢弃之后工作区文件应当回到 HEAD 的内容"
+    );
+    let after = repo.get_status(dir.path()).unwrap();
+    assert!(
+        status_of(&after, "tracked.txt").is_none(),
+        "丢弃之后 tracked.txt 不应再出现在变更列表里"
+    );
+}
+
+#[test]
+fn discard_with_staged_also_clears_the_index() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-discard-staged");
+    let repo = GitCliRepo::new();
+
+    // 先让 tracked.txt 同时有「已暂存 + 又改了一次」两个层面的改动
+    std::fs::write(dir.path().join("tracked.txt"), "line one\nstaged version\n").unwrap();
+    git(dir.path(), &["add", "--", "tracked.txt"]);
+    std::fs::write(dir.path().join("tracked.txt"), "line one\nworktree version\n").unwrap();
+
+    let before = repo.get_status(dir.path()).unwrap();
+    assert_eq!(status_of(&before, "tracked.txt").as_deref(), Some("MM"));
+
+    repo.discard(dir.path(), &["tracked.txt".to_string()], true)
+        .expect("git restore --source=HEAD --staged --worktree 应当成功");
+
+    assert_eq!(
+        read_text(dir.path(), "tracked.txt"),
+        "line one\nline two\n",
+        "staged=true 应当把工作区也一并回退到 HEAD"
+    );
+    let after = repo.get_status(dir.path()).unwrap();
+    assert!(
+        status_of(&after, "tracked.txt").is_none(),
+        "丢弃之后不应再有任何层面的改动"
+    );
+}
+
+#[test]
+fn discard_handles_a_file_that_was_deleted() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-discard-deleted");
+    let repo = GitCliRepo::new();
+
+    // 删掉一个已跟踪文件 —— 这正是「路径不存在、canonicalize 会失败」的场景，
+    // 也是 normalize_input_path 必须有词法兜底的原因。
+    std::fs::remove_file(dir.path().join("nested/inner.txt")).unwrap();
+
+    let before = repo.get_status(dir.path()).unwrap();
+    assert_eq!(status_of(&before, "nested/inner.txt").as_deref(), Some(".D"));
+
+    repo.discard(dir.path(), &["nested/inner.txt".to_string()], false)
+        .expect("丢弃删除也应当成功（路径不存在不能拦住它）");
+
+    assert!(
+        dir.path().join("nested/inner.txt").is_file(),
+        "丢弃删除应当把文件恢复出来"
+    );
+}
+
+#[test]
+fn commit_creates_a_real_commit_with_the_given_message() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-commit");
+    let repo = GitCliRepo::new();
+
+    // 只提交已暂存的 staged.txt（fixture 里已 add）
+    let result = repo
+        .commit(dir.path(), "  feat: add staged file  ", &[])
+        .expect("git commit 应当成功");
+
+    assert_eq!(result.commit_hash.len(), 40, "应当是完整哈希");
+    assert!(result.commit_hash.chars().all(|c| c.is_ascii_hexdigit()));
+
+    // 提交信息应当被 trim 过
+    let output = Command::new("git")
+        .args(["log", "-1", "--pretty=%s"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "feat: add staged file"
+    );
+
+    // HEAD 应当就是刚返回的那个哈希
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), result.commit_hash);
+
+    // 提交之后 staged.txt 不再出现在变更里
+    let after = repo.get_status(dir.path()).unwrap();
+    assert!(
+        status_of(&after, "staged.txt").is_none(),
+        "已提交的文件不应还在变更列表里"
+    );
+}
+
+#[test]
+fn commit_rejects_an_empty_message() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-commit-empty");
+    let repo = GitCliRepo::new();
+
+    for message in ["", "   ", "\t\n"] {
+        let failure = repo.commit(dir.path(), message, &[]).unwrap_err();
+        assert_eq!(
+            failure.kind,
+            zcode_services::git::cli_helpers::GitCommandFailureKind::InvalidArgument,
+            "空白提交信息应当在跑 git 之前就被拦下"
+        );
+        assert_eq!(failure.message, "Commit message cannot be empty");
+    }
+
+    // 确认真的没有产生新提交：仍然只有 initial 那一个
+    let count = Command::new("git")
+        .args(["rev-list", "--count", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+}
+
+#[test]
+fn commit_with_paths_only_commits_those_paths() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-commit-paths");
+    let repo = GitCliRepo::new();
+
+    // tracked.txt 有未暂存改动；用 pathspec 形式直接提交它
+    repo.commit(dir.path(), "fix: tracked only", &["tracked.txt".to_string()])
+        .expect("带 pathspec 的 commit 应当成功");
+
+    let after = repo.get_status(dir.path()).unwrap();
+    assert!(
+        status_of(&after, "tracked.txt").is_none(),
+        "被提交的路径应当从变更列表消失"
+    );
+    // staged.txt 仍然留在暂存区，没被顺手提交
+    assert_eq!(
+        status_of(&after, "staged.txt").as_deref(),
+        Some("A."),
+        "其它已暂存文件应当原样保留"
+    );
+}
+
+#[test]
+fn write_operations_refuse_a_non_repository() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    // ⚠️ 必须用一个**真的不在仓库里**的目录。用 TempDir（target/ 下）会命中本仓库，
+    // 于是这些写操作会作用在真实仓库上 —— `push` 就真的推了一次。
+    let Some(plain) = dir_outside_any_repository("write-non-repo") else {
+        return;
+    };
+    let repo = GitCliRepo::new();
+    let paths = vec!["a.txt".to_string()];
+
+    // 先确认前提成立，否则后面断言的是错的东西
+    assert!(!is_inside_a_repository(plain.path()));
+
+    for failure in [
+        repo.stage(plain.path(), &paths).unwrap_err(),
+        repo.unstage(plain.path(), &paths).unwrap_err(),
+        repo.discard(plain.path(), &paths, false).unwrap_err(),
+        repo.commit(plain.path(), "msg", &[]).unwrap_err(),
+    ] {
+        assert_eq!(
+            failure.kind,
+            zcode_services::git::cli_helpers::GitCommandFailureKind::RepositoryUnavailable,
+            "非仓库应当被前置校验拦下，而不是把 git 的原始报错抛出去：{}",
+            failure.message
+        );
+    }
+
+    // push 单独放最后：它是唯一会碰网络的，确认目录真的不在仓库里再跑。
+    let failure = repo.push(plain.path()).unwrap_err();
+    assert_eq!(
+        failure.kind,
+        zcode_services::git::cli_helpers::GitCommandFailureKind::RepositoryUnavailable
+    );
+}
+
+#[test]
+fn push_without_a_remote_reports_a_clear_error() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    // 临时仓库没有配 remote，也没有 upstream
+    let dir = build_repository("zcode-services-e2e-push-no-remote");
+    let repo = GitCliRepo::new();
+
+    let failure = repo.push(dir.path()).unwrap_err();
+    assert_eq!(
+        failure.kind,
+        zcode_services::git::cli_helpers::GitCommandFailureKind::RepositoryUnavailable
+    );
+    assert_eq!(
+        failure.message,
+        "No Git remote is configured for the current repository."
+    );
+}
+
+#[test]
+fn push_refuses_a_detached_head() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-push-detached");
+    // 先配一个 remote，把「没有 remote」那条分支排除掉
+    git(dir.path(), &["remote", "add", "origin", "https://example.invalid/repo.git"]);
+    git(dir.path(), &["checkout", "--quiet", "--detach", "HEAD"]);
+
+    let repo = GitCliRepo::new();
+    let failure = repo.push(dir.path()).unwrap_err();
+    assert_eq!(failure.message, "Cannot push while HEAD is detached.");
+}
+
+#[test]
+fn write_operations_reject_paths_outside_the_repository() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-write-outside");
+    let repo = GitCliRepo::new();
+    let outside = vec!["../outside.txt".to_string()];
+
+    for failure in [
+        repo.stage(dir.path(), &outside).unwrap_err(),
+        repo.unstage(dir.path(), &outside).unwrap_err(),
+        repo.discard(dir.path(), &outside, false).unwrap_err(),
+    ] {
+        assert_eq!(
+            failure.kind,
+            zcode_services::git::cli_helpers::GitCommandFailureKind::PathOutsideRepository,
+            "越界路径应当在跑 git 之前被拦下"
+        );
+    }
+}
+
+#[test]
+fn write_operations_with_no_paths_are_a_no_op() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-write-no-paths");
+    let repo = GitCliRepo::new();
+    let before = repo.get_status(dir.path()).unwrap();
+
+    repo.stage(dir.path(), &[]).unwrap();
+    repo.unstage(dir.path(), &[]).unwrap();
+    repo.discard(dir.path(), &[], true).unwrap();
+
+    let after = repo.get_status(dir.path()).unwrap();
+    assert_eq!(
+        before.entries.len(),
+        after.entries.len(),
+        "空路径列表不应当改变任何东西"
+    );
+    assert_eq!(
+        status_of(&after, "tracked.txt").as_deref(),
+        Some(".M"),
+        "改动应当原样保留"
+    );
 }
