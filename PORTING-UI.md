@@ -421,7 +421,9 @@ cargo run -p zcode-app --example app_preview    # → ./app-preview.html（自�
 把 [`AppShell`] 用 `dioxus-ssr` 渲染成 HTML，再把 `APP_CSS` 原样包进 `<style>`，
 产出一个**单文件、无外部依赖**的页面（不需要 CDN / 本地服务 / wasm）。
 它和 `cargo run -p zcode-app` 开原生窗口是两条独立的验证路径：
-前者能进 CI、能被 diff，后者才证明窗口真的能开。
+前者能进 CI、能被 diff，后者本应证明窗口真的能开 —— 但在本机
+**后者只开得出空白窗口**（原因见 [README.md](./README.md) 的「已知问题」），
+所以这个静态快照是目前唯一能看到 UI 的路径，也是「组件树本身是对的」的直接证据。
 
 > 渲染的是 `AppShell` 而不是 `App` —— `App` 用 `document::Style` 注入样式，
 > 而那需要真实渲染器，SSR 下没有实现（这也是两者被拆开的原因）。
@@ -579,32 +581,35 @@ cargo run -p zcode-ui --example preview            # → ./preview.html
 其中一条专门盯着「类名在 DOM 上、但样式表里没编译出规则」这个坑：
 断言 `[scrollbar-width:none]` 既出现在 DOM 里，也出现在内嵌 CSS 里。
 
-**开窗口**这一层没法在无头环境自动验证，所以用外部探针核对五件事：
-
-```bash
-cargo run -p zcode-app            # 保持运行
-# 另一个终端：
-#   Get-Process zcode-app | Select Id, MainWindowHandle, MainWindowTitle, Responding
-```
+**开窗口**这一层没法在无头环境自动验证，只能上外部探针。下面这张表记的是一次
+**踩坑**：起初只核对前四项就下了「跑通了」的结论，其实**窗口是空白的**。
 
 | 观测项 | 期望 | 实测 |
 | --- | --- | --- |
-| 进程存活 | 事件循环不退出 | 一次后台运行持续 **3 小时 49 分钟**（主动终止）；复测 50 s 亦存活 |
-| `MainWindowHandle` | 非 0（真的有窗口） | `44435456` |
+| 进程存活 | 事件循环不退出 | 存活（时长随机，20 s 到数小时） |
+| `MainWindowHandle` | 非 0（真的有窗口） | 非 0 |
 | `MainWindowTitle` | 与 `WindowBuilder` 一致 | `ZCode — Rust + Dioxus 移植` |
 | `Responding` | `True`（消息泵在跑） | `True`，工作集 36 MB |
-| 事件流 | 走到页面加载完成 | `Init` → `Focused(true)` → `Ipc { method: "initialize" }`，无 `CloseRequested` / `Destroyed` |
+| **`#main` 子节点数** | **非 0（UI 真的渲染出来了）** | **0 —— 空白** |
+| **WebView2 崩溃转储** | **无新增** | **自行新增 `msedge.dll` 崩溃转储** |
 
-> ⚠️ `MainWindowTitle` 首次读可能是空串（.NET 侧缓存），`$p.Refresh()` 之后才对。
-
-> 事件流那一行是用 `Config::with_custom_event_handler` 把每个 tao 事件落盘得到的，
-> 也是排查「约 20 秒静默退出」的手段 —— 该现象**无法复现**，详见
-> [README.md](./README.md) 的「已知问题 · 附」。
+> ⚠️ **前四项全部满足，也不代表能正常运行。** 渲染进程崩掉后，宿主进程照样存活、
+> 窗口句柄照样非零、消息泵照样响应。要判定「真的渲染了」，必须去看 DOM
+> （或直接看窗口截图）。
 >
-> 调试中还遇到过一个 `WebView2Error(E_INVALIDARG)`：真实成因是
-> **`dioxus://` 这个 scheme 没有注册**（`with_url` 给了 URL 却没给
-> `with_asynchronous_custom_protocol`）。`LaunchBuilder::desktop()` 会自动注册，
-> 正常 `cargo run -p zcode-app` 不受影响。详见 README 的「已知问题」。
+> 实测结论：dioxus-desktop 0.6.3 在 WebView2 `154.0.4258.62` 上**渲染不出内容**，
+> 成因与完整证据链见 [README.md](./README.md) 的「已知问题」。那一节还记录了
+> 排查中被证伪的三个假设，以及本机为什么修不了。
+>
+> 想做同类排查，可复用的两件工具：
+> - `Config::with_custom_event_handler` —— 把事件循环收到的每个 tao 事件落盘，
+>   用来判断进程是「被事件驱动退出」还是「别的原因」。
+> - `Config::with_custom_head` / `with_custom_index` + `window.ipc.postMessage` ——
+>   往页面里注入自检脚本，把 `#main` 子节点数、`window.interpreter` 是否存在、
+>   JS 报错等状态**回读**到 Rust 侧（消息会以
+>   `UserEvent(Ipc { msg: IpcMessage { method: "…" } })` 出现在事件流里）。
+>   注意回读别用 `setTimeout` —— 页面一旦停摆定时器就不再触发，
+>   会让人误判成「通道不通」。
 
 ## 6. 曾经的未移植清单与最终归宿
 

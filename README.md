@@ -10,19 +10,24 @@
 
 1. **核心逻辑层**（移植自 `packages/rpc` + `packages/shared`）—— 见 **[PORTING.md](./PORTING.md)**
 2. **UI 层**（移植自 `packages/ui` 的 shadcn 风格原语，**47 / 47**）—— 见 **[PORTING-UI.md](./PORTING-UI.md)**
-3. **可运行的应用**（`crates/zcode-app`）—— 用移植出的原语拼出的 ZCode 风格桌面外壳
+3. **应用外壳**（`crates/zcode-app`）—— 用移植出的原语拼出的 ZCode 风格界面
 
-目标是：把项目的核心逻辑与 UI 用 Rust 重写，并保证 **可编译、可测试、能跑起来**。
+**当前状态，请先读这一句**：**可编译、可测试**已经做到（`cargo build` 零警告、
+871 个测试全绿），但**桌面窗口渲染不出内容**（环境层面的依赖不兼容，见「已知问题」），
+而且**应用外壳目前只是静态演示**（硬编码演示数据，没有任何真实业务逻辑）。
+上面第 3 条**不等于**「应用已经能用」。已移植的是 **UI 原语这一层**；
+上游 8,462 个 `.ts` / `.tsx` 里真正承载业务逻辑的那部分基本还没动，
+范围明细见「已知问题 · 移植范围」。
 
 ## 快速开始
 
 ```bash
 cargo build                          # 编译整个工作区
 cargo test                           # 运行全部测试（871 个）
-cargo run -p zcode-app               # 开一个 1360×860 的桌面窗口
+cargo run -p zcode-app               # 桌面窗口（⚠️ 本机开得出窗口但内容是空白，见「已知问题」）
 cargo build --release
 
-# UI 预览（生成一份可直接在浏览器打开的 HTML）
+# UI 预览（生成一份可直接在浏览器打开的 HTML）—— 这是目前唯一能看到 UI 的路径
 cargo run -p zcode-ui --example preview       # → ./preview.html      （原语清单）
 cargo run -p zcode-app --example app_preview  # → ./app-preview.html  （应用整屏静态快照）
 ```
@@ -33,10 +38,13 @@ cargo run -p zcode-app --example app_preview  # → ./app-preview.html  （应�
 > `zcode-app` 默认走 `dioxus/desktop`（wry + tao 原生窗口），不需要 wasm 工具链。
 > 开窗依赖系统已安装 **WebView2 Runtime**（Windows 10/11 通常自带）。
 >
-> 实测环境：WebView2 Runtime `154.0.4258.62`（Windows）。`cargo run -p zcode-app`
-> 能正常开窗并长期运行，实测一次后台运行持续 3 小时 49 分钟。
-> 两个边界情况见「已知问题」一节：`dioxus://` 协议必须注册（用 `LaunchBuilder`
-> 会自动注册），以及反复快速启停时的偶发 `E_INVALIDARG`。
+> 实测环境：WebView2 Runtime `154.0.4258.62`（Windows）。
+>
+> ⚠️ **`cargo run -p zcode-app` 能开出窗口，但窗口内容区是空白的** —— UI 渲染不出来。
+> 这是 dioxus-desktop 0.6.3（wry 0.45）与较新 WebView2 Runtime 的兼容性问题，
+> **与本仓库代码无关**（`cargo build` 零警告、871 个测试全绿，SSR 渲染出的组件树
+> 也完整正确）。完整证据链与可选出路见「已知问题」一节。
+> 想直接看 UI，用浏览器打开 `app-preview.html`（SSR 静态快照）。
 
 ## 工作区结构
 
@@ -170,59 +178,107 @@ cargo test -p zcode-app    # 应用层 19 个测试
 > `MainWindowTitle` 与 `WindowBuilder` 一致 / `Responding=True`）见
 > [PORTING-UI.md](./PORTING-UI.md) §5.5。
 
-## 已知问题
+## 已知问题：原生窗口渲染不出内容（WebView2 运行时崩溃）
 
-开窗这一步在 `WebView2 Runtime 154.0.4258.62` 上**实测可用**。下面两条是调试过程中
-遇到的真实边界情况，都不影响正常使用。
+**结论先说**：`cargo run -p zcode-app` 能开出一个标题正确的窗口，但**窗口内容区一片空白**
+—— UI 渲染不出来。这是 **dioxus-desktop 0.6.3（内置 wry 0.45）与 WebView2 Runtime
+`154.0.4258.62` 之间的兼容性问题，不是本仓库代码的问题**。同一份代码
+`cargo build` 零警告、871 个测试全绿；SSR 渲染出的组件树也完整正确（见下方
+「能看的东西」）。
 
-### 1. `dioxus://` 协议必须注册
+### 证据链
 
-`dioxus-desktop` 用 `with_url("dioxus://index.html/")` 载入内嵌页面，因此**必须同时**
-通过 `with_asynchronous_custom_protocol("dioxus", …)` 把该 scheme 注册进 WebView2。
-只给 URL、不给协议处理器时，WebView2 解析不了这个 scheme，会在
-`dioxus-desktop-0.6.3/src/webview.rs` 建 WebView 处 panic：
+1. **页面本身加载正常**。往 `</head>` 注入自检脚本后用
+   `window.ipc.postMessage` 回读（这条通道可靠，`initialize` 已证明可用）：
+   `parse` / `domready` / `load` 三条都在页面时间 200 ms 内到达，
+   且此时 `window.interpreter` 已存在。
 
+2. **解释器启动正常**。包住解释器方法后可以看到
+   `initialize()` 与 `waitForRequest()` 都正常进入并返回
+   （`waitForRequest-enter h=true`）。顺带确认 `headless=true` 是 dioxus 的设计：
+   `webview.rs:228` 里 `headless = !cfg.window.window.visible`，而
+   `app.rs::handle_start_cause_init` 总是先 `with_visible(false)` 避免白屏闪烁。
+
+3. **DOM 变更送不到页面**。`#main` 始终 0 个子节点；`run_from_bytes`（解释器应用
+   DOM 变更的唯一入口）要么根本不被调用，要么被调用后页面立刻死亡。
+   页面在「收不到变更」时能一直存活（心跳每秒正常回读），说明**不是 JS 线程被阻塞**。
+
+4. **WebView2 会自行崩溃**。`<exe>.WebView2/EBWebView/Crashpad/reports/` 下会**自行**
+   出现崩溃转储（没有任何外力 kill），元数据为：
+
+   ```
+   ApplicationName=msedgewebview2.exe
+   ApplicationVersion=154.0.4258.62
+   ModuleName=msedge.dll
+   ProcessType=browser
+   SubCode=0x80000003        ← STATUS_BREAKPOINT，msedge.dll 里的 CHECK 失败
+   ```
+
+5. **宿主进程不受影响**。渲染进程死掉后 `zcode-app.exe` 仍然存活、`Responding=True`、
+   `MainWindowHandle` 非零。所以「进程活着 + 有窗口句柄 + 标题正确」**都不能**用来
+   判定「能正常运行」—— 之前正是只看了这几项，才把「空白窗口」误判成「已跑通」。
+
+### 为什么在本机修不了
+
+dioxus-desktop 在 Windows 上靠**「http 伪装的自定义协议」**传 DOM 变更：
+`protocol.rs` 里 `EDITS_PATH = "http://dioxus.index.html/__edits"`，由 wry 的
+`AddWebResourceRequestedFilter("http://dioxus.*")` 拦截后转交 dioxus 的处理器
+（wry `webview2/mod.rs:794` 与 `:940-943`：注册 `http://<name>.*` 过滤器，命中后把
+`http://<name>.` 前缀重写回 `<name>://`）。解释器用长轮询不断 fetch 这个端点。
+这条链路在 WebView2 `154.0.4258.62` 上不可靠，且会触发 `msedge.dll` 崩溃。
+
+可选出路，都受本机条件限制：
+
+| 出路 | 本机可行性 |
+| --- | --- |
+| 换一个 WebView2 Runtime 版本 | ❌ 只装了 `154.0.4258.62` 一个版本 |
+| 升级 dioxus 到 0.7（换掉这套协议实现） | ❌ 离线缓存只有 `dioxus 0.6.3`，且无网络 |
+| 改走 `--features web`（浏览器渲染器） | ❌ 只装了 `x86_64-pc-windows-msvc` target，无 wasm 工具链 |
+| 把 `dioxus-desktop` 的 wry 依赖换成缓存的 `0.53.5 / 0.54.2 / 0.55.1` | ⚠️ 缓存里有，但 0.45 → 0.53 的 API 改动很大，需要 vendor 后改写 |
+
+### 调试过程中被证伪的三个假设
+
+**「WebView2 154 与 wry 0.45 不兼容，所以建不出 WebView」** —— 不成立。裸
+`wry 0.45 + tao 0.30` 建 WebView 在全部变体下都成功，完整复刻 dioxus 的参数链也成功。
+建窗这一步没问题，问题在**建完之后传 DOM 变更**。
+
+**「`dioxus://` 协议没注册导致 `E_INVALIDARG`」** —— 只在一个刻意构造的二分变体里成立
+（保留 `dioxus://` URL 但去掉协议注册）。`LaunchBuilder::desktop()` 会自动注册，
+正常路径不会遇到。另外反复快速启停时偶发的 `E_INVALIDARG` 属 WebView2 侧进程竞争
+（上一次实例被强杀、用户数据目录还没释放），确认无残留 `msedgewebview2.exe` 后重试即可。
+
+**「窗口打开约 20 秒后静默退出」** —— 是渲染进程崩溃的**伴生现象**，不是独立问题。
+用 `Config::with_custom_event_handler` 抓事件流可见全程没有 `CloseRequested` /
+`Destroyed`，但崩溃转储会自行出现；崩溃时机不确定，所以进程存活时长在 20 秒到
+数小时之间随机。
+
+### 移植范围（避免误解）
+
+「47 / 47 已移植」指的是 **UI 原语这一层**，不是整个应用：
+
+| 层 | 状态 |
+| --- | --- |
+| `packages/ui/src/components/ui`（shadcn 原语，47 个 TSX） | ✅ 全部移植到 `crates/zcode-ui` |
+| 逻辑原语（`zcode-rpc` / `zcode-shared`） | ✅ 移植了一部分（VQL 序列化往返、Base64、事件缓冲、内存队列 RPC） |
+| `crates/zcode-app`（应用外壳） | ⚠️ **只是静态演示**：`state.rs` 里是硬编码演示数据，整层没有任何文件 IO / 网络 / 进程调用 |
+| `packages/shared`（419 个模块） | ⚠️ 只移植了 3 个 |
+| `packages/services`（674 个文件） | ❌ 未移植 |
+| `packages/desktop`（1,232 个文件） | ❌ 未移植 |
+| `apps/`（5,060 个文件） | ❌ 未移植 |
+
+上游 `main` 分支共 8,462 个 `.ts` / `.tsx` 文件。所以「移植完成」只在
+**UI 原语这一层**成立；让它变成可用产品的那部分基本还没动。
+
+### 能看的东西：SSR 静态快照
+
+窗口渲染不出来，但**整棵组件树本身是正确的**。用 SSR 把它渲染成 HTML 就能看到：
+
+```bash
+cargo run -p zcode-ui  --example preview       # → ./preview.html      （47 个原语清单）
+cargo run -p zcode-app --example app_preview   # → ./app-preview.html  （应用整屏快照）
 ```
-thread 'main' panicked at dioxus-desktop-0.6.3/src/webview.rs:400:39:
-called `Result::unwrap()` on an `Err` value:
-  WebView2Error(WindowsError(Error { code: HRESULT(0x80070057), message: "参数错误。" }))
-```
 
-这条结论来自**二分探针**：把 dioxus 建 WebView 的参数链逐项关掉
-（`with_ipc_handler` / `with_navigation_handler` / `with_browser_accelerator_keys` /
-`with_devtools` / `with_drag_drop_handler` / `with_bounds` / `with_web_context` /
-`with_url`），**只有**「保留 `dioxus://` URL 但去掉协议注册」这一项稳定复现。
+`app-preview.html` 含 10,000+ 字可见文本、347 个 `data-slot` 锚点，
+配色 / 圆角 / 字号都来自上游抽取并 vendored 的设计令牌 —— 用浏览器打开即所见即所得。
 
-`LaunchBuilder::desktop()` 会自动注册，所以 `cargo run -p zcode-app` 不会遇到；
-只有绕过 `LaunchBuilder` 手搓 `Config` 时才需要自己补上。
-
-### 2. 反复快速启停时偶发 `E_INVALIDARG`
-
-同一份代码、同一台机器，连续快速启动多个实例（或上一次实例被强杀、WebView2
-用户数据目录尚未释放）时会**偶发**同样的 `E_INVALIDARG`。确认没有残留的
-`zcode-app.exe` / `msedgewebview2.exe` 之后再启动即可。这是 WebView2 运行时侧的
-进程竞争，与仓库代码无关 —— 一个只含 `div { "hello" }` 的最小 Dioxus 程序在同样的
-竞争下也会失败，单独运行时正常。
-
-### 附：调试过程中被证伪的两个假设
-
-**「WebView2 154 与 wry 0.45 不兼容」** —— 不成立。裸 `wry 0.45 + tao 0.30` 建
-WebView 在全部变体下都成功；完整复刻 dioxus 的参数链也成功。真正的失败因子是上面
-第 1 条的协议注册。
-
-**「窗口打开约 20 秒后静默退出」** —— 无法复现。用
-`Config::with_custom_event_handler` 把事件循环收到的每个 tao 事件落盘后：
-
-- 事件流干净：`NewEvents(Init)` → 窗口 `Focused(true)` / `Resized` → 约 0.2 s 后
-  `Ipc { method: "initialize" }`（页面已加载）→ 之后只有输入事件，
-  **全程没有 `CloseRequested` / `Destroyed`**。
-- `target/debug/zcode-app.exe` 反复运行均存活 50 s 以上；一次后台运行持续
-  **3 小时 49 分钟**，由我主动终止。
-- `dioxus-desktop` 中把 `ControlFlow` 置为 `Exit` 的四条路径
-  （`app.rs:197` / `:225` / `:307`、`launch.rs:43`）**全部由事件驱动**；crate 内
-  没有任何定时器，唯一的 `std::process::exit(0)` 位于 `#[cfg(unix)]` 分支。
-- `webview.rs` 里没有任何关闭 / 销毁逻辑，也没有 `ProcessFailed` 处理。
-
-因此当时的观察应属进程竞争下的瞬时异常。
-
-判断「能正常运行」的观测方法见 [PORTING-UI.md](./PORTING-UI.md) §5.5。
+判断「能正常运行」的完整观测清单见 [PORTING-UI.md](./PORTING-UI.md) §5.5。

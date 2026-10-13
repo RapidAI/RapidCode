@@ -148,7 +148,7 @@ TS 的 `TContext` 泛型在 Rust 侧统一用 `Value` 承载（上下文本身�
 ```bash
 cargo build                              # 编译整个工作区
 cargo test                               # 工作区 871 个测试
-cargo run -p zcode-app                   # 开桌面窗口（UI 层见 PORTING-UI.md）
+cargo run -p zcode-app                   # 桌面窗口（⚠️ 本机能开窗但内容空白，见 README「已知问题」）
 cargo run -p zcode-ui --example preview  # 生成 UI 预览页 ./preview.html
 cargo build --release
 ```
