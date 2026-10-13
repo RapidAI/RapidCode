@@ -579,7 +579,7 @@ cargo run -p zcode-ui --example preview            # → ./preview.html
 其中一条专门盯着「类名在 DOM 上、但样式表里没编译出规则」这个坑：
 断言 `[scrollbar-width:none]` 既出现在 DOM 里，也出现在内嵌 CSS 里。
 
-**开窗口**这一层没法在无头环境自动验证，所以用外部探针核对四件事：
+**开窗口**这一层没法在无头环境自动验证，所以用外部探针核对五件事：
 
 ```bash
 cargo run -p zcode-app            # 保持运行
@@ -589,19 +589,22 @@ cargo run -p zcode-app            # 保持运行
 
 | 观测项 | 期望 | 实测 |
 | --- | --- | --- |
-| 进程存活 | 事件循环不退出 | 存活 12s 无输出 |
+| 进程存活 | 事件循环不退出 | 一次后台运行持续 **3 小时 49 分钟**（主动终止）；复测 50 s 亦存活 |
 | `MainWindowHandle` | 非 0（真的有窗口） | `44435456` |
 | `MainWindowTitle` | 与 `WindowBuilder` 一致 | `ZCode — Rust + Dioxus 移植` |
 | `Responding` | `True`（消息泵在跑） | `True`，工作集 36 MB |
+| 事件流 | 走到页面加载完成 | `Init` → `Focused(true)` → `Ipc { method: "initialize" }`，无 `CloseRequested` / `Destroyed` |
 
 > ⚠️ `MainWindowTitle` 首次读可能是空串（.NET 侧缓存），`$p.Refresh()` 之后才对。
 
-> ⚠️ **该探针在 WebView2 Runtime `154.0.4258.62` 上已不可复现** —— 会在
-> `wry::WebView::new` 处报 `WebView2Error(E_INVALIDARG)`。这是 dioxus-desktop 0.6.3
-> 自带的 wry 0.45.0 与较新 WebView2 Runtime 的兼容性问题，**与本仓库代码无关**：
-> 一个只含 `div { "hello" }` 的最小 Dioxus 程序同样失败，且非沙箱、显式数据目录、
-> 换 `tao` 窗口都无法绕过。`cargo build` / `cargo test` 不受影响（871 个测试全绿）。
-> 排查过程见 [README.md](./README.md) 的「已知问题」。
+> 事件流那一行是用 `Config::with_custom_event_handler` 把每个 tao 事件落盘得到的，
+> 也是排查「约 20 秒静默退出」的手段 —— 该现象**无法复现**，详见
+> [README.md](./README.md) 的「已知问题 · 附」。
+>
+> 调试中还遇到过一个 `WebView2Error(E_INVALIDARG)`：真实成因是
+> **`dioxus://` 这个 scheme 没有注册**（`with_url` 给了 URL 却没给
+> `with_asynchronous_custom_protocol`）。`LaunchBuilder::desktop()` 会自动注册，
+> 正常 `cargo run -p zcode-app` 不受影响。详见 README 的「已知问题」。
 
 ## 6. 曾经的未移植清单与最终归宿
 

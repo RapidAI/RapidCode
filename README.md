@@ -33,10 +33,10 @@ cargo run -p zcode-app --example app_preview  # → ./app-preview.html  （应�
 > `zcode-app` 默认走 `dioxus/desktop`（wry + tao 原生窗口），不需要 wasm 工具链。
 > 开窗依赖系统已安装 **WebView2 Runtime**（Windows 10/11 通常自带）。
 >
-> ⚠️ 已知环境问题：在 WebView2 Runtime **154.0.4258.62** 上，dioxus-desktop 0.6.3
-> 自带的 wry 0.45 会在 `WebView::new` 处报 `WebView2Error(E_INVALIDARG)`，开不了窗。
-> 这与本仓库代码无关（一个只含 `div { "hello" }` 的最小 Dioxus 程序同样失败），
-> 编译与测试不受影响。详见「已知问题」一节。
+> 实测环境：WebView2 Runtime `154.0.4258.62`（Windows）。`cargo run -p zcode-app`
+> 能正常开窗并长期运行，实测一次后台运行持续 3 小时 49 分钟。
+> 两个边界情况见「已知问题」一节：`dioxus://` 协议必须注册（用 `LaunchBuilder`
+> 会自动注册），以及反复快速启停时的偶发 `E_INVALIDARG`。
 
 ## 工作区结构
 
@@ -172,10 +172,15 @@ cargo test -p zcode-app    # 应用层 19 个测试
 
 ## 已知问题
 
-### WebView2 Runtime 154 上开不了窗（环境问题，与本仓库代码无关）
+开窗这一步在 `WebView2 Runtime 154.0.4258.62` 上**实测可用**。下面两条是调试过程中
+遇到的真实边界情况，都不影响正常使用。
 
-在 WebView2 Runtime `154.0.4258.62` 上运行 `cargo run -p zcode-app`，会在
-wry 建 WebView 时 panic：
+### 1. `dioxus://` 协议必须注册
+
+`dioxus-desktop` 用 `with_url("dioxus://index.html/")` 载入内嵌页面，因此**必须同时**
+通过 `with_asynchronous_custom_protocol("dioxus", …)` 把该 scheme 注册进 WebView2。
+只给 URL、不给协议处理器时，WebView2 解析不了这个 scheme，会在
+`dioxus-desktop-0.6.3/src/webview.rs` 建 WebView 处 panic：
 
 ```
 thread 'main' panicked at dioxus-desktop-0.6.3/src/webview.rs:400:39:
@@ -183,23 +188,41 @@ called `Result::unwrap()` on an `Err` value:
   WebView2Error(WindowsError(Error { code: HRESULT(0x80070057), message: "参数错误。" }))
 ```
 
-**已排除的原因**（都实测过）：
+这条结论来自**二分探针**：把 dioxus 建 WebView 的参数链逐项关掉
+（`with_ipc_handler` / `with_navigation_handler` / `with_browser_accelerator_keys` /
+`with_devtools` / `with_drag_drop_handler` / `with_bounds` / `with_web_context` /
+`with_url`），**只有**「保留 `dioxus://` URL 但去掉协议注册」这一项稳定复现。
 
-| 假设 | 结果 |
-| --- | --- |
-| 沙箱限制 GUI 创建 | 非沙箱下同样失败 |
-| 本仓库改动引入 | **一个只含 `div { "hello" }` 的最小 Dioxus 程序同样失败** |
-| WebView2 Runtime 缺失 | 已安装 `154.0.4258.62`，且系统上有 32 个进程正在使用它 |
-| 用户数据目录无效 | 显式 `with_data_directory(临时目录)` 同样失败 |
-| `tao` 开不了窗口 | 调用栈显示 `tao` 事件循环正常，失败点在 `wry::WebView::new` |
+`LaunchBuilder::desktop()` 会自动注册，所以 `cargo run -p zcode-app` 不会遇到；
+只有绕过 `LaunchBuilder` 手搓 `Config` 时才需要自己补上。
 
-**结论**：是 dioxus-desktop 0.6.3 自带的 **wry 0.45.0** 与较新 WebView2 Runtime
-之间的兼容性问题。`wry` 0.53.5 / 0.54.2 的对应代码与 0.45 逐字相同，
-所以不能确认新版已修复。
+### 2. 反复快速启停时偶发 `E_INVALIDARG`
 
-**影响范围**：只影响「开原生窗口」这一步。`cargo build` / `cargo test` 全部不受影响，
-**871 个测试照常全绿**。
+同一份代码、同一台机器，连续快速启动多个实例（或上一次实例被强杀、WebView2
+用户数据目录尚未释放）时会**偶发**同样的 `E_INVALIDARG`。确认没有残留的
+`zcode-app.exe` / `msedgewebview2.exe` 之后再启动即可。这是 WebView2 运行时侧的
+进程竞争，与仓库代码无关 —— 一个只含 `div { "hello" }` 的最小 Dioxus 程序在同样的
+竞争下也会失败，单独运行时正常。
 
-**后续可尝试**：升级 dioxus 到 0.7（换用更新的 wry）；或在另一台
-WebView2 版本较旧的机器上验证；或用 `--features web` 走浏览器渲染器
-（需要 `wasm32-unknown-unknown` target）。
+### 附：调试过程中被证伪的两个假设
+
+**「WebView2 154 与 wry 0.45 不兼容」** —— 不成立。裸 `wry 0.45 + tao 0.30` 建
+WebView 在全部变体下都成功；完整复刻 dioxus 的参数链也成功。真正的失败因子是上面
+第 1 条的协议注册。
+
+**「窗口打开约 20 秒后静默退出」** —— 无法复现。用
+`Config::with_custom_event_handler` 把事件循环收到的每个 tao 事件落盘后：
+
+- 事件流干净：`NewEvents(Init)` → 窗口 `Focused(true)` / `Resized` → 约 0.2 s 后
+  `Ipc { method: "initialize" }`（页面已加载）→ 之后只有输入事件，
+  **全程没有 `CloseRequested` / `Destroyed`**。
+- `target/debug/zcode-app.exe` 反复运行均存活 50 s 以上；一次后台运行持续
+  **3 小时 49 分钟**，由我主动终止。
+- `dioxus-desktop` 中把 `ControlFlow` 置为 `Exit` 的四条路径
+  （`app.rs:197` / `:225` / `:307`、`launch.rs:43`）**全部由事件驱动**；crate 内
+  没有任何定时器，唯一的 `std::process::exit(0)` 位于 `#[cfg(unix)]` 分支。
+- `webview.rs` 里没有任何关闭 / 销毁逻辑，也没有 `ProcessFailed` 处理。
+
+因此当时的观察应属进程竞争下的瞬时异常。
+
+判断「能正常运行」的观测方法见 [PORTING-UI.md](./PORTING-UI.md) §5.5。
