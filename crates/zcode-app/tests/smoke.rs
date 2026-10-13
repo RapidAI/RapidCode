@@ -13,6 +13,7 @@
 
 use dioxus::prelude::*;
 use zcode_app::state::{demo_state, AppCtx};
+use zcode_app::workspace::{WorkspaceData, WorkspaceStatus};
 use zcode_ui::*;
 
 /// 把组件渲染成 HTML 字符串。
@@ -74,6 +75,10 @@ fn Harness(
         workspace_tab: use_signal(|| "conversation".to_string()),
         plan_open: use_signal(|| true),
         approval_value: use_signal(|| "ask".to_string()),
+        // 工作区数据留空：夹具不提供 `WorkspaceBootstrap`，也就不会去跑真实 git。
+        // 真实数据的渲染另见 `changes_view_*` 一组测试。
+        workspace: use_signal(|| None::<WorkspaceData>),
+        workspace_status: use_signal(WorkspaceStatus::default),
     };
     use_context_provider(|| ctx);
 
@@ -204,7 +209,9 @@ fn all_regions_are_present() {
         "变更",
         "任务",
         "ZCode Pro",
-        "rust",
+        // 顶栏的工作区徽标：没有 bootstrap 时不扫描，显示「未扫描」而不是假的 `rust`。
+        // 真实分支名的渲染见 `changes_view_*` 一组测试。
+        "未扫描",
         // 会话流
         "继续完成剩余移植工作",
         "cargo test",
@@ -651,4 +658,233 @@ fn stylesheet_contains_the_repo_design_tokens() {
         color_vars > 200,
         "色板令牌只有 {color_vars} 个，@theme 块可能没被完整导入"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 真实工作区数据（「变更」页与 Tab 切换）
+// ---------------------------------------------------------------------------
+//
+// 这一组刻意**不跑 git**：这里测的是「拿到数据之后渲染对不对」。
+// 「git 到底能不能跑出这些数据」由 `crates/zcode-services/tests/git_workspace.rs`
+// 在真实临时仓库上覆盖 —— 两层分开，失败时能立刻定位到是哪一层的问题。
+
+/// 造一份固定的工作区数据。
+fn workspace_fixture(case: &str) -> (Option<WorkspaceData>, WorkspaceStatus) {
+    use zcode_services::git::changes::GitChangeSummary;
+    use zcode_shared::git::{
+        GitChangeKind, GitChangeSectionId, GitFileChange, GitHeadRefType, GitRepositorySummary,
+    };
+
+    let summary = |branch: &str, is_repository: bool| GitRepositorySummary {
+        workspace_path: "F:/demo/workspace".to_string(),
+        repo_root: "F:/demo/workspace".to_string(),
+        workspace_in_repo_path: ".".to_string(),
+        auto_refresh_watch_paths: Vec::new(),
+        branch_name: Some(branch.to_string()),
+        tracking_branch_name: Some(format!("origin/{branch}")),
+        head_ref_type: GitHeadRefType::Branch,
+        ahead: 2,
+        behind: 1,
+        is_dirty: true,
+        is_git_available: true,
+        is_repository,
+    };
+
+    let change = |path: &str, section: GitChangeSectionId, added: u32, removed: u32| GitFileChange {
+        path: format!("F:/demo/workspace/{path}"),
+        repo_relative_path: path.to_string(),
+        workspace_relative_path: path.to_string(),
+        x: Some("M".to_string()),
+        y: Some(".".to_string()),
+        kind: GitChangeKind::Modified,
+        section,
+        added,
+        removed,
+        is_staged: section == GitChangeSectionId::Staged,
+        is_untracked: section == GitChangeSectionId::Untracked,
+        is_conflicted: section == GitChangeSectionId::Conflicted,
+    };
+
+    let totals = |changes: &[GitFileChange]| GitChangeSummary {
+        file_count: changes.len(),
+        added: changes.iter().map(|change| change.added).sum(),
+        removed: changes.iter().map(|change| change.removed).sum(),
+    };
+
+    match case {
+        "changes" => {
+            let changes = vec![
+                change("src/staged.rs", GitChangeSectionId::Staged, 12, 3),
+                change("src/dirty.rs", GitChangeSectionId::Unstaged, 1, 1),
+                change("src/new.rs", GitChangeSectionId::Untracked, 7, 0),
+                change("src/conflict.rs", GitChangeSectionId::Conflicted, 0, 0),
+            ];
+            let totals = totals(&changes);
+            (
+                Some(WorkspaceData {
+                    summary: summary("rust-only", true),
+                    changes,
+                    totals,
+                }),
+                WorkspaceStatus::Ready,
+            )
+        }
+        "clean" => (
+            Some(WorkspaceData {
+                summary: summary("main", true),
+                changes: Vec::new(),
+                totals: GitChangeSummary::default(),
+            }),
+            WorkspaceStatus::Ready,
+        ),
+        "not-repo" => (
+            Some(WorkspaceData {
+                summary: summary("main", false),
+                changes: Vec::new(),
+                totals: GitChangeSummary::default(),
+            }),
+            WorkspaceStatus::Ready,
+        ),
+        "failed" => (
+            None,
+            WorkspaceStatus::Failed("fatal: not a git repository".to_string()),
+        ),
+        "loading" => (None, WorkspaceStatus::Loading),
+        other => panic!("未知的夹具：{other}"),
+    }
+}
+
+/// 注入 AppCtx + 一个不会真跑 git 的请求端，然后渲染主区域。
+#[component]
+fn WorkspaceHarness(case: &'static str, #[props(default = "changes")] tab: &'static str) -> Element {
+    let channel = use_hook(zcode_app::workspace::create_workspace_channel);
+    let requester = channel.requester();
+    use_context_provider(move || requester);
+
+    let (data, status) = workspace_fixture(case);
+    let ctx = AppCtx {
+        state: use_signal(demo_state),
+        settings_open: use_signal(|| false),
+        pending_delete: use_signal(|| None::<&'static str>),
+        delete_open: use_signal(|| false),
+        settings_tab: use_signal(|| "general".to_string()),
+        detail_open: use_signal(|| false),
+        gallery_open: use_signal(|| false),
+        workspace_tab: use_signal(move || tab.to_string()),
+        plan_open: use_signal(|| true),
+        approval_value: use_signal(|| "ask".to_string()),
+        workspace: use_signal(move || data),
+        workspace_status: use_signal(move || status),
+    };
+    use_context_provider(|| ctx);
+
+    rsx! { zcode_app::views::WorkspacePane {} }
+}
+
+#[component]
+fn ChangesFixture() -> Element {
+    rsx! { WorkspaceHarness { case: "changes" } }
+}
+
+#[component]
+fn CleanFixture() -> Element {
+    rsx! { WorkspaceHarness { case: "clean" } }
+}
+
+#[component]
+fn NotRepoFixture() -> Element {
+    rsx! { WorkspaceHarness { case: "not-repo" } }
+}
+
+#[component]
+fn FailedFixture() -> Element {
+    rsx! { WorkspaceHarness { case: "failed" } }
+}
+
+#[component]
+fn LoadingFixture() -> Element {
+    rsx! { WorkspaceHarness { case: "loading" } }
+}
+
+#[component]
+fn TasksTabFixture() -> Element {
+    rsx! { WorkspaceHarness { case: "clean", tab: "tasks" } }
+}
+
+#[component]
+fn ConversationTabFixture() -> Element {
+    rsx! { WorkspaceHarness { case: "clean", tab: "conversation" } }
+}
+
+#[test]
+fn changes_view_lists_real_change_sections() {
+    let out = html(ChangesFixture);
+
+    // 分组标题：顺序与 `populated_sections()` 一致（冲突最前）
+    for needle in ["冲突", "已暂存", "未暂存", "未跟踪"] {
+        assert!(out.contains(needle), "变更页缺少分组 `{needle}`");
+    }
+    // 真实文件名（来自夹具，不是硬编码在视图里的）
+    for needle in ["src/staged.rs", "src/dirty.rs", "src/new.rs", "src/conflict.rs"] {
+        assert!(out.contains(needle), "变更页缺少文件 `{needle}`");
+    }
+    // 行数来自统计表
+    assert!(out.contains("+12"), "缺少暂存区新增行数");
+    assert!(out.contains("-3"), "缺少暂存区删除行数");
+    // 汇总：4 个文件，+20/-4
+    assert!(out.contains("4 个文件"), "缺少文件数汇总");
+    assert!(out.contains("+20"), "缺少总新增行数");
+    assert!(out.contains("-4"), "缺少总删除行数");
+    // 顶栏的真实分支与 ahead/behind
+    assert!(out.contains("rust-only"), "缺少真实分支名");
+    assert!(out.contains("↑2 ↓1"), "缺少 ahead/behind");
+}
+
+#[test]
+fn changes_view_shows_clean_state() {
+    let out = html(CleanFixture);
+    assert!(out.contains("工作区干净"), "干净工作区应当有明确文案");
+    // 干净不等于「什么都不显示」——分支信息仍要在
+    assert!(out.contains("main"));
+}
+
+#[test]
+fn changes_view_shows_not_a_repository_state() {
+    let out = html(NotRepoFixture);
+    assert!(out.contains("当前目录不是 Git 仓库"));
+    // 非仓库是正常状态，不该被渲染成错误
+    assert!(!out.contains("读取工作区失败"));
+}
+
+#[test]
+fn changes_view_surfaces_failures_instead_of_going_blank() {
+    // 这一条是这一轮的核心教训：失败必须看得见。
+    // 之前的「只有壳子」正是「出错了但界面什么都不说」的后果。
+    let out = html(FailedFixture);
+    assert!(out.contains("读取工作区失败"), "失败必须显式呈现");
+    assert!(
+        out.contains("fatal: not a git repository"),
+        "失败原因必须带出来"
+    );
+}
+
+#[test]
+fn changes_view_shows_loading_state() {
+    let out = html(LoadingFixture);
+    assert!(out.contains("正在读取工作区"));
+    // 加载态也要给出「为什么不会卡」的说明
+    assert!(out.contains("后台线程"));
+}
+
+#[test]
+fn workspace_tab_switches_the_main_pane() {
+    // 顶栏的 Tab 点了必须真的换内容。之前「任务」Tab 点了没反应，
+    // 用户看到的仍然是一个不动的壳子。
+    let tasks = html(TasksTabFixture);
+    assert!(tasks.contains("任务页尚未移植"));
+    assert!(!tasks.contains("继续完成剩余移植工作"));
+
+    let conversation = html(ConversationTabFixture);
+    assert!(conversation.contains("继续完成剩余移植工作"));
+    assert!(!conversation.contains("任务页尚未移植"));
 }

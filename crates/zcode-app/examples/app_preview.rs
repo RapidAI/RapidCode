@@ -1,4 +1,4 @@
-//! 把 [`zcode_app::AppShell`] 渲染成一份**自包含**的 HTML 快照。
+//! 把 [`zcode_app::AppShell`] 渲染成**自包含**的 HTML 快照。
 //!
 //! 用途：在无头环境里也能看到应用长什么样。产出的文件内嵌了完整的
 //! `assets/app.css`，用浏览器直接打开即可 —— 不需要 CDN、不需要本地服务、
@@ -6,17 +6,73 @@
 //! 与 `cargo run -p zcode-app` 开原生窗口是两条独立的验证路径。
 //!
 //! ```bash
-//! cargo run -p zcode-app --example app_preview    # → ./app-preview.html
+//! cargo run -p zcode-app --example app_preview    # → ./app-preview.html / ./app-preview-changes.html
 //! ```
+//!
+//! ## 快照里的「变更」页是**真实数据**
+//!
+//! 这个 example 会**同步跑一次真正的 git 查询**（走 `zcode-services` 那套移植过来的
+//! 代码），把结果通过 `WorkspaceSeed` 注入界面。所以快照里列出的文件名、`+N/-M`
+//! 都来自你当前这份仓库 —— 换一个目录跑（`ZCODE_WORKSPACE=...`）就会换一批内容。
+//!
+//! 之所以同步扫而不是等后台线程：SSR 只渲染一帧，没有事件循环去驱动
+//! `spawn` 出来的 future，等不到回传。真实窗口里走的是后台线程那条路
+//! （见 `crates/zcode-app/tests/workspace_loader.rs`）。
 //!
 //! 注意这里渲染的是 [`zcode_app::AppShell`] 而不是 [`zcode_app::App`]：
 //! `App` 用 `document::Style` 注入样式，而那需要真实渲染器；SSR 下没有实现，
 //! 所以样式表由本文件手工包进 `<style>`（内容仍是同一份 `APP_CSS` 常量）。
 
 use dioxus::prelude::*;
+use zcode_app::workspace::{default_workspace_path, WorkspaceData, WorkspaceStatus};
+use zcode_app::{AppShell, WorkspaceSeed};
+use zcode_services::git::changes::{get_workspace_changes, summarize_changes};
+use zcode_services::git::repo::GitCliRepo;
 
-fn main() {
-    let mut dom = VirtualDom::new(zcode_app::AppShell);
+/// 同步扫一次工作区，产出可以注入界面的数据。
+fn scan_workspace() -> (Option<WorkspaceData>, WorkspaceStatus) {
+    let workspace = default_workspace_path();
+    let repo = GitCliRepo::new();
+
+    match repo.get_status(&workspace) {
+        Ok(snapshot) => {
+            let changes = get_workspace_changes(&snapshot);
+            let totals = summarize_changes(&changes);
+            (
+                Some(WorkspaceData {
+                    summary: snapshot.summary,
+                    changes,
+                    totals,
+                }),
+                WorkspaceStatus::Ready,
+            )
+        }
+        Err(failure) => (None, WorkspaceStatus::Failed(failure.message)),
+    }
+}
+
+/// 把种子塞进 context，然后渲染真实的 `AppShell`。
+#[component]
+fn PreviewRoot(data: Option<WorkspaceData>, status: WorkspaceStatus, tab: String) -> Element {
+    use_context_provider(move || WorkspaceSeed {
+        data,
+        status,
+        tab: Some(tab),
+    });
+
+    rsx! { AppShell {} }
+}
+
+/// 渲染一份快照并落盘。
+fn write_snapshot(path: &str, data: Option<WorkspaceData>, status: WorkspaceStatus, tab: &str) {
+    let mut dom = VirtualDom::new_with_props(
+        PreviewRoot,
+        PreviewRootProps {
+            data,
+            status,
+            tab: tab.to_string(),
+        },
+    );
     dom.rebuild_in_place();
     let body = dioxus_ssr::render(&dom);
 
@@ -26,7 +82,7 @@ fn main() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} · 静态快照</title>
+<title>{title} · 静态快照（{tab}）</title>
 <style>{css}</style>
 <style>
   /* 把「应用窗口」摆到页面中央，模拟 1360x860 的桌面窗口 */
@@ -55,11 +111,30 @@ fn main() {
         css = zcode_app::APP_CSS,
     );
 
-    let path = "app-preview.html";
     std::fs::write(path, &html).expect("写出失败");
     println!(
         "已生成 {path}（{} 字节 / {} 行）",
         html.len(),
         html.lines().count()
     );
+}
+
+fn main() {
+    let (data, status) = scan_workspace();
+
+    match data.as_ref() {
+        Some(data) if data.is_repository() => println!(
+            "工作区扫描成功：{} @ {}（{} 个变更，+{} -{}）",
+            data.branch_label(),
+            data.summary.repo_root,
+            data.totals.file_count,
+            data.totals.added,
+            data.totals.removed
+        ),
+        Some(data) => println!("工作区不是 Git 仓库：{}", data.summary.workspace_path),
+        None => println!("工作区扫描失败：{}", status.failure().unwrap_or("未知原因")),
+    }
+
+    write_snapshot("app-preview.html", data.clone(), status.clone(), "conversation");
+    write_snapshot("app-preview-changes.html", data, status, "changes");
 }

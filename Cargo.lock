@@ -5143,12 +5143,23 @@ version = "3.15.1"
 dependencies = [
  "dioxus",
  "dioxus-ssr",
+ "futures-channel",
+ "futures-core",
+ "zcode-services",
+ "zcode-shared",
  "zcode-ui",
 ]
 
 [[package]]
 name = "zcode-rpc"
 version = "3.15.1"
+
+[[package]]
+name = "zcode-services"
+version = "3.15.1"
+dependencies = [
+ "zcode-shared",
+]
 
 [[package]]
 name = "zcode-shared"

@@ -9,6 +9,8 @@
 
 use dioxus::prelude::*;
 
+use crate::workspace::{WorkspaceData, WorkspaceStatus};
+
 /// 会话列表里的一条会话。
 #[derive(Clone, PartialEq, Debug)]
 pub struct Conversation {
@@ -210,6 +212,11 @@ pub const GROUPS: [&str; 3] = ["今天", "昨天", "更早"];
 ///
 /// `Signal<T>` 是句柄（generational box），标识跨渲染稳定，所以可以安全地塞进
 /// context —— 这一点在 [`zcode_ui`] 的 `Tabs` / `Collapsible` 里已经反复验证过。
+///
+/// **必须保持 `Copy`**：视图里到处是 `move |_| { ctx.state ... }` 这类闭包，
+/// `Copy` 让它们按字段复制而不是把整个 ctx move 走。因此这里只放 `Signal`；
+/// 需要携带 `Arc` 的东西（例如工作区的请求端）走**另一个** context，见
+/// [`crate::workspace::WorkspaceRequester`]。
 #[derive(Clone, Copy)]
 pub struct AppCtx {
     pub state: Signal<AppState>,
@@ -237,6 +244,13 @@ pub struct AppCtx {
     /// 而 `AppState.approval` 是它的类型化投影。两处（详情面板、输入区）都读写
     /// 这个 signal，避免出现「两个控件各存一份、互相看不见」的分叉。
     pub approval_value: Signal<String>,
+    /// **真实**工作区数据（来自 `zcode-services` 的 git 查询）。
+    ///
+    /// `None` 表示还没跑出结果 —— 与「跑出来是空的」是两件事，所以状态另放
+    /// [`AppCtx::workspace_status`]。
+    pub workspace: Signal<Option<WorkspaceData>>,
+    /// 工作区数据的加载状态。
+    pub workspace_status: Signal<WorkspaceStatus>,
 }
 
 impl AppCtx {

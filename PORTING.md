@@ -34,9 +34,10 @@
 
 > **先完整移植项目的「逻辑骨架」——IPC/RPC 框架（`packages/rpc`），  
 > 再逐步迁移其它纯逻辑模块（`packages/shared`），  
-> 并为 UI 层选定 Rust 等价框架（Dioxus）从原语组件开始迁移。**
+> 并为 UI 层选定 Rust 等价框架（Dioxus）从原语组件开始迁移，  
+> 最后从 `packages/services` 里挑自包含的链路接上真实 IO。**
 
-产出保证：`cargo build` 与 `cargo test` 全部通过。
+产出保证：`cargo build` 与 `cargo test` 全部通过（零警告、981 个测试全绿）。
 
 ---
 
@@ -76,6 +77,7 @@
 | `lineChangeStat.ts`                    | `line_change_stat.rs`      | ✅ 完整（行级 LCS 统计） |
 | `model-provider-family.ts`（+ 相关常量）     | `model_provider_family.rs` | ✅ 完整            |
 | `plan-identity.ts`（+ `usage-stats` 子集） | `plan_identity.rs`         | ✅ 完整            |
+| `git.ts`                               | `git.rs`                   | ✅ 类型层完整（见 §2.4） |
 
 ### 2.3 `crates/zcode-ui` —— 部分移植 `packages/ui`（UI 层）
 
@@ -104,6 +106,43 @@ Rust 侧与 React 语义最贴近的等价框架是 **Dioxus 0.6**（RSX ≈ JSX
 - **原样保留 `data-slot` / `data-state` / `data-orientation` 属性**，
   因为 `packages/ui/src/styles.css` 的 `@custom-variant` 全靠它们生效；
 - 类名输出与 TS 逐字符对齐，**CSS 一行不用改**。
+
+### 2.4 `crates/zcode-services` —— 起步：git 工作区状态链路
+
+`packages/services`（674 个文件 / 224k 行）不可能一次全量移植。这里挑的是
+**自包含、可测、且能立刻让界面显示真实数据**的一条链路：git 工作区状态。
+
+| TS 源文件 | Rust 目标文件 | 状态 |
+| --- | --- | --- |
+| `git/config.ts` | `git/config.rs` | ✅ 完整（环境净化 / 二进制探测 / 路径归一） |
+| `providers/gitEnvironmentProvider.ts` | `git/config.rs`（`apply_git_command_env`） | ✅ 完整 |
+| `providers/gitCommandProvider.ts` | `git/provider.rs` | ✅ 语义等价（见下方差异） |
+| `repo/gitCliTypes.ts` | `git/types.rs` | ✅ 完整 |
+| `repo/gitCliHelpers.ts` | `git/cli_helpers.rs` | ✅ 完整（porcelain v2 / numstat 解析） |
+| `repo/gitCliRepo.ts`（读路径） | `git/repo.rs` | ✅ 只读部分（`resolve` / `getStatus` / `listLocalBranches`） |
+| `gitService.ts` 的 `getChanges` | `git/changes.rs` | ✅ 完整（按暂存区分组 + 汇总） |
+| `packages/shared/src/git.ts` | `crates/zcode-shared/src/git.rs` | ✅ 类型层完整 |
+
+**有意未移植**（不是遗漏，是为了不让「已移植」这句话失真）：
+
+- `gitCommitMessageGenerator*` —— 依赖 LLM provider；
+- `gitCheckpoint*` —— 依赖检查点存储（另一个未移植的子系统）；
+- `commitMessageFileScope`、`getIgnoredPaths` / `getDiff` / `getCommitGraph` / `getIdentity`；
+- **全部写操作** `stage` / `unstage` / `discard` / `commit` / `push`。
+
+清单与理由也写在 `crates/zcode-services/src/lib.rs` 的模块文档里。
+
+**与上游的两处刻意差异**：
+
+1. **杀进程只做一次**。上游分两阶段（先 `SIGTERM` 再超时后 `SIGKILL`）；Rust 的
+   `Child::kill` 在 Windows 上就是 `TerminateProcess`，没有「先礼后兵」的中间态，
+   所以直接一次强杀，并在结果里如实记录 `force_kill_attempted` / `orphaned`。
+2. **spawn 失败用类型区分，不靠 stderr 文本**。上游靠匹配错误文本判断
+   「git 不存在」还是「工作目录不存在」；Rust 侧改成 `GitSpawnErrorKind`
+   枚举。顺带发现一个上游没有覆盖的真实行为：Windows 上 `CreateProcessW`
+   遇到不存在的 `cwd` 返回 `ERROR_DIRECTORY`(267)，Rust 把它映射成
+   `ErrorKind::Other` 而**不是** `NotFound` —— 所以 `classify_spawn_error`
+   必须**先查 `cwd.is_dir()`**，否则会把「目录不存在」误判成「git 没装」。
 
 ---
 
@@ -141,13 +180,51 @@ TS 的 `TContext` 泛型在 Rust 侧统一用 `Value` 承载（上下文本身�
 `Object` 分支所需 JSON 与嵌套 `Uint8Array` 标记用**手写编解码**复刻，  
 不引入 `serde`。
 
+### 3.5 同步阻塞的服务调用怎么接进 dioxus（不引 tokio、不轮询）
+
+`zcode-services` 的调用是**同步阻塞**的（起进程、读管道、等退出）。直接在
+dioxus 的渲染线程上跑会把窗口冻住 —— 而「窗口卡死」和「窗口空白」在肉眼上
+几乎分不出来，正是上一轮误判的成因。所以必须挪到后台线程。
+
+问题在于：dioxus 0.6 用的是自己的**本地 executor**（不是 tokio），
+`spawn` 只能从组件体内调用，而线程跑完之后需要**主动唤醒** executor 才会
+重新 poll 那个 future。
+
+做法是 `futures-channel` 的 `mpsc::unbounded()`：
+
+```rust
+// 后台线程：send 会注册 dioxus 的 waker，从而触发 VirtualDom 重新 poll
+let _ = sender.unbounded_send(WorkspaceMessage::Loaded(Box::new(data)));
+
+// 组件内：
+while let Some(message) = next_workspace_message(receiver).await { … }
+// 其中 next_workspace_message = poll_fn(|cx| Pin::new(&mut *receiver).poll_next(cx))
+```
+
+要点：
+
+- **不需要轮询定时器**，也不需要 tokio —— 唤醒是 `send` 的副作用；
+- `UnboundedReceiver` **不是 `Clone`**，而 `use_hook` 要求闭包 `Clone`，
+  所以包一层 `Rc<RefCell<Option<_>>>`（`WorkspaceChannel`），提供
+  `requester()` / `take_receiver()`；接收端只能被取走一次（有测试守着）；
+- 只多引了两个**纯 trait/通道** crate（`futures-channel` / `futures-core`），
+  没有引入任何运行时；
+- `AppCtx` 必须保持 `Copy`（各 view 用 `move |_|` 按字段捕获它），
+  所以持有 `Arc` 的 `WorkspaceRequester` 走**另一个** context
+  （`use_context_provider`），不能塞进 `AppCtx`。
+
+副作用是：SSR 快照测试**不会**驱动 `spawn` 出来的 future（`rebuild_in_place`
+只跑同步代码）。这反而帮了忙 —— 快照测试因此永远不会真的去跑 git。
+`AppShell` 只在存在 `WorkspaceBootstrap`（真实 `App` 根）时才发起扫描，
+测试里用 `try_consume_context` 拿不到它，于是完全无副作用。
+
 ---
 
 ## 4. 构建与验证
 
 ```bash
 cargo build                              # 编译整个工作区
-cargo test                               # 工作区 871 个测试
+cargo test                               # 工作区 981 个测试
 cargo run -p zcode-app                   # 桌面窗口（⚠️ 本机能开窗但内容空白，见 README「已知问题」）
 cargo run -p zcode-ui --example preview  # 生成 UI 预览页 ./preview.html
 cargo build --release
@@ -158,9 +235,10 @@ cargo build --release
 | crate | 单元测试 | 集成测试 | 覆盖内容 |
 | --- | ---: | ---: | --- |
 | `zcode-rpc` | 10 | — | 序列化 / 事件 / 端到端 RPC |
-| `zcode-shared` | 14 | — | 行级变更统计 / 供应商族 / 套餐身份 |
+| `zcode-shared` | 18 | — | 行级变更统计 / 供应商族 / 套餐身份 / git 类型 |
+| `zcode-services` | 76 | 6 | git 解析纯函数 / **真起临时仓库**的端到端 |
 | `zcode-ui` | 742 | 75 + 11 | 类名 / 几何 / 键盘纯函数、渲染指令、HTML 快照 |
-| `zcode-app` | 2 | 17 | 应用外壳 + 整树冒烟 |
+| `zcode-app` | 17 | 23 + 3 | 应用外壳 + 整树冒烟 + 跨线程取数链路 |
 
 逻辑层测试覆盖：
 
@@ -171,6 +249,17 @@ cargo build --release
 - 事件缓冲语义；
 - 基于 `create_queue_pair`（内存队列传输）的**端到端**：  
   RPC 调用、事件订阅、未知方法报错。
+
+服务层测试覆盖：
+
+- `--porcelain=v2 -z` 解析：`MM` 条目同时产出两条变更、重命名记录吃掉
+  下一条空记录、路径含空格、Windows 反斜杠归一、未跟踪目录记录；
+- `--numstat -z` 解析：二进制显示 `-` 时记 0、重命名取 `original_path`；
+- 超时诊断信息：断言 `timed out after 15000ms` / `elapsed=` / `killAt=` /
+  `cleanup=` / `forceKill=` / `orphaned=` 都出现在消息里；
+- **端到端**（`tests/git_workspace.rs`，真建临时仓库）：解析仓库根 / 子目录
+  作用域 / 本地分支列表（当前分支排最前）/ 普通目录不是错误 / 工作目录不存在时
+  降级而不是报错。没有 git 时跳过并打印说明。
 
 ---
 
@@ -184,12 +273,16 @@ cargo build --release
 2. **`packages/rpc` 的补充**：真实 `Socket` 实现（TCP / WebSocket）、  
    `MessagePortLike` 的 Electron/浏览器绑定、与 `packages/provider*` 的对接。
 3. **UI 层**（见 [PORTING-UI.md](./PORTING-UI.md) §6/§7）：  
-   **47 / 47 个原语已全部移植完毕**，并拼出了可运行的 `zcode-app`（871 个测试全绿）。
+   **47 / 47 个原语已全部移植完毕**，并拼出了可运行的 `zcode-app`（981 个测试全绿）。
    剩余的是**宿主接线**而非移植：`overlay.rs` 的边缘翻转碰撞检测，以及为
    `code_viewer` / `diff_viewer` / `pdf_viewer` / `pptx_preview_viewer` / `chart` /
    `carousel` 接上各自的 JS 引擎等价物（这些属于宿主应用职责，见 §4.4）。
 4. **服务层核心逻辑**（`packages/services`，224k 行）：按领域切分，优先迁移  
-   纯计算/状态机模块；I/O 与第三方 SDK 调用保留边界。
+   纯计算/状态机模块；I/O 与第三方 SDK 调用保留边界。  
+   **已完成第一条：git 工作区状态（§2.4）。** 下一步的自然延伸是补齐
+   git 的**写操作**（`stage` / `unstage` / `discard` / `commit`）—— 读路径已经
+   全部就位，写路径在 TS 侧也只是拼命令行 + 复用同一套 `GitCommandProvider`，
+   移植成本低，且能让「变更」页从只读变成可操作。
 5. **不可移植部分**：桌面/浏览器外壳（Electron / Vite / Node 主进程）不迁移；
    UI 层则**改用 Dioxus 重写**而不是机械翻译（React 运行时无法移植，但组件语义可以）。
 

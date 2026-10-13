@@ -6,33 +6,47 @@
 > `packages/**`、`apps/**` 路径都是**移植来源**，用于追溯「这段 Rust 是从哪个
 > TS 文件翻译过来的」，在 `rust` 分支上才能打开。
 
-本仓库是 **RapidCode / ZCode 的 Rust 移植**。分三批推进：
+本仓库是 **RapidCode / ZCode 的 Rust 移植**。分四批推进：
 
 1. **核心逻辑层**（移植自 `packages/rpc` + `packages/shared`）—— 见 **[PORTING.md](./PORTING.md)**
 2. **UI 层**（移植自 `packages/ui` 的 shadcn 风格原语，**47 / 47**）—— 见 **[PORTING-UI.md](./PORTING-UI.md)**
 3. **应用外壳**（`crates/zcode-app`）—— 用移植出的原语拼出的 ZCode 风格界面
+4. **真实业务链路**（移植自 `packages/services`）—— 见 **[PORTING.md](./PORTING.md) §2.4**
 
 **当前状态，请先读这一句**：**可编译、可测试**已经做到（`cargo build` 零警告、
-871 个测试全绿），但**桌面窗口渲染不出内容**（环境层面的依赖不兼容，见「已知问题」），
-而且**应用外壳目前只是静态演示**（硬编码演示数据，没有任何真实业务逻辑）。
-上面第 3 条**不等于**「应用已经能用」。已移植的是 **UI 原语这一层**；
-上游 8,462 个 `.ts` / `.tsx` 里真正承载业务逻辑的那部分基本还没动，
+981 个测试全绿），但**桌面窗口渲染不出内容**（环境层面的依赖不兼容，见「已知问题」）。
+
+**应用外壳已经能显示真实数据**：「变更」页走的是**真正移植过来的 git 工作区状态链路**
+（`crates/zcode-services`）—— 它会真的去 `git status --porcelain=v2` / `git diff --numstat`，
+界面上列出的分支名、变更文件、`+N/-M` 全部来自你当前这份仓库，不是硬编码。
+见下方 [截图](#能看的东西ssr-静态快照) 与 [§真实业务链路](#真实业务链路git-工作区状态)。
+
+**但请不要误解规模**：已移植的是 **UI 原语层**（47/47）加 **git 这一条服务链路**；
+上游 8,462 个 `.ts` / `.tsx` 里其余承载业务逻辑的部分基本还没动，
 范围明细见「已知问题 · 移植范围」。
 
 ## 快速开始
 
 ```bash
 cargo build                          # 编译整个工作区
-cargo test                           # 运行全部测试（871 个）
+cargo test                           # 运行全部测试（981 个）
 cargo run -p zcode-app               # 桌面窗口（⚠️ 本机开得出窗口但内容是空白，见「已知问题」）
 cargo build --release
 
-# UI 预览（生成一份可直接在浏览器打开的 HTML）—— 这是目前唯一能看到 UI 的路径
-cargo run -p zcode-ui --example preview       # → ./preview.html      （原语清单）
-cargo run -p zcode-app --example app_preview  # → ./app-preview.html  （应用整屏静态快照）
+# UI 预览（生成可直接在浏览器打开的 HTML）—— 这是目前唯一能看到 UI 的路径
+cargo run -p zcode-ui --example preview       # → ./preview.html            （原语清单）
+cargo run -p zcode-app --example app_preview  # → ./app-preview.html        （对话页整屏快照）
+                                              #   ./app-preview-changes.html（变更页整屏快照，真实 git 数据）
 ```
 
-> `zcode-rpc` / `zcode-shared` **零外部依赖**（只用 `std`），离线也能编译。
+> **`app_preview` 会真的跑一次 git 查询**：它同步调用 `zcode-services` 里那套移植过来的
+> 代码读当前工作区，把结果注入界面。所以快照里列的文件名、`+N/-M` 就是你这份仓库的
+> 真实状态。换个目录跑（`ZCODE_WORKSPACE=/path/to/repo cargo run -p zcode-app --example app_preview`）
+> 就会换一批内容。
+
+> `zcode-rpc` / `zcode-shared` / `zcode-services` **零外部依赖**（只用 `std`），
+> 离线也能编译。其中 `zcode-services` 跑 git 只用 `std::process`，没有 `tokio`、
+> 没有 `serde`、连正则都没引（`porcelain` / `numstat` 全是手写解析）。
 > `zcode-ui` 依赖 Dioxus，但默认关掉了所有渲染器 feature，因此同样离线可编译、
 > 可测试（`cargo test` 首次需联网拉取 dev-dependency `dioxus-ssr`）。
 > `zcode-app` 默认走 `dioxus/desktop`（wry + tao 原生窗口），不需要 wasm 工具链。
@@ -42,9 +56,10 @@ cargo run -p zcode-app --example app_preview  # → ./app-preview.html  （应�
 >
 > ⚠️ **`cargo run -p zcode-app` 能开出窗口，但窗口内容区是空白的** —— UI 渲染不出来。
 > 这是 dioxus-desktop 0.6.3（wry 0.45）与较新 WebView2 Runtime 的兼容性问题，
-> **与本仓库代码无关**（`cargo build` 零警告、871 个测试全绿，SSR 渲染出的组件树
+> **与本仓库代码无关**（`cargo build` 零警告、981 个测试全绿，SSR 渲染出的组件树
 > 也完整正确）。完整证据链与可选出路见「已知问题」一节。
-> 想直接看 UI，用浏览器打开 `app-preview.html`（SSR 静态快照）。
+> 想直接看 UI，用浏览器打开 `app-preview.html` / `app-preview-changes.html`
+> （SSR 静态快照），或直接看下面的截图。
 
 ## 工作区结构
 
@@ -56,7 +71,9 @@ cargo run -p zcode-app --example app_preview  # → ./app-preview.html  （应�
 ├── PORTING.md                      # 逻辑层移植说明
 ├── PORTING-UI.md                   # UI 层移植说明
 ├── preview.html                    # 原语清单预览页（由 zcode-ui 的 example 生成）
-├── app-preview.html                # 应用整屏静态快照（由 zcode-app 的 example 生成，自包含）
+├── app-preview.html                # 对话页整屏快照（由 zcode-app 的 example 生成，自包含）
+├── app-preview-changes.html        # 变更页整屏快照（同上，含**真实 git 工作区数据**）
+├── docs/                           # 上面两份快照的截图（README 里引用）
 ├── .tailwind-build/                # 生成 app.css（见 PORTING-UI.md §4.8）
 │   ├── build.sh                    #   拼装入口 CSS + 调 Tailwind CLI
 │   ├── tokens.css                  #   设计令牌（vendored 自上游 styles.css 的 @theme / .dark）
@@ -85,7 +102,17 @@ cargo run -p zcode-app --example app_preview  # → ./app-preview.html  （应�
     │   └── src/
     │       ├── line_change_stat.rs       行级 LCS 变更统计
     │       ├── model_provider_family.rs  模型供应商族归一 / 可见性
-    │       └── plan_identity.rs          套餐身份解析
+    │       ├── plan_identity.rs          套餐身份解析
+    │       └── git.rs                    git 领域类型（分支 / 变更 / diff 可用性）
+    ├── zcode-services/             # 服务层业务逻辑（起步：git 工作区状态链路）
+    │   ├── src/
+    │   │   ├── git/config.rs             git 环境净化 / 二进制探测 / 路径归一
+    │   │   ├── git/provider.rs           std::process 跑 git（超时 / 输出上限 / 强制 kill）
+    │   │   ├── git/cli_helpers.rs        porcelain v2 / numstat 解析（纯函数）
+    │   │   ├── git/repo.rs               GitCliRepo：resolve / get_status / list_local_branches
+    │   │   ├── git/changes.rs            按暂存区分组 + 汇总（对齐 gitService.getChanges）
+    │   │   └── git/types.rs              解析中间态类型
+    │   └── tests/git_workspace.rs        真起临时仓库跑端到端（6）
     ├── zcode-ui/                   # UI 原语组件库（Rust + Dioxus 移植自 packages/ui）
     │   ├── src/
     │   │   ├── cn.rs                     类名合并（clsx + tailwind-merge 子集）
@@ -114,16 +141,19 @@ cargo run -p zcode-app --example app_preview  # → ./app-preview.html  （应�
     │   │   ├── render.rs                 mutation 记录式渲染测试（11）
     │   │   └── html_snapshot.rs          dioxus-ssr HTML 快照测试（75）
     │   └── examples/preview.rs           预览页生成器
-    └── zcode-app/                  # 可运行的桌面应用（用上面两个 crate 拼出来）
-        ├── assets/app.css                由 .tailwind-build/build.sh 生成（116,737 字节）
+    └── zcode-app/                  # 可运行的桌面应用（用上面三个 crate 拼出来）
+        ├── assets/app.css                由 .tailwind-build/build.sh 生成（117,214 字节）
         ├── src/
-        │   ├── lib.rs                    App / AppShell，内嵌样式表
+        │   ├── lib.rs                    App / AppShell / WorkspaceBootstrap，内嵌样式表
         │   ├── main.rs                   桌面入口（LaunchBuilder::desktop）
         │   ├── state.rs                  AppState / AppCtx / demo_state
+        │   ├── workspace.rs              真实工作区数据的后台线程桥（futures-channel）
         │   └── views/                    sidebar / topbar / conversation / composer
-        │                                 detail / settings / gallery
-        ├── examples/app_preview.rs       整屏静态快照生成器（自包含 HTML）
-        └── tests/smoke.rs                整树冒烟测试（17）
+        │                                 detail / settings / gallery / changes
+        ├── examples/app_preview.rs       整屏静态快照生成器（对话页 + 变更页）
+        └── tests/
+            ├── smoke.rs                  整树冒烟测试（23 + 1 ignored）
+            └── workspace_loader.rs       跨线程取数链路测试（3）
 ```
 
 ## 设计要点（逻辑层）
@@ -153,37 +183,69 @@ cargo run -p zcode-app --example app_preview  # → ./app-preview.html  （应�
 ## 测试
 
 ```
-cargo test                 # 工作区 871 个测试
-cargo test -p zcode-ui     # UI 层 828 个测试
-cargo test -p zcode-app    # 应用层 19 个测试
+cargo test                    # 工作区 981 个测试
+cargo test -p zcode-ui        # UI 层 828 个测试
+cargo test -p zcode-services  # 服务层 82 个测试（含真起临时仓库的端到端）
+cargo test -p zcode-app       # 应用层 43 个测试
 ```
 
 | crate | 单元 | 集成 | 小计 |
-| --- | --- | --- | --- |
+| --- | ---: | ---: | ---: |
 | `zcode-rpc` | 10 | — | 10 |
-| `zcode-shared` | 14 | — | 14 |
+| `zcode-shared` | 18 | — | 18 |
+| `zcode-services` | 76 | 6 | 82 |
 | `zcode-ui` | 742 | 75 + 11 | 828 |
-| `zcode-app` | 2 | 17 | 19 |
-| **合计** | **768** | **103** | **871** |
+| `zcode-app` | 17 | 23 + 3 | 43 |
+| **合计** | **863** | **118** | **981** |
 
 - **逻辑层**：VQL 序列化往返、嵌套 `Uint8Array` 的 JSON 回退、Base64、
   事件缓冲、基于内存队列（`create_queue_pair`）的端到端 RPC 调用 / 事件订阅。
 - **UI 层**：类名 / 几何 / 键盘 / 格式化的纯函数断言（742）、mutation 记录式
   渲染（11）、`dioxus-ssr` HTML 快照（75）—— 全部不需要 wasm / 窗口 / 浏览器。
+- **服务层**：`porcelain=v2` / `numstat` 解析的纯函数断言（76）；
+  以及**真起临时 git 仓库**跑端到端的集成测试（6）—— 建仓库、造提交、
+  改文件、建未跟踪目录，再验证解析结果。没有 git 时这些测试会跳过并打印说明。
 - **应用层**：整棵应用树（含三个浮层）真渲染一遍，断言区域文案、
   `data-slot` 锚点、`data-*` 语义属性、浮层默认关闭、内嵌样式表覆盖到了
-  所需的 `@custom-variant` 与设计令牌。
+  所需的 `@custom-variant` 与设计令牌（23）；另有一组用**手写 executor**
+  驱动 `refresh → 后台线程 → 通道 → 结果` 整条链路、不依赖 dioxus 运行时的
+  测试（3），覆盖「加载成功 / 不是仓库 / 重复刷新被忽略」。
 
 > 「能正常运行」的判定方法（进程存活 / `MainWindowHandle` 非零 /
 > `MainWindowTitle` 与 `WindowBuilder` 一致 / `Responding=True`）见
 > [PORTING-UI.md](./PORTING-UI.md) §5.5。
+
+## 真实业务链路：git 工作区状态
+
+这是目前**唯一一条端到端跑通真实 IO 的链路**，落在 `crates/zcode-services`
+（移植自 `packages/services/src/git/*`）。
+
+```
+git 进程 ──► provider.rs ──► cli_helpers.rs ──► repo.rs ──► changes.rs ──► workspace.rs ──► 界面
+            跑命令/超时     porcelain v2       GitCliRepo  按暂存区    后台线程 + 通道
+                            解析（纯函数）      get_status   分组         （futures-channel）
+```
+
+| 环节 | 说明 |
+| --- | --- |
+| `config.rs` | 清掉 `GIT_DIR` / `GIT_WORK_TREE` 等 16 个环境变量（否则在 git hook 里跑会被带偏），强制 `LC_ALL=C`、`GIT_PAGER=cat`；探测 Windows 下 4 个常见 `git.exe` 位置 |
+| `provider.rs` | 只用 `std::process`（**零第三方依赖**）；每根管道一个读取线程（否则管道缓冲区满会死锁）；超时后 `kill` + 汇总诊断信息 |
+| `cli_helpers.rs` | 手写解析 `--porcelain=v2 -z` 与 `--numstat -z`，**不用正则**（本 crate 零依赖）；重命名记录会吃掉下一条空记录 |
+| `repo.rs` | `rev-parse --show-toplevel --show-prefix --absolute-git-dir --git-common-dir` 定位仓库；未跟踪文件按 4 线程池数行（>1 MiB 跳过、含 NUL 视为二进制） |
+| `changes.rs` | 对齐 `gitService.getChanges`：一个 `MM` 状态会**同时**产出「已暂存」和「未暂存」两条变更（是展开，不是过滤） |
+| `workspace.rs` | 把同步阻塞的调用挪到后台线程，用 `futures-channel` 唤醒 dioxus（**不用轮询定时器**，也不引入 tokio） |
+
+**没移植的**（有意为之，避免「看起来移植了其实没有」）：`gitCommitMessageGenerator`
+（依赖 LLM）、`gitCheckpoint*`（依赖检查点存储）、以及全部写操作
+（`stage` / `unstage` / `discard` / `commit` / `push`）。明细写在
+`crates/zcode-services/src/lib.rs` 的模块文档里。
 
 ## 已知问题：原生窗口渲染不出内容（WebView2 运行时崩溃）
 
 **结论先说**：`cargo run -p zcode-app` 能开出一个标题正确的窗口，但**窗口内容区一片空白**
 —— UI 渲染不出来。这是 **dioxus-desktop 0.6.3（内置 wry 0.45）与 WebView2 Runtime
 `154.0.4258.62` 之间的兼容性问题，不是本仓库代码的问题**。同一份代码
-`cargo build` 零警告、871 个测试全绿；SSR 渲染出的组件树也完整正确（见下方
+`cargo build` 零警告、981 个测试全绿；SSR 渲染出的组件树也完整正确（见下方
 「能看的东西」）。
 
 ### 证据链
@@ -260,25 +322,47 @@ dioxus-desktop 在 Windows 上靠**「http 伪装的自定义协议」**传 DOM 
 | --- | --- |
 | `packages/ui/src/components/ui`（shadcn 原语，47 个 TSX） | ✅ 全部移植到 `crates/zcode-ui` |
 | 逻辑原语（`zcode-rpc` / `zcode-shared`） | ✅ 移植了一部分（VQL 序列化往返、Base64、事件缓冲、内存队列 RPC） |
-| `crates/zcode-app`（应用外壳） | ⚠️ **只是静态演示**：`state.rs` 里是硬编码演示数据，整层没有任何文件 IO / 网络 / 进程调用 |
-| `packages/shared`（419 个模块） | ⚠️ 只移植了 3 个 |
-| `packages/services`（674 个文件） | ❌ 未移植 |
+| `crates/zcode-app`（应用外壳） | ✅ 界面全部用真实原语渲染；**「变更」页已是真实数据**（见上一节），其余页面仍是演示数据 |
+| `packages/services`（674 个文件） | ⚠️ **起步**：git 工作区状态这一条链路已完整移植（`crates/zcode-services`），其余未动 |
+| `packages/shared`（419 个模块） | ⚠️ 只移植了 4 个 |
 | `packages/desktop`（1,232 个文件） | ❌ 未移植 |
 | `apps/`（5,060 个文件） | ❌ 未移植 |
 
 上游 `main` 分支共 8,462 个 `.ts` / `.tsx` 文件。所以「移植完成」只在
-**UI 原语这一层**成立；让它变成可用产品的那部分基本还没动。
+**UI 原语这一层**成立；让它变成可用产品的那部分基本还没动 ——
+目前**唯一**一条端到端跑通真实 IO 的是 git 工作区状态。
 
 ### 能看的东西：SSR 静态快照
 
 窗口渲染不出来，但**整棵组件树本身是正确的**。用 SSR 把它渲染成 HTML 就能看到：
 
 ```bash
-cargo run -p zcode-ui  --example preview       # → ./preview.html      （47 个原语清单）
-cargo run -p zcode-app --example app_preview   # → ./app-preview.html  （应用整屏快照）
+cargo run -p zcode-ui  --example preview       # → ./preview.html             （47 个原语清单）
+cargo run -p zcode-app --example app_preview   # → ./app-preview.html         （对话页整屏快照）
+                                               #   ./app-preview-changes.html （变更页，真实 git 数据）
 ```
 
-`app-preview.html` 含 10,000+ 字可见文本、347 个 `data-slot` 锚点，
+`app-preview.html` 含 11,700+ 字可见文本、343 个 `data-slot` 锚点，
 配色 / 圆角 / 字号都来自上游抽取并 vendored 的设计令牌 —— 用浏览器打开即所见即所得。
+
+下面这两张就是用 Chromium 无头模式把快照截出来的（脚本见下方），
+内容随你当前仓库的真实 git 状态变化：
+
+**对话页**（`app-preview.html`）
+
+![对话页快照](./docs/screenshot-conversation.png)
+
+**变更页**（`app-preview-changes.html`）—— 左上角分支 `rust-only`、
+工作区路径 `F:/RapidCode`、`30 个文件 · +6029 -51`、以及每个文件的
+`修改 / 新增` 与 `+N/-M` 全部来自真实 git 查询：
+
+![变更页快照](./docs/screenshot-changes.png)
+
+```bash
+# 重新生成截图（需要 Edge 或 Chrome）
+EDGE="/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
+"$EDGE" --headless=new --disable-gpu --hide-scrollbars --window-size=1440,960 \
+        --screenshot=docs/screenshot-changes.png "file://$PWD/app-preview-changes.html"
+```
 
 判断「能正常运行」的完整观测清单见 [PORTING-UI.md](./PORTING-UI.md) §5.5。

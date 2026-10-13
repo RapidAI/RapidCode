@@ -34,6 +34,16 @@ dioxus = { version = "0.6", default-features = false, features = [
     "document",
 ] }
 zcode-ui = { path = "../zcode-ui" }
+zcode-shared = { path = "../zcode-shared" }
+# 真实功能：git 工作区状态链路（见 src/workspace.rs）
+zcode-services = { path = "../zcode-services" }
+
+# 后台线程 → UI 线程的结果回传。
+# 选 futures-channel 而不是 std::sync::mpsc，是因为它能在结果送达时唤醒
+# dioxus 注册的 waker，于是不需要定时轮询、也不需要引入 tokio 运行时。
+futures-channel = "0.3"
+# 只为拿到 `Stream::poll_next`（futures-channel 不重新导出这个 trait）。
+futures-core = "0.3"
 
 [dev-dependencies]
 # 仅测试用：把组件树渲染成 HTML 字符串，验证锚点与文案

@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/zcode-rpc", "crates/zcode-shared", "crates/zcode-ui", "crates/zcode-app"]
+members = [
+    "crates/zcode-rpc",
+    "crates/zcode-shared",
+    "crates/zcode-services",
+    "crates/zcode-ui",
+    "crates/zcode-app",
+]
 
 [workspace.package]
 version = "3.15.1"

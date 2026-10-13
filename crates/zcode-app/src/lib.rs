@@ -34,13 +34,26 @@
 //! ## 目录
 //!
 //! - [`state`]：单一 store（`Signal<AppState>`）+ 演示数据
-//! - [`views`]：侧栏 / 顶栏 / 会话流 / 输入区 / 详情面板 / 设置 / 组件画廊
+//! - [`workspace`]：**真实**工作区数据（后台线程跑 git，UI 线程只读结果）
+//! - [`views`]：侧栏 / 顶栏 / 会话流 / 变更页 / 输入区 / 详情面板 / 设置 / 组件画廊
+//!
+//! ## 哪些是真的，哪些是演示
+//!
+//! 这一层必须说清楚，否则很容易把「原语都长出来了」误读成「功能都搬过来了」：
+//!
+//! | 区域 | 数据来源 |
+//! | --- | --- |
+//! | 「变更」页、详情面板的「变更文件」、顶栏分支徽标、侧栏底部仓库信息 | **真实** —— `zcode-services` 跑 `git status` / `git diff --numstat` |
+//! | 会话列表、消息流、工具调用卡片、上下文用量 | 演示数据（`state::demo_state`）—— 依赖会话存储与 LLM provider，尚未移植 |
+//! | 「任务」页 | 明确标注为未移植的占位页 |
 
 pub mod state;
 pub mod views;
+pub mod workspace;
 
 use dioxus::prelude::*;
 use state::{AppCtx, ApprovalMode};
+use workspace::{WorkspaceData, WorkspaceMessage, WorkspaceRequester, WorkspaceStatus};
 use zcode_ui::*;
 
 /// 构建期生成的样式表（见 crate 文档）。
@@ -48,6 +61,50 @@ pub const APP_CSS: &str = include_str!("../assets/app.css");
 
 /// 窗口标题。
 pub const TITLE: &str = "ZCode — Rust + Dioxus 移植";
+
+/// 启动时告诉 [`AppShell`] 该扫描哪个工作区。
+///
+/// 只有真实入口 [`App`] 会提供它。测试里直接渲染 `AppShell` 时没有这个 context，
+/// 于是**不会**去碰真实文件系统与 git 进程 —— 无头快照测试因此保持确定性。
+#[derive(Clone, Debug)]
+pub struct WorkspaceBootstrap {
+    pub path: std::path::PathBuf,
+}
+
+/// 用一份**给定**的工作区数据启动 [`AppShell`]。
+///
+/// 与 [`WorkspaceBootstrap`] 的区别：那个是「自己去扫」，这个是「数据已经在这儿了」。
+/// 两条用途：
+///
+/// 1. `examples/app_preview.rs` 在进程里同步扫一次真实仓库，再把结果塞进来 ——
+///    这样静态快照里显示的是**真实**的文件名与行数，而不是编的。
+/// 2. 快照测试注入固定数据，断言各种状态（干净 / 非仓库 / 失败 / 加载中）的渲染。
+///
+/// 提供它时不会触发后台扫描。
+#[derive(Clone, Debug)]
+pub struct WorkspaceSeed {
+    pub data: Option<WorkspaceData>,
+    pub status: WorkspaceStatus,
+    /// 初始视图 Tab；`None` 用默认值（对话页）。
+    pub tab: Option<String>,
+}
+
+impl WorkspaceSeed {
+    /// 用一份扫描结果构造种子。
+    pub fn ready(data: WorkspaceData) -> Self {
+        Self {
+            data: Some(data),
+            status: WorkspaceStatus::Ready,
+            tab: None,
+        }
+    }
+
+    /// 指定初始 Tab。
+    pub fn with_tab(mut self, tab: impl Into<String>) -> Self {
+        self.tab = Some(tab.into());
+        self
+    }
+}
 
 /// 应用根组件：往 `<head>` 注入标题与样式表，然后挂上界面。
 ///
@@ -57,6 +114,12 @@ pub const TITLE: &str = "ZCode — Rust + Dioxus 移植";
 /// [`AppShell`]，两边各自可测。
 #[component]
 pub fn App() -> Element {
+    // 在根上把「从哪个目录开始扫描」定下来，再交给 AppShell。
+    // 放在根上而不是 AppShell 里，是为了让 AppShell 在测试中保持零副作用。
+    use_context_provider(|| WorkspaceBootstrap {
+        path: workspace::default_workspace_path(),
+    });
+
     rsx! {
         document::Title { {TITLE} }
         document::Style { {APP_CSS} }
@@ -67,6 +130,13 @@ pub fn App() -> Element {
 /// 界面主体（不含 `<head>` 注入，便于无渲染器测试）。
 #[component]
 pub fn AppShell() -> Element {
+    // 外部可以塞一份「已经拿到的」工作区数据进来（预览与快照测试用）。
+    // 读它用 `try_consume_context`：真实运行时没有这个 context，走后台扫描。
+    let seed = try_consume_context::<WorkspaceSeed>();
+    let seeded_tab = seed.as_ref().and_then(|seed| seed.tab.clone());
+    let seeded_data = seed.as_ref().and_then(|seed| seed.data.clone());
+    let seeded_status = seed.as_ref().map(|seed| seed.status.clone());
+
     // 全局 store
     let state = use_signal(state::demo_state);
     // UI 瞬态：各自的 Signal，避免开合浮层时让整棵树重算
@@ -76,9 +146,65 @@ pub fn AppShell() -> Element {
     let settings_tab = use_signal(|| "general".to_string());
     let detail_open = use_signal(|| true);
     let gallery_open = use_signal(|| false);
-    let workspace_tab = use_signal(|| "conversation".to_string());
+    let workspace_tab = use_signal(move || {
+        seeded_tab.unwrap_or_else(|| "conversation".to_string())
+    });
     let plan_open = use_signal(|| true);
     let approval_value = use_signal(|| ApprovalMode::Ask.as_str().to_string());
+    // 真实工作区数据
+    let workspace_data = use_signal(move || seeded_data);
+    let workspace_status = use_signal(move || seeded_status.unwrap_or_default());
+
+    // 请求端 / 结果端只建一次；请求端要通过 context 给顶栏与变更页用。
+    let workspace_channel = use_hook(workspace::create_workspace_channel);
+    let requester_for_context = workspace_channel.requester();
+    use_context_provider(move || requester_for_context);
+
+    // 结果回传循环。
+    //
+    // 阻塞的 git 调用在 worker 线程里（见 [`workspace`]），这里只 await 结果，
+    // 因此渲染线程不会被 `git status` 卡住。`futures-channel` 会在消息到达时
+    // 唤醒 dioxus 的 waker，所以不需要定时轮询。
+    let channel_for_poller = workspace_channel.clone();
+    let _workspace_poller = use_hook(move || {
+        let mut receiver = channel_for_poller.take_receiver();
+        let mut workspace_data = workspace_data;
+        let mut workspace_status = workspace_status;
+        spawn(async move {
+            let Some(receiver) = receiver.as_mut() else {
+                // 理论上不可达（`use_hook` 保证初始化只跑一次）。
+                // 这里挂起而不是 panic：内部不变量出问题时不该把整个界面带走。
+                std::future::pending::<()>().await;
+                return;
+            };
+
+            while let Some(message) = workspace::next_workspace_message(receiver).await {
+                match message {
+                    WorkspaceMessage::Loading => workspace_status.set(WorkspaceStatus::Loading),
+                    WorkspaceMessage::Loaded(data) => {
+                        workspace_data.set(Some(*data));
+                        workspace_status.set(WorkspaceStatus::Ready);
+                    }
+                    WorkspaceMessage::Failed(message) => {
+                        workspace_status.set(WorkspaceStatus::Failed(message));
+                    }
+                }
+            }
+        })
+    });
+
+    // 首帧发起一次扫描；只有真实入口提供了 bootstrap、且外部没有塞数据时才做。
+    let bootstrap_path = if seed.is_none() {
+        try_consume_context::<WorkspaceBootstrap>().map(|bootstrap| bootstrap.path)
+    } else {
+        None
+    };
+    let requester_for_initial_load: WorkspaceRequester = workspace_channel.requester();
+    use_hook(move || {
+        if let Some(path) = bootstrap_path {
+            requester_for_initial_load.refresh(path);
+        }
+    });
 
     use_context_provider(|| AppCtx {
         state,
@@ -91,6 +217,8 @@ pub fn AppShell() -> Element {
         workspace_tab,
         plan_open,
         approval_value,
+        workspace: workspace_data,
+        workspace_status,
     });
 
     let dark = state.read().dark;
@@ -104,7 +232,8 @@ pub fn AppShell() -> Element {
                 div { class: "flex min-w-0 flex-1 flex-col",
                     views::TopBar {}
                     div { class: "flex min-h-0 flex-1",
-                        views::ConversationView {}
+                        // 顶栏的 Tab 必须真的切换内容，见 [`views::WorkspacePane`]。
+                        views::WorkspacePane {}
                         if (detail_open)() {
                             views::DetailPanel {}
                         }

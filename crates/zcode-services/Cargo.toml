@@ -1,0 +1,16 @@
+[package]
+name = "zcode-services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ZCode 服务层（Rust 移植自 packages/services，当前含 git 工作区状态链路）"
+
+[lib]
+name = "zcode_services"
+path = "src/lib.rs"
+
+[dependencies]
+zcode-shared = { path = "../zcode-shared" }
+# 刻意保持零第三方依赖：进程调用只用 std::process，
+# 与 zcode-rpc 的取舍一致（离线环境下少一个依赖就少一处编译风险）。

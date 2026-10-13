@@ -255,7 +255,10 @@ fn ConversationMenu(id: &'static str, title: &'static str) -> Element {
     }
 }
 
-/// 侧栏底部：组件画廊入口 + 设置。
+/// 侧栏底部：组件画廊入口 + 设置 + **真实**工作区信息。
+///
+/// 「上下文用量」与用户名仍是演示数据（依赖尚未移植的会话存储与账号体系），
+/// 但工作区那一行读的是 `zcode-services` 跑出来的真实仓库状态。
 #[component]
 fn SidebarFooter() -> Element {
     let ctx = use_app();
@@ -264,6 +267,16 @@ fn SidebarFooter() -> Element {
         state.token_used / state.token_limit * 100.0
     } else {
         0.0
+    };
+
+    let workspace = ctx.workspace.read().clone();
+    let (workspace_name, workspace_detail) = match workspace.as_ref() {
+        Some(data) if data.is_repository() => (
+            path_leaf(&data.summary.workspace_path),
+            format!("{} · {} 个变更", data.branch_label(), data.totals.file_count),
+        ),
+        Some(data) => (path_leaf(&data.summary.workspace_path), "非 Git 仓库".to_string()),
+        None => ("本地工作区".to_string(), "读取中…".to_string()),
     };
 
     rsx! {
@@ -309,11 +322,22 @@ fn SidebarFooter() -> Element {
                     AvatarFallback { "M" }
                 }
                 div { class: "flex min-w-0 flex-1 flex-col",
-                    span { class: "truncate text-ui-xs text-foreground", "ma139" }
-                    span { class: "truncate text-ui-xs text-foreground-subtlest", "本地工作区" }
+                    span { class: "truncate text-ui-xs text-foreground", {workspace_name} }
+                    span { class: "truncate text-ui-xs text-foreground-subtlest",
+                        {workspace_detail}
+                    }
                 }
                 Badge { variant: BadgeVariant::Outline, class: "h-4 px-1 text-ui-xs", "Pro" }
             }
         }
     }
+}
+
+/// 取路径的最后一段（`F:\RapidCode` → `RapidCode`）。
+fn path_leaf(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.to_string())
 }

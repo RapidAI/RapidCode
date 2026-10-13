@@ -1,12 +1,18 @@
-//! 右侧详情面板：执行计划、变更、上下文、以及一批设置项。
+//! 右侧详情面板：执行计划、**真实变更**、上下文、以及一批设置项。
 //!
 //! 这一块刻意把「表单类」原语都过一遍：`Collapsible` / `Accordion` / `Switch` /
 //! `RadioGroup` / `Checkbox` / `Progress`（分段）/ `AvatarGroup` / `ButtonGroup` /
 //! `Kbd` / `Separator` / `Tooltip`。
+//!
+//! 面板里只有「变更文件」那一块接的是**真实数据**（`zcode-services` 的 git 查询）；
+//! 执行计划、工具调用、上下文来源仍是演示数据，且各自标注了这一点。
 
 use crate::state::{use_app, ApprovalMode, Model};
+use crate::workspace::section_label;
 use dioxus::prelude::*;
 use zcode_ui::*;
+
+use super::ChangeRow;
 
 /// 详情面板。
 #[component]
@@ -47,27 +53,7 @@ pub fn DetailPanel() -> Element {
                     Accordion { kind: AccordionType::Single,
                         AccordionItem { value: "changes",
                             AccordionTrigger { "变更文件" }
-                            AccordionContent {
-                                div { class: "flex flex-col gap-2",
-                                    for (path , add , del) in [
-                                        ("crates/zcode-ui/src/components/accordion.rs", 138, 0),
-                                        ("crates/zcode-ui/src/components/overlay.rs", 209, 0),
-                                        ("crates/zcode-ui/src/cn.rs", 27, 0),
-                                        ("crates/zcode-app/src/main.rs", 96, 4),
-                                    ] {
-                                        div { key: "{path}", class: "flex items-center gap-2",
-                                            IconFileText { class: "size-3 shrink-0 text-foreground-subtlest" }
-                                            span { class: "min-w-0 flex-1 truncate text-ui-xs text-foreground-subtle",
-                                                {path}
-                                            }
-                                            span { class: "shrink-0 text-ui-xs text-primary", "+{add}" }
-                                            if del > 0 {
-                                                span { class: "shrink-0 text-ui-xs text-destructive", "-{del}" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            AccordionContent { ChangesSection {} }
                         }
                         AccordionItem { value: "tools",
                             AccordionTrigger { "工具调用" }
@@ -76,6 +62,7 @@ pub fn DetailPanel() -> Element {
                                     ToolRow { name: "cargo test", detail: "871 passed", ok: true }
                                     ToolRow { name: "cargo build", detail: "desktop · 16.6s", ok: true }
                                     ToolRow { name: "tailwindcss", detail: "app.css · 114 KB", ok: true }
+                                    DemoHint { text: "演示数据：工具调用流依赖尚未移植的会话存储。" }
                                 }
                             }
                         }
@@ -96,6 +83,7 @@ pub fn DetailPanel() -> Element {
                                             Checkbox { checked: CheckboxState::Checked }
                                         }
                                     }
+                                    DemoHint { text: "演示数据：真实上下文索引依赖尚未移植的 RAG 链路。" }
                                 }
                             }
                         }
@@ -262,6 +250,93 @@ pub fn DetailPanel() -> Element {
     }
 }
 
+/// 详情面板里的「变更文件」。
+///
+/// 数据来自 [`crate::workspace`]（真实 git 查询），按 staged / unstaged /
+/// untracked / conflicted 分组展示；每种异常状态都有明确文案。
+#[component]
+fn ChangesSection() -> Element {
+    let ctx = use_app();
+    let data = ctx.workspace.read().clone();
+    let status = ctx.workspace_status.read().clone();
+
+    if let Some(message) = status.failure() {
+        return rsx! {
+            div { class: "flex items-start gap-2",
+                IconTriangleAlert { class: "mt-0.5 size-3 shrink-0 text-destructive" }
+                span { class: "break-all text-ui-xs text-foreground-subtle",
+                    {message.to_string()}
+                }
+            }
+        };
+    }
+
+    let Some(data) = data else {
+        return rsx! { PanelHint { text: "正在读取工作区…" } };
+    };
+
+    if !data.is_repository() {
+        return rsx! { PanelHint { text: "当前目录不是 Git 仓库".to_string() } };
+    }
+
+    if data.changes.is_empty() {
+        return rsx! {
+            PanelHint { text: format!("{} 工作区干净", data.branch_label()) }
+        };
+    }
+
+    let totals = format!(
+        "{} 个文件 · +{} -{}",
+        data.totals.file_count, data.totals.added, data.totals.removed
+    );
+
+    rsx! {
+        div { class: "flex flex-col gap-2",
+            span { class: "text-ui-xs text-foreground-subtlest", {totals} }
+            for section in data.populated_sections() {
+                div { key: "{section.as_str()}", class: "flex flex-col gap-1",
+                    div { class: "flex items-center gap-1.5",
+                        span { class: "text-ui-xs font-medium text-foreground-subtle",
+                            {section_label(section)}
+                        }
+                        span { class: "text-ui-xs text-foreground-subtlest",
+                            "{data.changes_in(section).len()}"
+                        }
+                    }
+                    for change in data.changes_in(section) {
+                        ChangeRow {
+                            key: "{change.repo_relative_path}",
+                            change: change.clone(),
+                            compact: true,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 面板里的一句提示。
+#[component]
+fn PanelHint(text: String) -> Element {
+    rsx! {
+        span { class: "text-ui-xs text-foreground-subtlest", {text} }
+    }
+}
+
+/// 「这块是演示数据」的显式标注。
+///
+/// 不标出来，读者会把整页都当成已移植的功能 —— 这一轮就是被这个误读坑过一次。
+#[component]
+fn DemoHint(text: &'static str) -> Element {
+    rsx! {
+        div { class: "flex items-start gap-1.5 rounded-md bg-muted/50 px-2 py-1",
+            IconInfo { class: "mt-0.5 size-3 shrink-0 text-foreground-subtlest" }
+            span { class: "text-ui-xs text-foreground-subtlest", {text} }
+        }
+    }
+}
+
 /// 「执行计划」折叠区（受控用法）。
 #[component]
 fn PlanSection() -> Element {
@@ -281,7 +356,7 @@ fn PlanSection() -> Element {
                     "执行计划"
                 }
                 Badge { variant: BadgeVariant::Secondary, class: "ml-auto text-ui-xs",
-                    "3 / 4"
+                    "4 / 5"
                 }
             }
             CollapsibleContent {
@@ -289,7 +364,8 @@ fn PlanSection() -> Element {
                     PlanStep { done: true, text: "补齐第二批原语（无浮层）" }
                     PlanStep { done: true, text: "浮层类改用纯 CSS 自管理定位" }
                     PlanStep { done: true, text: "生成并内嵌 Tailwind 样式表" }
-                    PlanStep { done: false, text: "跑通桌面窗口" }
+                    PlanStep { done: true, text: "接入真实 git 工作区状态" }
+                    PlanStep { done: false, text: "跑通桌面窗口（受 WebView2 限制）" }
                 }
             }
         }
