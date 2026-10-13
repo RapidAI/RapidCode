@@ -1,230 +1,205 @@
-# ZCode
+# ZCode Rust 移植
 
-<div align="center">
-  <img src="public/logo/icons/1024x1024.png" alt="ZCode" width="128" height="128" />
-</div>
-<p align="center">
-  <a href="https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=47ag983c-8fcb-4d6d-814b-5395193a712c&amp;qr_code=true">飞书社群</a> ·
-  <a href="https://discord.gg/z9aBcQXZQ3">Discord</a>
-</p>
-<p align="center">
-  简体中文 | <a href="README.en.md">English</a>
-</p>
+> **本分支（`rust-only`）只保留 Rust 代码。**
+> 移植所依据的 TypeScript 源码**不在这里** —— 它保留在 `rust` 分支
+> （= `main` + 本目录内容）。本文档与 `PORTING.md` / `PORTING-UI.md` 里出现的
+> `packages/**`、`apps/**` 路径都是**移植来源**，用于追溯「这段 Rust 是从哪个
+> TS 文件翻译过来的」，在 `rust` 分支上才能打开。
 
+本仓库是 **RapidCode / ZCode 的 Rust 移植**。分三批推进：
 
+1. **核心逻辑层**（移植自 `packages/rpc` + `packages/shared`）—— 见 **[PORTING.md](./PORTING.md)**
+2. **UI 层**（移植自 `packages/ui` 的 shadcn 风格原语，**47 / 47**）—— 见 **[PORTING-UI.md](./PORTING-UI.md)**
+3. **可运行的应用**（`crates/zcode-app`）—— 用移植出的原语拼出的 ZCode 风格桌面外壳
 
-ZCode 是 AI 编程工作台，提供桌面应用、浏览器界面和终端 Agent。本仓库包含客户端、后端服务、共享 UI，以及 Agent CLI 与运行时源码。
+目标是：把项目的核心逻辑与 UI 用 Rust 重写，并保证 **可编译、可测试、能跑起来**。
 
-## 更新
-
-- 2026-10-10：更新至 ZCode v3.15.1 版本。
-- 2026-9-23：更新至 ZCode v3.14.3 版本。
-
-## 初始化
-
-准备 Git、Node.js **24.14.0** 和 pnpm **10.33.2**，版本以 [mise.toml](mise.toml) 为准。以下开发和打包命令均在仓库根目录执行。
+## 快速开始
 
 ```bash
-pnpm bootstrap
+cargo build                          # 编译整个工作区
+cargo test                           # 运行全部测试（871 个）
+cargo run -p zcode-app               # 开一个 1360×860 的桌面窗口
+cargo build --release
+
+# UI 预览（生成一份可直接在浏览器打开的 HTML）
+cargo run -p zcode-ui --example preview       # → ./preview.html      （原语清单）
+cargo run -p zcode-app --example app_preview  # → ./app-preview.html  （应用整屏静态快照）
 ```
 
-`pnpm bootstrap` 安装 workspace 依赖、准备桌面本地运行资源，再执行 `build:bootstrap`。
+> `zcode-rpc` / `zcode-shared` **零外部依赖**（只用 `std`），离线也能编译。
+> `zcode-ui` 依赖 Dioxus，但默认关掉了所有渲染器 feature，因此同样离线可编译、
+> 可测试（`cargo test` 首次需联网拉取 dev-dependency `dioxus-ssr`）。
+> `zcode-app` 默认走 `dioxus/desktop`（wry + tao 原生窗口），不需要 wasm 工具链。
+> 开窗依赖系统已安装 **WebView2 Runtime**（Windows 10/11 通常自带）。
+>
+> ⚠️ 已知环境问题：在 WebView2 Runtime **154.0.4258.62** 上，dioxus-desktop 0.6.3
+> 自带的 wry 0.45 会在 `WebView::new` 处报 `WebView2Error(E_INVALIDARG)`，开不了窗。
+> 这与本仓库代码无关（一个只含 `div { "hello" }` 的最小 Dioxus 程序同样失败），
+> 编译与测试不受影响。详见「已知问题」一节。
 
-Agent CLI 与运行时源码位于 [apps/zcode-cli/](apps/zcode-cli/)，作为普通目录随本仓库一起克隆，无需单独拉取或初始化 Git submodule。
+## 工作区结构
 
-根据需要选择其他初始化或构建入口：
-
-| 命令                           | 用途                                                              |
-| ------------------------------ | ----------------------------------------------------------------- |
-| `pnpm install`                 | 安装依赖                                                          |
-| `pnpm prepare:desktop-runtime` | 准备桌面运行资源，默认包含远程资源准备                            |
-| `pnpm prepare:remote-assets`   | 单独准备远程运行资源                                              |
-| `pnpm bootstrap:with-remote`   | 初始化依赖、本地与远程资源，并串行构建相关包；跳过桌面应用 bundle |
-| `pnpm build`                   | 递归执行各 workspace 包的构建脚本，包括包内的资源准备步骤         |
-
-默认 `bootstrap` 跳过远程资源准备，适合本地桌面开发。使用远程工作区或验证远程发行资源时，再运行对应准备命令。
-
-## 开发与运行
-
-### 桌面版
-
-```bash
-pnpm dev:desktop
-
-# 使用测试环境
-pnpm dev:desktop:test
+```
+.                                   # 仓库根 = Cargo workspace 根
+├── Cargo.toml                      # workspace 根
+├── Cargo.lock
+├── LICENSE                         # Apache 2.0（沿用上游）
+├── PORTING.md                      # 逻辑层移植说明
+├── PORTING-UI.md                   # UI 层移植说明
+├── preview.html                    # 原语清单预览页（由 zcode-ui 的 example 生成）
+├── app-preview.html                # 应用整屏静态快照（由 zcode-app 的 example 生成，自包含）
+├── .tailwind-build/                # 生成 app.css（见 PORTING-UI.md §4.8）
+│   ├── build.sh                    #   拼装入口 CSS + 调 Tailwind CLI
+│   ├── tokens.css                  #   设计令牌（vendored 自上游 styles.css 的 @theme / .dark）
+│   └── package.json                #   只用 @tailwindcss/cli + tw-animate-css
+└── crates/
+    ├── zcode-rpc/                  # 核心：VS Code 风格 IPC/RPC 框架（完整移植）
+    │   └── src/
+    │       ├── foundation.rs            Layer 0  Event / Emitter / Disposable / CancellationToken
+    │       ├── buffer.rs                Layer 0.5 VSBuffer
+    │       ├── value.rs                 动态值 + JSON/Base64 编解码
+    │       ├── error.rs                 RpcError
+    │       ├── promise.rs               回调式 Promise（零依赖异步）
+    │       ├── serialization.rs         Layer 1  VQL 序列化
+    │       ├── protocol.rs              Layer 2  IMessagePassingProtocol / SocketProtocol / ChunkStream
+    │       ├── persistent_protocol.rs   Layer 2+ ACK / 心跳 / 重放 / 流控
+    │       ├── channels_shared.rs       Layer 3  通道契约
+    │       ├── channel_server.rs        Layer 3  ChannelServer
+    │       ├── channel_client.rs        Layer 3  ChannelClient
+    │       ├── delayed_channel.rs       Layer 3  延迟通道
+    │       ├── ipc.rs                   Layer 4  IPCServer / IPCClient / StaticRouter
+    │       ├── proxy_channel.rs         Layer 5  ProxyChannel
+    │       ├── remote.rs                Layer 6  远程连接
+    │       ├── logging_middleware.rs    中间件：RPC 日志
+    │       └── network_telemetry_middleware.rs  中间件：网络遥测
+    ├── zcode-shared/               # 共享核心逻辑（部分移植）
+    │   └── src/
+    │       ├── line_change_stat.rs       行级 LCS 变更统计
+    │       ├── model_provider_family.rs  模型供应商族归一 / 可见性
+    │       └── plan_identity.rs          套餐身份解析
+    ├── zcode-ui/                   # UI 原语组件库（Rust + Dioxus 移植自 packages/ui）
+    │   ├── src/
+    │   │   ├── cn.rs                     类名合并（clsx + tailwind-merge 子集）
+    │   │   ├── icons.rs                  内联 lucide 图标（零图标库依赖）
+    │   │   ├── code_preview_preferences.rs  代码预览主题白名单
+    │   │   ├── keyboard_shortcuts.rs     快捷键平台判定（mac / 非 mac）
+    │   │   ├── presentation_element_model.rs  PPTX 元素命中测试模型
+    │   │   ├── patch_diff_preview.rs     diff 预览的纯数据层
+    │   │   ├── shiki_highlighter.rs      shiki 的 trait 抽象
+    │   │   ├── pdf_js_assets.rs          pdf.js 资源路径解析
+    │   │   ├── pdf_zoom_overlay.rs       缩放浮层的双缓冲状态
+    │   │   ├── diffs_highlighter_engine.rs  高亮引擎的纯决策层
+    │   │   └── components/               47 个 shadcn 风格原语 + overlay.rs 定位约定
+    │   │       ├── 基础     button  badge  card  alert  input  textarea  label
+    │   │       │            separator  progress  kbd  spinner  avatar  switch  checkbox  tabs
+    │   │       ├── 折叠类   collapsible  accordion
+    │   │       ├── 组合型   radio_group  button_group  input_group  scroll_area
+    │   │       ├── 浮层类   tooltip  hover_card  popover  dialog  alert_dialog  dropdown_menu
+    │   │       ├── 展示/动画 brand  glm_icon  scroll_fade_viewport  toast  select  command
+    │   │       │            context_menu  resizable  floating_particles
+    │   │       │            smooth_metric_value  flip_metric_value
+    │   │       └── 重型预览 carousel  chart  code_viewer  diff_viewer  pdf_viewer
+    │   │                    pptx_preview_viewer  lightweight_diff_preview
+    │   │                    highlighted_lightweight_diff_preview  pptx_selection_action_bar
+    │   ├── tests/
+    │   │   ├── render.rs                 mutation 记录式渲染测试（11）
+    │   │   └── html_snapshot.rs          dioxus-ssr HTML 快照测试（75）
+    │   └── examples/preview.rs           预览页生成器
+    └── zcode-app/                  # 可运行的桌面应用（用上面两个 crate 拼出来）
+        ├── assets/app.css                由 .tailwind-build/build.sh 生成（116,737 字节）
+        ├── src/
+        │   ├── lib.rs                    App / AppShell，内嵌样式表
+        │   ├── main.rs                   桌面入口（LaunchBuilder::desktop）
+        │   ├── state.rs                  AppState / AppCtx / demo_state
+        │   └── views/                    sidebar / topbar / conversation / composer
+        │                                 detail / settings / gallery
+        ├── examples/app_preview.rs       整屏静态快照生成器（自包含 HTML）
+        └── tests/smoke.rs                整树冒烟测试（17）
 ```
 
-`pnpm dev:desktop` 默认等同于 `pnpm dev:desktop:prod`，使用生产服务配置。启动脚本会准备本地运行资源、构建桌面 Agent，再启动 Electron 和源码监听。
+## 设计要点（逻辑层）
 
-需要独立开发数据目录时，可设置 `ZCODE_DATA_BASE_DIR`。例如在 macOS / Linux 中：
+| 主题 | TypeScript 原实现 | Rust 移植 |
+| --- | --- | --- |
+| 事件系统 | `Event<T>` = 回调函数 | `Event<T>` 结构体（`Arc<dyn Fn>` 订阅） |
+| 异步结果 | 原生 `Promise` | 零依赖回调式 `Promise<T>`（`Mutex` + `Condvar`） |
+| 动态载荷 | `any` | `Value` 枚举（含 JSON / Base64 编解码） |
+| 定时器 | `setTimeout` / `setInterval` | `std::thread` + `sleep` + 停止标志 |
+| 传输 | 接口 | `MessagePassingProtocol` trait；`create_queue_pair` 供测试 |
+| 上下文 | 泛型 `TContext` | 统一用 `Value` 承载（本身可序列化） |
 
-```bash
-ZCODE_DATA_BASE_DIR="$HOME/.zcode-dev-home" pnpm dev:desktop:test
+## 设计要点（UI 层）
+
+| React 生态 | Rust / Dioxus 等价物 |
+| --- | --- |
+| JSX | RSX（`rsx! { ... }`） |
+| 函数组件 / `useState` | `#[component] fn` / `use_signal` |
+| `useContext` / `Provider` | `use_context` / `use_context_provider` |
+| `cva`（class-variance-authority） | 枚举 + `classes()` |
+| `clsx` + `tailwind-merge` | `cn()` / `cn_opt()` |
+| Radix `data-state` / `data-orientation` | 手写同名属性（保住 `@custom-variant` 语义） |
+| Radix `Portal` + `@floating-ui` | 锚点包裹层 + `absolute` 类名（见 `components/overlay.rs`） |
+| lucide-react | `icons.rs` 内联 SVG（零依赖） |
+
+## 测试
+
+```
+cargo test                 # 工作区 871 个测试
+cargo test -p zcode-ui     # UI 层 828 个测试
+cargo test -p zcode-app    # 应用层 19 个测试
 ```
 
-### 远程功能（SSH/WSL）
+| crate | 单元 | 集成 | 小计 |
+| --- | --- | --- | --- |
+| `zcode-rpc` | 10 | — | 10 |
+| `zcode-shared` | 14 | — | 14 |
+| `zcode-ui` | 742 | 75 + 11 | 828 |
+| `zcode-app` | 2 | 17 | 19 |
+| **合计** | **768** | **103** | **871** |
 
-先执行 `pnpm bootstrap:with-remote` 准备远程资源（mock-cdn），再 `pnpm dev:desktop`；连接远程项目时资源选择「本地下载后上传」。开发态资源取自本地 `packages/desktop/mock-cdn` 和本地构建产物，经 SFTP 上传到远程，不访问 CDN。
+- **逻辑层**：VQL 序列化往返、嵌套 `Uint8Array` 的 JSON 回退、Base64、
+  事件缓冲、基于内存队列（`create_queue_pair`）的端到端 RPC 调用 / 事件订阅。
+- **UI 层**：类名 / 几何 / 键盘 / 格式化的纯函数断言（742）、mutation 记录式
+  渲染（11）、`dioxus-ssr` HTML 快照（75）—— 全部不需要 wasm / 窗口 / 浏览器。
+- **应用层**：整棵应用树（含三个浮层）真渲染一遍，断言区域文案、
+  `data-slot` 锚点、`data-*` 语义属性、浮层默认关闭、内嵌样式表覆盖到了
+  所需的 `@custom-variant` 与设计令牌。
 
-### Web 开发
+> 「能正常运行」的判定方法（进程存活 / `MainWindowHandle` 非零 /
+> `MainWindowTitle` 与 `WindowBuilder` 一致 / `Responding=True`）见
+> [PORTING-UI.md](./PORTING-UI.md) §5.5。
 
-修改 Web 或后端源码时，使用开发模式：
+## 已知问题
 
-```bash
-pnpm dev:web
+### WebView2 Runtime 154 上开不了窗（环境问题，与本仓库代码无关）
 
-# 指定后端工作区（macOS / Linux）
-ZCODE_SERVER_WORKSPACE=/path/to/project pnpm dev:web
+在 WebView2 Runtime `154.0.4258.62` 上运行 `cargo run -p zcode-app`，会在
+wry 建 WebView 时 panic：
+
+```
+thread 'main' panicked at dioxus-desktop-0.6.3/src/webview.rs:400:39:
+called `Result::unwrap()` on an `Err` value:
+  WebView2Error(WindowsError(Error { code: HRESULT(0x80070057), message: "参数错误。" }))
 ```
 
-该命令同时启动 Web 开发服务器（默认 `http://localhost:5173`）和后端（默认 `http://localhost:3030`）；浏览器访问前者。`/ws` 和一般 `/api` 请求代理到本地后端，`/api/v1/oauth/token` 单独代理到当前配置的产品服务。
+**已排除的原因**（都实测过）：
 
-Agent 源码修改后，执行 `pnpm --filter @zcode/cli... build` 并重启服务。需要验证完整发行包时，按下方“ZCode 命令行版”打包章节解压运行。
+| 假设 | 结果 |
+| --- | --- |
+| 沙箱限制 GUI 创建 | 非沙箱下同样失败 |
+| 本仓库改动引入 | **一个只含 `div { "hello" }` 的最小 Dioxus 程序同样失败** |
+| WebView2 Runtime 缺失 | 已安装 `154.0.4258.62`，且系统上有 32 个进程正在使用它 |
+| 用户数据目录无效 | 显式 `with_data_directory(临时目录)` 同样失败 |
+| `tao` 开不了窗口 | 调用栈显示 `tao` 事件循环正常，失败点在 `wry::WebView::new` |
 
-### ZCode 命令行版
+**结论**：是 dioxus-desktop 0.6.3 自带的 **wry 0.45.0** 与较新 WebView2 Runtime
+之间的兼容性问题。`wry` 0.53.5 / 0.54.2 的对应代码与 0.45 逐字相同，
+所以不能确认新版已修复。
 
-命令行发行包包含 TUI、Web 和 Agent，统一使用 `zcode` 启动：无参数进入 TUI；第一个参数为 `--web` 时启动 Web；其他参数交给现有 Agent CLI 处理。两种模式都在本机运行，无需 Electron。
+**影响范围**：只影响「开原生窗口」这一步。`cargo build` / `cargo test` 全部不受影响，
+**871 个测试照常全绿**。
 
-```bash
-# 默认进入终端交互界面
-zcode
-
-# 启动 Web 界面
-zcode --web
-
-# 指定项目和端口，不自动打开浏览器
-zcode --web --workspace /path/to/project --port 3030 --no-open
-
-# 查看 CLI 或 Web 参数
-zcode --help
-zcode --web --help
-```
-
-Web 模式默认工作目录为当前目录，监听 `127.0.0.1`，默认不启用访问令牌，自动选择空闲端口并打开浏览器。访问终端输出的地址，按 `Ctrl+C` 停止服务。局域网访问可使用 `--host 0.0.0.0`；监听非本机地址时默认生成访问令牌，使用终端输出的带令牌链接。可通过 `--token` 指定令牌或 `--no-token` 关闭令牌认证。
-
-直接启动通用 Web 服务的 HTTP 入口时，通过 `ZCODE_SERVER_AUTH_TOKEN` 配置 API／WebSocket 认证；通过程序接口创建服务时，使用 `authToken` 选项。
-
-构建方式见下方打包章节。`pnpm build:zcode` 只生成发行包，不会替换 `PATH` 中已有的 `zcode`。如果命令仍指向旧安装或其他源码目录，macOS / Linux 可用 `command -v zcode` 检查，Windows 可用 `where.exe zcode` 检查。
-
-### CLI 源码开发
-
-直接开发 TUI 或 Agent 时，运行源码入口：
-
-```bash
-pnpm --filter @zcode/cli dev --help
-pnpm --filter @zcode/cli dev
-
-# 构建 CLI 及其 workspace 依赖
-pnpm --filter @zcode/cli... build
-node apps/zcode-cli/packages/cli/dist/zcode.cjs --help
-```
-
-这个入口直接运行 Agent CLI，不经过发行包的 `--web` 分流。开发 Web 用 `pnpm dev:web`；验证统一的 `zcode` 命令，用下方解压后的 `bin/zcode.mjs`。
-
-### UI Plugin 开发
-
-参见 [UI Plugin：能力、API 与调试](UI_PLUGIN.md)，从 Excalidraw 的画布协作示例开始，了解插件安装更新、页面 API 和宿主联调入口。
-
-**向 `zcode-plugins` 提交插件 PR 时，必须在 PR 模板中声明是否为 UI Plugin，并填写插件名称。** 判断标准见[提交 PR 时声明插件类型](UI_PLUGIN.md#提交-pr-时声明插件类型)。
-
-## 配置
-
-根目录 [.env.example](.env.example) 提供服务地址与构建配置示例，可按需复制到 `.env`，本地覆盖放入 `.env.local`。Desktop 的开发环境通过 `dev:desktop:test` / `dev:desktop:prod` 选择。
-
-| 配置                                 | 用途                                             |
-| ------------------------------------ | ------------------------------------------------ |
-| `ZCODE_DATA_BASE_DIR`                | 应用数据基目录，数据写入其下的 `.zcode/`         |
-| `ZCODE_SERVER_WORKSPACE`             | Web 后端的工作区路径                             |
-| `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` | 本地 Provider 配置文件路径；未设置时使用内置配置 |
-| `ZCODE_DIST_BASE_URL`                | 命令行安装脚本使用的下载根地址                   |
-
-运行时变量可在启动命令的环境中显式设置。随客户端发布的默认配置见 [config/README.md](config/README.md)。
-
-## 打包
-
-第三方声明生成、发行校验流程及声明在发行物中的位置见 [third-party/README.md](third-party/README.md)。
-
-### 桌面版
-
-```bash
-pnpm bundle:desktop
-
-# 指定目标平台与 CPU 架构
-pnpm bundle:desktop -- --os win --arch x64
-
-pnpm bundle:desktop -- --help
-```
-
-默认目标为 macOS arm64，默认输出目录为 `packages/desktop/dist/`。`--os` 支持 `mac`、`win`、`linux`，`--arch` 支持 `x64`、`arm64`；实际打包与签名需要目标平台对应的工具和配置。
-
-安装：双击打开产物 DMG，将 ZCode 拖入"应用程序"。本地构建未签名，首次打开若被 macOS 拦截，执行：
-
-```bash
-sudo xattr -rd com.apple.quarantine /Applications/ZCode.app
-```
-
-### ZCode 命令行版
-
-构建入口为 `pnpm build:zcode`。脚本会依次构建 CLI/TUI、后端和 Web，收集 TUI 的原生库、worker 与运行时依赖，再组装发行包；运行发行包仍需要 Node.js，版本以 `mise.toml` 为准。
-
-打包前必须设置下载根地址 `ZCODE_DIST_BASE_URL`（可放在 `.env`、`.env.local` 或环境变量中），也可以通过 `--base-url` 传入。以下地址是占位示例，发布时替换为实际托管地址：
-
-```bash
-pnpm build:zcode --base-url https://downloads.example.com/zcode/
-
-# 已配置 ZCODE_DIST_BASE_URL 时
-pnpm build:zcode
-
-# 仅重新组包，复用已有的 Agent、后端和 Web 构建产物
-pnpm build:zcode --skip-build
-
-# 查看版本、输出目录等可选参数
-pnpm build:zcode --help
-```
-
-默认版本取根目录 `package.json`，输出目录为 `dist/zcode/`：
-
-- `releases/<version>/zcode-<version>.tar.gz`：运行包。
-- `releases/<version>/sha256.txt`：校验摘要。
-- `latest.json`、`install.sh`：版本索引和安装脚本。
-
-完整目录可上传到配置的下载根地址。安装脚本从该地址下载运行包，默认安装到 `~/.zcode/runtime`，并在 `~/.local/bin` 创建 `zcode` 命令。安装目录可通过 `ZCODE_DIST_HOME` 修改，命令目录可通过 `ZCODE_DIST_BIN_DIR` 修改。
-
-旧 Lite 用户需要改用上述构建命令、环境变量和新的安装脚本。新安装不会删除旧 Lite 目录，也不会迁移或删除已有会话数据。
-
-本地调试打包产物时，可直接解压运行，无需上传或安装：
-
-```bash
-zcode_version=$(node -p "require('./dist/zcode/latest.json').version")
-mkdir -p dist/zcode/debug
-tar -xzf "dist/zcode/releases/$zcode_version/zcode-$zcode_version.tar.gz" \
-  -C dist/zcode/debug
-# 默认启动 TUI
-node dist/zcode/debug/zcode/bin/zcode.mjs
-
-# 启动 Web
-node dist/zcode/debug/zcode/bin/zcode.mjs --web \
-  --workspace "$PWD" --port 3030 --no-open
-```
-
-浏览器打开 `http://127.0.0.1:3030`，即可验证同一后端服务托管 Web 页面和 Agent 的完整链路。该端口需要空闲；如正在运行 `pnpm dev:web`，可改用其他 `--port`。
-
-## 仓库结构
-
-| 目录                                                 | 职责                                       |
-| ---------------------------------------------------- | ------------------------------------------ |
-| `packages/desktop`                                   | Electron Main、Host、Renderer 与桌面打包   |
-| `packages/web`                                       | Web 客户端                                 |
-| `packages/server`                                    | HTTP / WebSocket 服务与远程连接            |
-| `packages/zcode-server-cli`                          | 独立 Server 启动与进程管理                 |
-| `packages/ui`                                        | 共享 React 组件、hooks 与 Zustand 状态     |
-| `packages/services`                                  | 业务服务与持久化                           |
-| `packages/shared`、`packages/rpc`、`packages/client` | 共享协议和类型、RPC 框架、Agent 客户端 SDK |
-| `packages/provider`、`packages/provider-node`        | Provider 公共能力与 Node 实现              |
-| `apps/zcode-cli`                                     | Agent CLI、TUI、运行时与工具               |
-| `scripts`、`config`、`third-party`                   | 构建维护脚本、内置配置与第三方声明材料     |
-
-## 项目声明
-
-功能与优惠范围、维护规则、执行与数据风险，以及许可和第三方版权说明，详见 [NOTICE.md](NOTICE.md)。
+**后续可尝试**：升级 dioxus 到 0.7（换用更新的 wry）；或在另一台
+WebView2 版本较旧的机器上验证；或用 `--features web` 走浏览器渲染器
+（需要 `wasm32-unknown-unknown` target）。

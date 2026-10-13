@@ -1,2 +1,0 @@
-phase unphased
-participant unphased:actor#1 "r" steps=ask#1

@@ -1,3 +1,0 @@
-actor-node workspace
-actor-node actor#1 "logger" @4:16
-actor-edge workspace -> actor#1 exact count=1 types="string[]"
