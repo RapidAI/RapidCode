@@ -22,15 +22,17 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
 use zcode_services::git::changes::{get_workspace_changes, summarize_changes, GitChangeSummary};
 use zcode_services::git::repo::GitCliRepo;
+use zcode_services::git::types::GitDiffQuery;
 use zcode_shared::git::{
-    GitChangeKind, GitChangeSectionId, GitFileChange, GitHeadRefType, GitRepositorySummary,
+    GitChangeKind, GitChangeSectionId, GitDiffResult, GitFileChange, GitHeadRefType,
+    GitRepositorySummary,
 };
 
 /// 一次扫描的结果。
@@ -124,6 +126,69 @@ pub enum WorkspaceMessage {
     Failed(String),
     /// 写操作的即时反馈（成功或失败）。
     Notice(WorkspaceNotice),
+    /// 单文件 diff 的结果。
+    Diff(Box<DiffPreview>),
+}
+
+/// 单文件 diff 的加载状态。
+///
+/// 一个信号同时承载「哪一行被展开」和「展开后显示什么」—— 行的 key 就是
+/// [`DiffPreviewState::path`]，因此不需要额外维护一个「当前展开项」状态，
+/// 也就不可能出现两者不同步。
+///
+/// `id` 用于丢弃过期结果：用户快速点了 A 又点 B 时，A 的 diff 可能后到，
+/// 必须按 id 丢掉，否则会把 B 的内容覆盖成 A 的。
+#[derive(Clone, Debug, PartialEq)]
+pub enum DiffPreviewState {
+    Loading {
+        id: u64,
+        path: String,
+    },
+    Ready {
+        id: u64,
+        path: String,
+        diff: Box<GitDiffResult>,
+    },
+    /// 读 diff 本身失败了（git 跑不起来等）。注意这与
+    /// [`GitDiffResult`] 的 `Unavailable` 不同：后者是「git 正常跑完但没有 diff」，
+    /// 属于正常状态，仍然走 `Ready`。
+    Failed {
+        id: u64,
+        path: String,
+        message: String,
+    },
+}
+
+impl DiffPreviewState {
+    pub fn id(&self) -> u64 {
+        match self {
+            DiffPreviewState::Loading { id, .. }
+            | DiffPreviewState::Ready { id, .. }
+            | DiffPreviewState::Failed { id, .. } => *id,
+        }
+    }
+
+    pub fn path(&self) -> &str {
+        match self {
+            DiffPreviewState::Loading { path, .. }
+            | DiffPreviewState::Ready { path, .. }
+            | DiffPreviewState::Failed { path, .. } => path,
+        }
+    }
+
+    /// 这一行的 diff 面板是否应当展开。
+    pub fn is_open_for(&self, path: &str) -> bool {
+        self.path() == path
+    }
+}
+
+/// worker 回传的一次 diff 加载结果。
+#[derive(Debug)]
+pub struct DiffPreview {
+    pub id: u64,
+    pub path: String,
+    /// `Err` 是「命令没跑起来」；`Ok(Unavailable)` 是「跑起来了但没有 diff」。
+    pub outcome: Result<Box<GitDiffResult>, String>,
 }
 
 /// 上一次写操作的结果，用于给用户即时反馈。
@@ -207,6 +272,8 @@ pub struct WorkspaceRequester {
     repo: Arc<GitCliRepo>,
     sender: UnboundedSender<WorkspaceMessage>,
     busy: Arc<AtomicBool>,
+    /// diff 请求的单调递增序号；只用于丢弃过期结果。
+    diff_seq: Arc<AtomicU64>,
 }
 
 impl WorkspaceRequester {
@@ -225,6 +292,48 @@ impl WorkspaceRequester {
     /// 会争 `index.lock`，失败信息还很难懂。
     pub fn run(&self, workspace: PathBuf, action: WorkspaceAction) -> bool {
         self.dispatch(workspace, Some(action))
+    }
+
+    /// 加载一个文件的 diff；返回本次请求的 id（调用方拿它构造
+    /// [`DiffPreviewState`]）。
+    ///
+    /// **刻意不走 `busy` 标志**：读 diff 既不改仓库、也不碰 `index.lock`，
+    /// 没有任何理由让它和「刷新 / 提交」互相阻塞 —— 那只会让用户点开文件时
+    /// 发现整个界面被锁住。
+    ///
+    /// 代价是可能有两个 diff 同时在跑，所以结果必须带 id 回来，由调用方
+    /// 按 id 丢弃过期的那一份。
+    pub fn load_diff(&self, workspace: PathBuf, query: GitDiffQuery, path: String) -> u64 {
+        let id = self.diff_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let repo = Arc::clone(&self.repo);
+        let sender = self.sender.clone();
+
+        let spawned = std::thread::Builder::new()
+            .name("zcode-workspace-diff".to_string())
+            .spawn(move || {
+                let outcome = repo
+                    .get_diff(&workspace, &query)
+                    .map(Box::new)
+                    .map_err(|failure| failure.message);
+                let _ = sender.unbounded_send(WorkspaceMessage::Diff(Box::new(DiffPreview {
+                    id,
+                    path,
+                    outcome,
+                })));
+            });
+
+        if let Err(error) = spawned {
+            // 线程起不来时也必须回一条消息，否则界面会永远停在「加载中」。
+            let _ = self.sender.unbounded_send(WorkspaceMessage::Diff(Box::new(
+                DiffPreview {
+                    id,
+                    path: format!("<线程启动失败 #{id}>"),
+                    outcome: Err(format!("无法启动 diff 线程：{error}")),
+                },
+            )));
+        }
+
+        id
     }
 
     /// `refresh` 与 `run` 的公共部分。
@@ -302,6 +411,7 @@ pub fn create_workspace_channel() -> WorkspaceChannel {
             repo: Arc::new(GitCliRepo::new()),
             sender,
             busy: Arc::new(AtomicBool::new(false)),
+            diff_seq: Arc::new(AtomicU64::new(0)),
         },
         receiver: Rc::new(RefCell::new(Some(receiver))),
     }
@@ -458,11 +568,37 @@ pub fn display_path(change: &GitFileChange) -> &str {
     }
 }
 
+/// 从一条变更推出该查哪种 diff。
+///
+/// 分组 → 来源的映射与服务层 [`GitChangeSourceId`] 的语义一一对应：
+/// 已暂存走 `--cached`，分支差异走 `merge-base`，其余（含未跟踪、冲突）
+/// 都走「工作区 vs 索引」。
+pub fn diff_query_for(change: &GitFileChange) -> GitDiffQuery {
+    let path = display_path(change).to_string();
+    match change.section {
+        GitChangeSectionId::Staged => GitDiffQuery::staged(path),
+        GitChangeSectionId::Branch => GitDiffQuery::branch(path),
+        _ => GitDiffQuery::unstaged(path),
+    }
+}
+
+/// 把一段 unified diff 原文切成逐行，供 `LightweightDiffPreview` 渲染。
+///
+/// 结尾的换行不产生一个空行 —— 否则每份 diff 末尾都会多出一行空白。
+pub fn split_patch_lines(patch: &str) -> Vec<String> {
+    let normalized = patch.replace("\r\n", "\n");
+    let mut lines: Vec<String> = normalized.split('\n').map(str::to_string).collect();
+    if lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use zcode_services::git::types::GitResolvedRepository;
-    use zcode_shared::git::GitRepositoryAutoRefreshWatchPath;
+    use zcode_shared::git::{GitChangeSourceId, GitRepositoryAutoRefreshWatchPath};
 
     fn summary(branch: Option<&str>, head: GitHeadRefType, ahead: u32, behind: u32) -> GitRepositorySummary {
         GitRepositorySummary {
@@ -756,6 +892,7 @@ mod tests {
             repo: Arc::new(GitCliRepo::new()),
             sender,
             busy: Arc::new(AtomicBool::new(true)),
+            diff_seq: Arc::new(AtomicU64::new(0)),
         };
 
         assert!(
@@ -778,5 +915,149 @@ mod tests {
             }
             other => panic!("期望收到 Notice，实际：{other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // diff 预览
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn diff_query_maps_sections_to_the_right_source() {
+        let staged = change("a.rs", GitChangeSectionId::Staged);
+        assert_eq!(diff_query_for(&staged).source_id, Some(GitChangeSourceId::Staged));
+        assert_eq!(diff_query_for(&staged).staged, Some(true));
+
+        let untracked = change("b.rs", GitChangeSectionId::Untracked);
+        assert_eq!(diff_query_for(&untracked).source_id, None);
+        assert_eq!(diff_query_for(&untracked).staged, None);
+
+        let mut branch = change("c.rs", GitChangeSectionId::Branch);
+        branch.section = GitChangeSectionId::Branch;
+        assert_eq!(
+            diff_query_for(&branch).source_id,
+            Some(GitChangeSourceId::Branch)
+        );
+
+        // 冲突与「本轮改动」都按未暂存处理
+        let conflicted = change("d.rs", GitChangeSectionId::Conflicted);
+        assert_eq!(diff_query_for(&conflicted).source_id, None);
+    }
+
+    #[test]
+    fn diff_query_uses_the_workspace_relative_path() {
+        // 服务层以 workspace 为基准解析相对路径，所以这里必须传 workspace 那条。
+        let mut staged = change("a.rs", GitChangeSectionId::Staged);
+        staged.workspace_relative_path = "sub/a.rs".into();
+        assert_eq!(diff_query_for(&staged).path, "sub/a.rs");
+    }
+
+    #[test]
+    fn split_patch_lines_drops_the_trailing_blank_line() {
+        let lines = split_patch_lines("--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new\n");
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0], "--- a");
+        assert_eq!(lines[4], "+new");
+
+        // 没有结尾换行时不该多切出一行
+        assert_eq!(split_patch_lines("only").len(), 1);
+        // 空 patch 就是 0 行（`"".split('\n')` 会给出一个空串，必须被吃掉）
+        assert!(split_patch_lines("").is_empty());
+    }
+
+    #[test]
+    fn split_patch_lines_normalises_crlf() {
+        assert_eq!(split_patch_lines("a\r\nb\r\n"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn diff_preview_state_identity_and_open_check() {
+        let loading = DiffPreviewState::Loading {
+            id: 7,
+            path: "a.rs".into(),
+        };
+        assert_eq!(loading.id(), 7);
+        assert_eq!(loading.path(), "a.rs");
+        assert!(loading.is_open_for("a.rs"));
+        assert!(!loading.is_open_for("b.rs"));
+    }
+
+    #[test]
+    fn load_diff_returns_a_monotonic_id() {
+        let channel = create_workspace_channel();
+        let requester = channel.requester();
+        // 接收端丢掉也无所谓，我们只关心 id 单调递增。
+        drop(channel.take_receiver());
+
+        let first = requester.load_diff(
+            PathBuf::from("."),
+            GitDiffQuery::unstaged("a.rs"),
+            "a.rs".into(),
+        );
+        let second = requester.load_diff(
+            PathBuf::from("."),
+            GitDiffQuery::unstaged("b.rs"),
+            "b.rs".into(),
+        );
+        assert!(second > first, "id 必须单调递增：{first} → {second}");
+        assert!(first > 0);
+    }
+
+    #[test]
+    fn a_busy_requester_still_loads_diffs() {
+        // 读 diff **刻意不共用** `busy` 标志：写操作/刷新在跑时点开一个文件，
+        // 仍然要能出内容 —— 否则用户会以为界面卡住了。
+        let (sender, mut receiver) = futures_channel::mpsc::unbounded();
+        let requester = WorkspaceRequester {
+            repo: Arc::new(GitCliRepo::new()),
+            sender,
+            busy: Arc::new(AtomicBool::new(true)),
+            diff_seq: Arc::new(AtomicU64::new(0)),
+        };
+
+        let id = requester.load_diff(
+            PathBuf::from("."),
+            GitDiffQuery::unstaged("a.rs"),
+            "a.rs".into(),
+        );
+        assert!(id > 0, "busy 状态下也应当被接受");
+
+        // 不管 `.` 是不是仓库，worker 都必须回一条消息（成功或失败），
+        // 否则界面会永远停在「正在读取 diff」。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match receiver.try_recv() {
+                Ok(WorkspaceMessage::Diff(preview)) => {
+                    assert_eq!(preview.id, id);
+                    break;
+                }
+                Ok(other) => panic!("只应当收到 Diff，实际：{other:?}"),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("等 diff 结果超时：{error:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_stale_diff_result_can_be_told_apart_by_id() {
+        // 界面的丢弃规则：只有 id 与当前状态一致的结果才采纳。
+        let current = DiffPreviewState::Loading {
+            id: 2,
+            path: "b.rs".into(),
+        };
+        let stale = DiffPreview {
+            id: 1,
+            path: "a.rs".into(),
+            outcome: Ok(Box::new(GitDiffResult {
+                path: "a.rs".into(),
+                availability: zcode_shared::git::GitDiffAvailability::Unavailable,
+                patch: None,
+                before_content: None,
+                after_content: None,
+                summary: None,
+            })),
+        };
+        assert_ne!(current.id(), stale.id, "过期结果必须与当前请求区分开");
     }
 }

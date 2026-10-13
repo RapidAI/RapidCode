@@ -9,7 +9,7 @@
 
 use dioxus::prelude::*;
 
-use crate::workspace::{WorkspaceData, WorkspaceNotice, WorkspaceStatus};
+use crate::workspace::{DiffPreviewState, WorkspaceData, WorkspaceNotice, WorkspaceStatus};
 
 /// 会话列表里的一条会话。
 #[derive(Clone, PartialEq, Debug)]
@@ -257,6 +257,12 @@ pub struct AppCtx {
     /// 这个说的是「刚才那个动作成没成」。写操作失败时界面上的数据依然有效，
     /// 不该被一个整屏错误面板盖掉。
     pub workspace_notice: Signal<Option<WorkspaceNotice>>,
+    /// 当前展开的那一条变更的 diff 预览。
+    ///
+    /// 一个信号同时表示「哪一行开着」和「开着的那行显示什么」（见
+    /// [`crate::workspace::DiffPreviewState`]），因此不可能出现「展开了 A
+    /// 却显示着 B 的内容」这种不同步。
+    pub diff_preview: Signal<Option<DiffPreviewState>>,
 }
 
 impl AppCtx {

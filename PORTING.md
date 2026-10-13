@@ -37,7 +37,7 @@
 > 并为 UI 层选定 Rust 等价框架（Dioxus）从原语组件开始迁移，  
 > 最后从 `packages/services` 里挑自包含的链路接上真实 IO。**
 
-产出保证：`cargo build` 与 `cargo test` 全部通过（零警告、1028 个测试全绿）。
+产出保证：`cargo build` 与 `cargo test` 全部通过（零警告、1116 个测试全绿）。
 
 ---
 
@@ -118,16 +118,28 @@ Rust 侧与 React 语义最贴近的等价框架是 **Dioxus 0.6**（RSX ≈ JSX
 | `providers/gitEnvironmentProvider.ts` | `git/config.rs`（`apply_git_command_env`） | ✅ 完整 |
 | `providers/gitCommandProvider.ts` | `git/provider.rs` | ✅ 语义等价（见下方差异） |
 | `repo/gitCliTypes.ts` | `git/types.rs` | ✅ 完整 |
-| `repo/gitCliHelpers.ts` | `git/cli_helpers.rs` | ✅ 完整（porcelain v2 / numstat 解析） |
-| `repo/gitCliRepo.ts` | `git/repo.rs` | ✅ 读路径（`resolve` / `getStatus` / `listLocalBranches`）+ 写路径（`stage` / `unstage` / `discard` / `commit` / `push`） |
+| `repo/gitCliHelpers.ts` | `git/cli_helpers.rs` | ✅ 完整（porcelain v2 / numstat 解析 + `git config --show-scope` 解析） |
+| `repo/gitCliRepo.ts`（`git log` 解析那一组纯函数） | `git/graph.rs` | ✅ 完整（提交图 / 装饰 ref 解析） |
+| `repo/gitCliRepo.ts`（diff 结果构造那一组纯函数） | `git/diff.rs` | ✅ 完整（可用性判定 / 二进制探测 / 未跟踪文件最小补丁） |
+| `repo/gitCliRepo.ts` | `git/repo.rs` | ✅ 读路径（`resolve` / `getStatus` / `listLocalBranches` / `getIdentity` / `getIgnoredPaths` / `getCommitGraph` / `getDiff`）+ 写路径（`stage` / `unstage` / `discard` / `commit` / `push`） |
 | `gitService.ts` 的 `getChanges` | `git/changes.rs` | ✅ 完整（按暂存区分组 + 汇总） |
 | `packages/shared/src/git.ts` | `crates/zcode-shared/src/git.rs` | ✅ 类型层完整 |
+
+> `graph.rs` / `diff.rs` 在上游**并不是独立文件** —— 它们是 `gitCliRepo.ts` /
+> `gitCliHelpers.ts` 里的模块级纯函数。拆出来只是因为「拼命令行」和
+> 「解析输出」是两件可分别验证的事：解析层不碰进程，就能用字符串直接喂进
+> 单测（`parse_git_graph_records` / `to_diff_result`），不必真起仓库。
+> 逻辑逐行对应，没有合并或改写。
 
 **有意未移植**（不是遗漏，是为了不让「已移植」这句话失真）：
 
 - `gitCommitMessageGenerator*` —— 依赖 LLM provider；
 - `gitCheckpoint*` —— 依赖检查点存储（另一个未移植的子系统）；
-- `commitMessageFileScope`、`getIgnoredPaths` / `getDiff` / `getCommitGraph` / `getIdentity`；
+- `commitMessageFileScope`；
+- `getBranchComparison` —— 分支比较的「提交列表 + 文件列表」聚合视图，
+  需要先有提交图之外的 merge-base 计算链路；
+- `reuseInFlightRequest` —— 上游用它把并发发起的同一个查询合并成一次。
+  本移植的读接口是**无状态**的，调用方自己决定要不要合并；
 - `commit` 的 **`stagedOnly` 部分提交变体** —— 上游靠临时 `GIT_INDEX_FILE`
   只提交索引里的内容；本移植的 `commit` 走的是「整索引 + 可选 pathspec」那条路，
   所以调用方**不要**期待这个能力。
@@ -167,6 +179,92 @@ Rust 侧与 React 语义最贴近的等价框架是 **Dioxus 0.6**（RSX ≈ JSX
 verbatim 前缀，它永远 `strip_prefix` 匹配不上普通路径，于是所有路径比较都会
 静默失败。`config.rs` 的 `canonicalize_best_effort` 负责剥掉前缀
 （`\\?\UNC\server\share` → `\\server\share`），**两边都必须走它**。
+
+### 2.6 读接口补全（`getIdentity` / `getIgnoredPaths` / `getCommitGraph` / `getDiff`）
+
+对应上游 `gitCliRepo.ts` 的同名方法。这一批的目的不只是「多几个查询」，
+而是让已经移植好的 `diff_viewer` / `lightweight_diff_preview` 原语**有真实数据可喂** ——
+「变更」页因此从「列出改了哪些文件」变成「点开就能看补丁」。
+
+**`getIdentity`** 读 `user.name` / `user.email`。两条容易踩的约定：
+
+1. `git config` 的退出码 **1 表示「这个 key 没配」，不是错误**。当成失败会
+   让「用户没设邮箱」这种完全正常的状态变成红色报错。
+2. 解析 `--show-scope` 输出时**只能剥掉行尾那一个换行**（`/\r?\n$/`），
+   不能 `trim()` —— 否则配置值两端的空格会被吃掉，而 git 允许值里有空格。
+   同理 `split('\t')` 之后要**把第 3 段之后重新拼回 `\t`**，因为值本身可能含制表符。
+
+**`getIgnoredPaths`** 走 `git check-ignore`。两处细节：
+
+- **`-z` 只和 `--stdin` 搭配时才有效**。本移植把路径放在 argv 上，
+  所以必须按**换行**解析输出（上游在这里踩过并修过）；
+- 输入里**不在仓库内的路径会被静默跳过**（等价于上游的 `try/catch → null`），
+  而不是让整次查询失败 —— 一个越界路径不该毁掉其余结果。
+
+**`getCommitGraph`** 走 `git log --format=%H%x00%P%x00%an%x00%at%x00%s%x00%D%x1e`。
+四条刻意的取舍：
+
+1. **绝不用 `--all`**。本仓库内部有 `refs/zcode/checkpoints` 这类隐藏 ref，
+   `--all` 会把检查点提交拉进提交图。上游用的是显式的
+   `HEAD --branches --tags --remotes`，照搬。
+2. **`%at` 按 JS `Number.parseInt` 语义解析**，而不是 Rust 的 `str::parse`。
+   `parseInt` 是**宽松**的：允许前导空白、允许尾部垃圾（`"12abc"` → `12`）、
+   遇到小数点就截断（`"12.9"` → `12`）。`parse_leading_i64` 逐字符复刻了这套行为。
+   解析不出来时是 `None`（**不是 0**）—— 0 会被界面渲染成 1970 年。
+3. **装饰 ref 的解析规则**（全部保留）：`HEAD -> refs/heads/main` 要产出
+   **两个** ref（`HEAD` 是 head，`main` 是 branch）；`tag: v1.0` 与
+   `tag: refs/tags/v1.0` 是同一个 tag；没有前缀时按「含 `/` ⇒ remote，
+   否则 branch」兜底。
+   上游是**先 trim 再匹配 `"tag: "`**，所以裸的 `"tag: "` 会变成 `"tag:"`、
+   匹配不上前缀、落进兜底分支变成名为 `tag:` 的 branch。这个怪行为**故意保留**，
+   并有测试把它钉住。
+4. **`has_more` 靠多取一条**：实际跑 `--max-count = 归一后的值 + 1`，
+   `has_more = 解析条数 > 归一后的值`，再 `.take(归一后的值)`。
+   `normalize_git_graph_max_count` 的语义是：`None` → 100，否则
+   **clamp 到 `[1, 200]`** —— 注意 `0` 和负数是被**抬到 1**，不是「不限量」。
+
+**`getDiff`** 是本批最需要小心的一条。核心是一个**顺序不能调换**的判定链：
+
+```
+超时 → 输出被截断 → 退出码 → stdout 为空 → 二进制 → 有补丁
+```
+
+前两项必须在看退出码之前定，因为它们的含义是「命令**没正常跑完**」——
+拿一个被杀掉的进程的退出码去判断「有没有改动」是没有意义的。
+
+其余约定：
+
+- **`is_binary_diff` 匹配 `"GIT binary patch"` 或 `"Binary files "`** ——
+  后面那个**尾随空格是模式的一部分**，少了它 `Binary files` 开头的普通文本
+  也会被误判；
+- **`--no-index` 用退出码 1 表示「两边有差异」**，这是正常结果，
+  所以 `allowed_exit_codes` 传 `[0, 1]`；
+- **未跟踪文件不走 `git diff --no-index`**，而是**手工拼一个最小 unified diff**
+  （`--- /dev/null` / `+++ b/<path>` / `@@ -0,0 +1,N @@`）。上游这么做是因为
+  `--no-index` 在 Windows 上会吐平台相关的头，而 `@pierre/diffs` 解析某些
+  `diff --git` 头会直接抛异常、把界面展开动作打崩。手工拼的那份输出
+  平台无关，且**二进制判定要排在大小截断之前** —— 否则一个巨大的二进制文件
+  会报「被截断」，而它其实是「不可预览」。
+- **两侧全文预览要么都给、要么都不给**（`to_complete_diff_contents`）。
+  如果只读成功一侧、另一侧回填 `""`，界面会把「读不出来」当成「空文件」，
+  于是整份文件被渲染成「全是新增/删除」。宁可整对降级。
+  同理 `with_diff_contents`：**补丁成功、全文预览失败时保留补丁** ——
+  预览只是喂给 MultiFileDiff 的，丢掉它不该连正确的补丁一起丢。
+- **`git show ":path"`（空 ref）读的是索引版本**，这正是暂存区 diff 的「后」侧；
+  而 `git show "<ref>:<path>"` **不能**用于 `--show-scope` / `--show-origin`
+  的输出（那是 `scope\tfile:<path>\tvalue` 格式），所以两者各走各的解析。
+
+应用层这一侧有一条与写路径**刻意相反**的约定：
+
+> **`load_diff` 不共用 `busy` 锁。** 读 diff 既不修改仓库、也不碰 `index.lock`，
+> 没有理由把它和刷新 / 写操作串起来 —— 那只会让「点开看一眼」也被排队。
+> 代价是**并发结果必须能分辨新旧**：每次请求带一个单调递增的 `id`，
+> 轮询端只采纳 id 等于当前请求的那条。用户快速点了 A 又点 B 时，
+> A 的结果可能后到，直接丢弃，否则会把 B 的内容盖成 A 的。
+
+界面状态也据此设计成**单个信号** `Option<DiffPreviewState>`，
+其中 `path` 就是行主键 —— 于是「A 行展开着、显示的却是 B 的内容」这种状态
+在结构上不可能出现。
 
 ---
 
@@ -263,7 +361,7 @@ while let Some(message) = next_workspace_message(receiver).await { … }
 
 ```bash
 cargo build                              # 编译整个工作区
-cargo test                               # 工作区 1028 个测试
+cargo test                               # 工作区 1116 个测试
 cargo run -p zcode-app                   # 桌面窗口（⚠️ 本机能开窗但内容空白，见 README「已知问题」）
 cargo run -p zcode-ui --example preview  # 生成 UI 预览页 ./preview.html
 cargo build --release
@@ -274,10 +372,10 @@ cargo build --release
 | crate | 单元测试 | 集成测试 | 覆盖内容 |
 | --- | ---: | ---: | --- |
 | `zcode-rpc` | 10 | — | 序列化 / 事件 / 端到端 RPC |
-| `zcode-shared` | 18 | — | 行级变更统计 / 供应商族 / 套餐身份 / git 类型 |
-| `zcode-services` | 91 | 20 | git 解析 / 路径归一纯函数、**真起临时仓库**的端到端（读 6 + 写 14） |
+| `zcode-shared` | 19 | — | 行级变更统计 / 供应商族 / 套餐身份 / git 类型（含提交图 ref、改动来源枚举） |
+| `zcode-services` | 144 | 37 | git 解析 / 路径归一 / 提交图 / diff 结果构造纯函数，**真起临时仓库**的端到端（读 17 + 写 20） |
 | `zcode-ui` | 742 | 75 + 11 | 类名 / 几何 / 键盘纯函数、渲染指令、HTML 快照 |
-| `zcode-app` | 25 | 30 + 6 | 应用外壳 + 整树冒烟（含写操作入口）+ 跨线程读 / 写链路 |
+| `zcode-app` | 33 | 36 + 9 | 应用外壳 + 整树冒烟（含写操作入口与 diff 预览四种状态）+ 跨线程读 / 写 / diff 链路 |
 
 逻辑层测试覆盖：
 
@@ -294,16 +392,39 @@ cargo build --release
 - `--porcelain=v2 -z` 解析：`MM` 条目同时产出两条变更、重命名记录吃掉
   下一条空记录、路径含空格、Windows 反斜杠归一、未跟踪目录记录；
 - `--numstat -z` 解析：二进制显示 `-` 时记 0、重命名取 `original_path`；
+- `git config --show-scope` 解析：三列拆解、**key 不存在（退出码 1）不算错**、
+  值内含制表符要拼回、列数不足时整行当值、**只剥行尾换行**（值两端空格要保留）、
+  CRLF 输出、空值保留 scope；
+- 提交图解析：装饰 ref 去重、`HEAD -> refs/heads/main` 产出两个 ref、
+  `tag: ` 前缀拆解、**裸 `"tag: "` 落进兜底分支**（复刻上游行为）、
+  记录之间的换行容错、时间戳解析不出来时是 `None` 而不是 0、
+  `parseInt` 宽松语义（前导空白 / 尾部垃圾 / 小数点截断）、
+  subject 里的逗号与空格不被吃掉；
+- diff 结果构造：判定链顺序（**超时优先于退出码** / 截断优先于退出码）、
+  二进制标记探测、**未跟踪文件二进制判定排在大小截断之前**、
+  未跟踪补丁标记缺失的结尾换行、`with_diff_contents` 在预览失败时
+  **保留补丁**；
 - 超时诊断信息：断言 `timed out after 15000ms` / `elapsed=` / `killAt=` /
   `cleanup=` / `forceKill=` / `orphaned=` 都出现在消息里；
-- **端到端**（`tests/git_workspace.rs`，真建临时仓库）：解析仓库根 / 子目录
-  作用域 / 本地分支列表（当前分支排最前）/ 普通目录不是错误 / 工作目录不存在时
-  降级而不是报错（读 6 条）；
-- **写操作端到端**（同一文件，写 14 条）：`stage` 把未跟踪文件推进索引、
+- **读接口端到端**（`tests/git_workspace.rs`，真建临时仓库，读 17 条）：
+  解析仓库根 / 子目录作用域 / 本地分支列表（当前分支排最前）/ 普通目录不是错误 /
+  工作目录不存在时降级而不是报错 / 读出已配置的 `user.name` 与 `user.email` /
+  非仓库时身份为空 / `check-ignore` 认出被忽略的路径（空输入与普通目录返回空）/
+  提交图按「新到旧」列出真实提交 / `max_count` 生效且 `has_more` 如实报告 /
+  无提交的仓库返回空图 / 未暂存改动的 diff **两侧内容都有** /
+  已暂存改动同样补齐两侧 / 新暂存的文件保留补丁（没有「前」侧）/
+  未跟踪文件走手工最小补丁 / 二进制内容报「不可预览」/
+  文件不存在或不在仓库时是「不可用」/ 没有上游时分支比较给出明确错误 /
+  有上游时按 upstream 比较 / 越界路径被拒；
+- **写操作端到端**（同一文件，写 20 条）：`stage` 把未跟踪文件推进索引、
   `unstage` 退回工作区（并断言 `M.` → `.M` 的往返）、`discard` 还原未暂存改动 /
   连带清索引 / 处理**已被删除**的文件、`commit` 真的产出带指定信息的提交 /
   拒绝空信息 / 只提交指定 pathspec、`push` 在没有 remote 或 detached HEAD 时
   给出明确错误、以及写操作统一拒绝「非仓库」与「越界路径」、空路径列表是 no-op。
+
+  > 「有上游时按 upstream 比较」那条用的是**本地目录当 remote**
+  > （`remote add origin <temp>` → `fetch` → `branch --set-upstream-to`），
+  > 不碰网络，所以离线也能跑。
 
   > 这一组踩过一个值得记的坑：`CARGO_TARGET_TMPDIR` 落在仓库自己的 `target/`
   > 里，而 `target/` 只是被 `.gitignore` 掉了 —— `git rev-parse` 依然会解析到
@@ -311,6 +432,15 @@ cargo build --release
   > `git push`。现在改用 `std::env::temp_dir()` 并先探一次
   > `git rev-parse --show-toplevel` 确认真的不在任何仓库里，测试从 93 秒
   > 降到 9.7 秒。
+
+应用层测试覆盖（`crates/zcode-app`）：
+
+- **整树冒烟**（`tests/smoke.rs`，36 条 + 1 条 `#[ignore]`）：各页面渲染、
+  写操作入口的可见性、**diff 预览的四种状态**（有补丁 / 加载中 /
+  不可用且给出原因 / 命令失败）、以及「展开预览不会遮掉页面其余部分」；
+- **后台通道**（`tests/workspace_loader.rs`，9 条）：真起临时仓库，
+  断言刷新链路的消息顺序、**diff 请求只回一条消息**（不发 `Loading` / `Loaded`）、
+  并发 diff 的 id 互不相同、失败时**带着原因回来**而不是静默。
 
 ---
 
@@ -324,17 +454,19 @@ cargo build --release
 2. **`packages/rpc` 的补充**：真实 `Socket` 实现（TCP / WebSocket）、  
    `MessagePortLike` 的 Electron/浏览器绑定、与 `packages/provider*` 的对接。
 3. **UI 层**（见 [PORTING-UI.md](./PORTING-UI.md) §6/§7）：  
-   **47 / 47 个原语已全部移植完毕**，并拼出了可运行的 `zcode-app`（1028 个测试全绿）。
+   **47 / 47 个原语已全部移植完毕**，并拼出了可运行的 `zcode-app`（1116 个测试全绿）。
    剩余的是**宿主接线**而非移植：`overlay.rs` 的边缘翻转碰撞检测，以及为
    `code_viewer` / `diff_viewer` / `pdf_viewer` / `pptx_preview_viewer` / `chart` /
    `carousel` 接上各自的 JS 引擎等价物（这些属于宿主应用职责，见 §4.4）。
 4. **服务层核心逻辑**（`packages/services`，224k 行）：按领域切分，优先迁移  
    纯计算/状态机模块；I/O 与第三方 SDK 调用保留边界。  
-   **已完成两条**：git 工作区状态的**读路径**（§2.4）与**写路径**（§2.5，
-   `stage` / `unstage` / `discard` / `commit` / `push`），「变更」页因此从只读
-   变成了可操作。下一步的自然延伸是 `getDiff` / `getCommitGraph` /
-   `getIdentity` 这几个读接口 —— 它们同样只是拼命令行 + 复用同一套
-   `GitCommandProvider`，而且能直接喂给已经移植好的 `diff_viewer` 原语。
+   **已完成三条**：git 工作区状态的**读路径**（§2.4）、**写路径**（§2.5，
+   `stage` / `unstage` / `discard` / `commit` / `push`）与**读接口补全**
+   （§2.6，`getIdentity` / `getIgnoredPaths` / `getCommitGraph` / `getDiff`）。
+   「变更」页因此走完了「列出改动 → 可操作 → 点开看补丁」三级。
+   下一步的自然延伸有两支：`getBranchComparison`（需要先补 merge-base 计算），
+   以及 `packages/services` 里其它自包含链路（如 `gitCheckpoint*`，
+   但那条依赖检查点存储，得先把存储一起移植）。
 5. **不可移植部分**：桌面/浏览器外壳（Electron / Vite / Node 主进程）不迁移；
    UI 层则**改用 Dioxus 重写**而不是机械翻译（React 运行时无法移植，但组件语义可以）。
 

@@ -54,7 +54,8 @@ pub mod workspace;
 use dioxus::prelude::*;
 use state::{AppCtx, ApprovalMode};
 use workspace::{
-    WorkspaceData, WorkspaceMessage, WorkspaceNotice, WorkspaceRequester, WorkspaceStatus,
+    DiffPreviewState, WorkspaceData, WorkspaceMessage, WorkspaceNotice, WorkspaceRequester,
+    WorkspaceStatus,
 };
 use zcode_ui::*;
 
@@ -89,6 +90,11 @@ pub struct WorkspaceSeed {
     pub status: WorkspaceStatus,
     /// 初始视图 Tab；`None` 用默认值（对话页）。
     pub tab: Option<String>,
+    /// 初始就展开的 diff 面板；`None` 表示全部收起。
+    ///
+    /// 单独开一个字段是为了让静态快照也能把 diff 预览拍进去 ——
+    /// 否则那一块在快照里永远是关着的，等于没验证。
+    pub diff: Option<DiffPreviewState>,
 }
 
 impl WorkspaceSeed {
@@ -98,12 +104,19 @@ impl WorkspaceSeed {
             data: Some(data),
             status: WorkspaceStatus::Ready,
             tab: None,
+            diff: None,
         }
     }
 
     /// 指定初始 Tab。
     pub fn with_tab(mut self, tab: impl Into<String>) -> Self {
         self.tab = Some(tab.into());
+        self
+    }
+
+    /// 指定初始展开的 diff 面板。
+    pub fn with_diff(mut self, diff: DiffPreviewState) -> Self {
+        self.diff = Some(diff);
         self
     }
 }
@@ -138,6 +151,7 @@ pub fn AppShell() -> Element {
     let seeded_tab = seed.as_ref().and_then(|seed| seed.tab.clone());
     let seeded_data = seed.as_ref().and_then(|seed| seed.data.clone());
     let seeded_status = seed.as_ref().map(|seed| seed.status.clone());
+    let seeded_diff = seed.as_ref().and_then(|seed| seed.diff.clone());
 
     // 全局 store
     let state = use_signal(state::demo_state);
@@ -157,6 +171,7 @@ pub fn AppShell() -> Element {
     let workspace_data = use_signal(move || seeded_data);
     let workspace_status = use_signal(move || seeded_status.unwrap_or_default());
     let workspace_notice = use_signal(|| None::<WorkspaceNotice>);
+    let diff_preview = use_signal(move || seeded_diff);
 
     // 请求端 / 结果端只建一次；请求端要通过 context 给顶栏与变更页用。
     let workspace_channel = use_hook(workspace::create_workspace_channel);
@@ -174,6 +189,7 @@ pub fn AppShell() -> Element {
         let mut workspace_data = workspace_data;
         let mut workspace_status = workspace_status;
         let mut workspace_notice = workspace_notice;
+        let mut diff_preview = diff_preview;
         spawn(async move {
             let Some(receiver) = receiver.as_mut() else {
                 // 理论上不可达（`use_hook` 保证初始化只跑一次）。
@@ -193,6 +209,31 @@ pub fn AppShell() -> Element {
                         workspace_status.set(WorkspaceStatus::Failed(message));
                     }
                     WorkspaceMessage::Notice(notice) => workspace_notice.set(Some(notice)),
+                    WorkspaceMessage::Diff(preview) => {
+                        // 只采纳**当前那次请求**的结果：用户快速点了 A 又点 B 时，
+                        // A 的 diff 可能后到，直接丢弃，否则会把 B 的内容盖成 A 的。
+                        // 用户中途把面板收起来（状态变 None）时也一并丢弃。
+                        let is_current = diff_preview
+                            .read()
+                            .as_ref()
+                            .map(DiffPreviewState::id)
+                            == Some(preview.id);
+                        if !is_current {
+                            continue;
+                        }
+                        diff_preview.set(Some(match preview.outcome {
+                            Ok(diff) => DiffPreviewState::Ready {
+                                id: preview.id,
+                                path: preview.path,
+                                diff,
+                            },
+                            Err(message) => DiffPreviewState::Failed {
+                                id: preview.id,
+                                path: preview.path,
+                                message,
+                            },
+                        }));
+                    }
                 }
             }
         })
@@ -225,6 +266,7 @@ pub fn AppShell() -> Element {
         workspace: workspace_data,
         workspace_status,
         workspace_notice,
+        diff_preview,
     });
 
     let dark = state.read().dark;

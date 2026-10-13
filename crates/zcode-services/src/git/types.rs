@@ -9,7 +9,8 @@
 use std::collections::BTreeMap;
 
 use zcode_shared::git::{
-    GitChangeKind, GitHeadRefType, GitRepositoryAutoRefreshWatchPath, GitRepositorySummary,
+    GitChangeKind, GitChangeSourceId, GitHeadRefType, GitRepositoryAutoRefreshWatchPath,
+    GitRepositorySummary,
 };
 
 /// 单个文件的行级增删。
@@ -135,6 +136,49 @@ pub struct GitHeadInfo {
     pub tracking_branch_name: Option<String>,
     pub ahead: u32,
     pub behind: u32,
+}
+
+/// 一次单文件 diff 查询。
+///
+/// 对应上游 `GitDiffQuery`，但**不含 `workspacePath`** —— 本移植把工作区路径
+/// 作为方法参数传入，与其余方法保持一致。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitDiffQuery {
+    /// 目标路径；绝对路径或 workspace 相对路径都可以。
+    pub path: String,
+    /// 是否看暂存区（`--cached`）；`None` 时由 `source_id` 决定。
+    pub staged: Option<bool>,
+    /// 改动来源；只有 `Branch` 会改变走法（见 [`GitChangeSourceId`]）。
+    pub source_id: Option<GitChangeSourceId>,
+}
+
+impl GitDiffQuery {
+    /// 最常用的一种：给定路径，看未暂存改动。
+    pub fn unstaged(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            staged: None,
+            source_id: None,
+        }
+    }
+
+    /// 看暂存区改动。
+    pub fn staged(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            staged: Some(true),
+            source_id: Some(GitChangeSourceId::Staged),
+        }
+    }
+
+    /// 与上游分支比较（`<tracking>...HEAD`）。
+    pub fn branch(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            staged: None,
+            source_id: Some(GitChangeSourceId::Branch),
+        }
+    }
 }
 
 /// 一次提交的结果。

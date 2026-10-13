@@ -11,8 +11,10 @@ use std::process::Command;
 
 use zcode_services::git::changes::{get_workspace_changes, summarize_changes};
 use zcode_services::git::repo::GitCliRepo;
-use zcode_services::git::types::GitChangeSection;
-use zcode_shared::git::{GitChangeKind, GitChangeSectionId, GitHeadRefType};
+use zcode_services::git::types::{GitChangeSection, GitDiffQuery};
+use zcode_shared::git::{
+    GitChangeKind, GitChangeSectionId, GitDiffAvailability, GitHeadRefType,
+};
 
 /// 本机能不能跑 git。
 fn git_available() -> bool {
@@ -821,5 +823,440 @@ fn write_operations_with_no_paths_are_a_no_op() {
         status_of(&after, "tracked.txt").as_deref(),
         Some(".M"),
         "改动应当原样保留"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 其余读操作：identity / ignored paths / commit graph / diff
+//
+// 这一组测的是「拼出来的命令行真能被 git 接受，并且解析出的形状与界面预期一致」。
+// 单文件 diff 尤其值得端到端跑 —— 它的三种来源（分支比较 / 暂存区 / 未跟踪）
+// 走的是完全不同的命令，且未跟踪那条是**我们手搓 patch**，只有真跑一遍才知道
+// 格式对不对。
+// ---------------------------------------------------------------------------
+
+/// 造一个「干净」的仓库：只有一条提交，工作区没有改动。
+fn build_clean_repository(name: &str, file: &str, content: &str) -> TempDir {
+    let dir = TempDir::new(name);
+    git(dir.path(), &["init", "--quiet", "-b", "main"]);
+    std::fs::write(dir.path().join(file), content).unwrap();
+    git(dir.path(), &["add", "--", file]);
+    git(dir.path(), &["commit", "--quiet", "-m", "initial"]);
+    dir
+}
+
+#[test]
+fn reads_the_configured_identity() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_clean_repository("zcode-services-e2e-identity", "a.txt", "a\n");
+    git(dir.path(), &["config", "user.name", "ZCode Test"]);
+    git(dir.path(), &["config", "user.email", "test@example.com"]);
+
+    let repo = GitCliRepo::new();
+    let identity = repo.get_identity(dir.path()).expect("读身份不应失败");
+
+    assert_eq!(identity.user_name.as_deref(), Some("ZCode Test"));
+    assert_eq!(identity.user_email.as_deref(), Some("test@example.com"));
+    // 我们写的是 local 配置，作用域应当报 local
+    assert_eq!(identity.scope_label.as_deref(), Some("local"));
+    let source = identity.name_source.expect("应当能报出值来自哪个文件");
+    assert!(source.contains("config"), "来源应当是配置文件：{source}");
+}
+
+#[test]
+fn identity_is_empty_for_a_plain_directory() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let Some(plain) = dir_outside_any_repository("identity-non-repo") else {
+        return;
+    };
+    let repo = GitCliRepo::new();
+    let identity = repo.get_identity(plain.path()).expect("非仓库不该报错");
+
+    assert!(identity.user_name.is_none());
+    assert!(identity.user_email.is_none());
+    assert!(identity.scope_label.is_none());
+}
+
+#[test]
+fn reports_which_paths_are_ignored() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-ignored");
+    std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+    std::fs::write(dir.path().join("ignored.txt"), "nope\n").unwrap();
+
+    let repo = GitCliRepo::new();
+    let inputs = vec!["ignored.txt".to_string(), "tracked.txt".to_string()];
+    let ignored = repo
+        .get_ignored_paths(dir.path(), &inputs)
+        .expect("check-ignore 不应失败");
+
+    assert_eq!(ignored.len(), 1, "只有 ignored.txt 被忽略：{ignored:?}");
+    let only = ignored[0].replace('\\', "/");
+    assert!(
+        only.ends_with("/ignored.txt"),
+        "返回的应当是绝对路径：{only}"
+    );
+}
+
+#[test]
+fn ignored_paths_is_empty_for_empty_input_and_plain_directory() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let repo = GitCliRepo::new();
+
+    // 空输入直接返回空，连命令都不跑
+    let dir = build_repository("zcode-services-e2e-ignored-empty");
+    assert!(repo.get_ignored_paths(dir.path(), &[]).unwrap().is_empty());
+
+    // 非仓库也是空列表，而不是报错
+    let Some(plain) = dir_outside_any_repository("ignored-non-repo") else {
+        return;
+    };
+    let inputs = vec!["a.txt".to_string()];
+    assert!(repo
+        .get_ignored_paths(plain.path(), &inputs)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn commit_graph_lists_real_commits_newest_first() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_clean_repository("zcode-services-e2e-graph", "a.txt", "one\n");
+    std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+    git(dir.path(), &["add", "--", "a.txt"]);
+    git(dir.path(), &["commit", "--quiet", "-m", "second"]);
+    std::fs::write(dir.path().join("a.txt"), "three\n").unwrap();
+    git(dir.path(), &["add", "--", "a.txt"]);
+    git(dir.path(), &["commit", "--quiet", "-m", "third"]);
+
+    let repo = GitCliRepo::new();
+    let graph = repo
+        .get_commit_graph(dir.path(), None, None)
+        .expect("读提交图不应失败");
+
+    assert_eq!(graph.commits.len(), 3);
+    assert!(!graph.has_more);
+    assert_eq!(graph.commits[0].subject, "third");
+    assert_eq!(graph.commits[2].subject, "initial");
+    assert_eq!(graph.commits[0].parents.len(), 1, "HEAD 应当有一个父提交");
+    assert!(graph.commits[2].parents.is_empty(), "根提交没有父");
+    assert!(graph.commits[0].authored_at_ms.is_some());
+
+    // HEAD 那一条应当同时带 HEAD 与 main 两个 ref
+    let names: Vec<&str> = graph.commits[0]
+        .refs
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert!(names.contains(&"HEAD"), "实际 refs：{names:?}");
+    assert!(names.contains(&"main"), "实际 refs：{names:?}");
+}
+
+#[test]
+fn commit_graph_respects_max_count_and_reports_more() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_clean_repository("zcode-services-e2e-graph-page", "a.txt", "one\n");
+    for index in 2..=3 {
+        std::fs::write(dir.path().join("a.txt"), format!("v{index}\n")).unwrap();
+        git(dir.path(), &["add", "--", "a.txt"]);
+        git(dir.path(), &["commit", "--quiet", "-m", &format!("c{index}")]);
+    }
+
+    let repo = GitCliRepo::new();
+    let page = repo.get_commit_graph(dir.path(), Some(2), None).unwrap();
+    assert_eq!(page.commits.len(), 2);
+    assert!(page.has_more, "还有第三条没取，应当报 has_more");
+    assert_eq!(page.commits[0].subject, "c3");
+
+    // skip 掉最新的一条
+    let skipped = repo.get_commit_graph(dir.path(), Some(2), Some(1)).unwrap();
+    assert_eq!(skipped.commits[0].subject, "c2");
+    assert_eq!(skipped.commits.len(), 2);
+    assert!(!skipped.has_more);
+}
+
+#[test]
+fn commit_graph_is_empty_for_a_repository_without_commits() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    // 空仓库不是错误，是一个正常的空图
+    let dir = TempDir::new("zcode-services-e2e-graph-empty");
+    git(dir.path(), &["init", "--quiet", "-b", "main"]);
+
+    let repo = GitCliRepo::new();
+    let graph = repo
+        .get_commit_graph(dir.path(), None, None)
+        .expect("空仓库应当返回空图而不是报错");
+    assert!(graph.commits.is_empty());
+    assert!(!graph.has_more);
+}
+
+#[test]
+fn diff_shows_an_unstaged_modification_with_both_sides() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-diff-unstaged");
+    let repo = GitCliRepo::new();
+
+    let diff = repo
+        .get_diff(dir.path(), &GitDiffQuery::unstaged("tracked.txt"))
+        .expect("取 diff 不应失败");
+
+    assert_eq!(diff.availability, GitDiffAvailability::Patch);
+    let patch = diff.patch.expect("应当有 patch");
+    assert!(patch.contains("-line two"), "patch：{patch}");
+    assert!(patch.contains("+line two changed"), "patch：{patch}");
+
+    // 两侧完整内容都应当拿到：HEAD 版本 → 工作区版本
+    assert_eq!(diff.before_content.as_deref(), Some("line one\nline two\n"));
+    assert_eq!(
+        diff.after_content.as_deref(),
+        Some("line one\nline two changed\n")
+    );
+}
+
+#[test]
+fn diff_for_a_staged_modification_fills_both_sides() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_clean_repository("zcode-services-e2e-diff-staged", "a.txt", "v1\n");
+    std::fs::write(dir.path().join("a.txt"), "v2\n").unwrap();
+    git(dir.path(), &["add", "--", "a.txt"]);
+
+    let repo = GitCliRepo::new();
+    let diff = repo
+        .get_diff(dir.path(), &GitDiffQuery::staged("a.txt"))
+        .expect("取暂存区 diff 不应失败");
+
+    assert_eq!(diff.availability, GitDiffAvailability::Patch);
+    // HEAD 版本 → 索引版本
+    assert_eq!(diff.before_content.as_deref(), Some("v1\n"));
+    assert_eq!(diff.after_content.as_deref(), Some("v2\n"));
+}
+
+#[test]
+fn diff_for_a_newly_staged_file_keeps_the_patch_without_contents() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-diff-staged-new");
+    let repo = GitCliRepo::new();
+
+    // staged.txt 是新增文件：`HEAD:staged.txt` 取不到 → 完整内容必须**整体降级**，
+    // 但 patch 本身是好的，不能一起丢。这正是 to_complete_diff_contents 的规则。
+    let diff = repo
+        .get_diff(dir.path(), &GitDiffQuery::staged("staged.txt"))
+        .expect("取 diff 不应失败");
+
+    assert_eq!(diff.availability, GitDiffAvailability::Patch);
+    assert!(diff.patch.is_some(), "patch 必须留下");
+    assert!(
+        diff.before_content.is_none() && diff.after_content.is_none(),
+        "任一侧取不到就应当整体不带完整内容"
+    );
+}
+
+#[test]
+fn diff_for_an_untracked_file_uses_the_minimal_patch() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-diff-untracked");
+    let repo = GitCliRepo::new();
+
+    let diff = repo
+        .get_diff(dir.path(), &GitDiffQuery::unstaged("untracked.txt"))
+        .expect("取未跟踪文件 diff 不应失败");
+
+    assert_eq!(diff.availability, GitDiffAvailability::Patch);
+    let patch = diff.patch.expect("应当有手搓的 patch");
+    // 我们不用 `--no-index`，只保留 ---/+++/@@ 三段
+    assert!(patch.starts_with("--- /dev/null\n+++ b/untracked.txt\n"), "patch：{patch}");
+    assert!(patch.contains("@@ -0,0 +1,3 @@"), "patch：{patch}");
+    assert!(patch.contains("+x\n+y\n+z\n"), "patch：{patch}");
+    assert_eq!(diff.before_content.as_deref(), Some(""));
+    assert_eq!(diff.after_content.as_deref(), Some("x\ny\nz\n"));
+}
+
+#[test]
+fn diff_reports_binary_content_as_not_previewable() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-diff-binary");
+    // 含 NUL 字节 → 二进制
+    std::fs::write(dir.path().join("blob.bin"), [0u8, 1, 2, 3, 0, 255]).unwrap();
+
+    let repo = GitCliRepo::new();
+    let diff = repo
+        .get_diff(dir.path(), &GitDiffQuery::unstaged("blob.bin"))
+        .expect("取二进制 diff 不应失败");
+
+    assert_eq!(diff.availability, GitDiffAvailability::Binary);
+    assert_eq!(
+        diff.summary.as_deref(),
+        Some("Binary diff is not previewable.")
+    );
+    assert!(diff.patch.is_none());
+}
+
+#[test]
+fn diff_for_a_missing_file_is_unavailable() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-diff-missing");
+    let repo = GitCliRepo::new();
+
+    let diff = repo
+        .get_diff(dir.path(), &GitDiffQuery::unstaged("does-not-exist.txt"))
+        .expect("不存在的路径不该报错，只应当 unavailable");
+
+    assert_eq!(diff.availability, GitDiffAvailability::Unavailable);
+    assert_eq!(
+        diff.summary.as_deref(),
+        Some("No Git diff is available for this file.")
+    );
+    assert!(diff.patch.is_none());
+}
+
+#[test]
+fn diff_for_a_plain_directory_is_unavailable() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let Some(plain) = dir_outside_any_repository("diff-non-repo") else {
+        return;
+    };
+    let repo = GitCliRepo::new();
+    let diff = repo
+        .get_diff(plain.path(), &GitDiffQuery::unstaged("a.txt"))
+        .expect("非仓库不该报错");
+
+    assert_eq!(diff.availability, GitDiffAvailability::Unavailable);
+    assert_eq!(
+        diff.summary.as_deref(),
+        Some("Workspace is not inside a Git repository.")
+    );
+}
+
+#[test]
+fn diff_without_an_upstream_cannot_do_a_branch_comparison() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-diff-branch-no-upstream");
+    let repo = GitCliRepo::new();
+
+    let diff = repo
+        .get_diff(dir.path(), &GitDiffQuery::branch("tracked.txt"))
+        .expect("没有上游时不该报错");
+
+    assert_eq!(diff.availability, GitDiffAvailability::Unavailable);
+    assert_eq!(
+        diff.summary.as_deref(),
+        Some("Current branch does not have an upstream branch.")
+    );
+}
+
+#[test]
+fn diff_with_a_branch_source_compares_against_the_upstream() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    // 用一个本地目录当 remote，避免测试碰网络。
+    let remote = build_clean_repository("zcode-services-e2e-branch-remote", "file.txt", "v1\n");
+
+    let dir = build_clean_repository("zcode-services-e2e-branch-local", "file.txt", "v1\n");
+    let remote_url = remote.path().to_str().unwrap().to_string();
+    git(dir.path(), &["remote", "add", "origin", &remote_url]);
+    git(dir.path(), &["fetch", "--quiet", "origin"]);
+    git(
+        dir.path(),
+        &["branch", "--set-upstream-to=origin/main", "main"],
+    );
+
+    // 本地往前走一条提交，此时 origin/main...HEAD 恰好是 v1 → v2
+    std::fs::write(dir.path().join("file.txt"), "v2\n").unwrap();
+    git(dir.path(), &["add", "--", "file.txt"]);
+    git(dir.path(), &["commit", "--quiet", "-m", "v2"]);
+
+    let repo = GitCliRepo::new();
+    let diff = repo
+        .get_diff(dir.path(), &GitDiffQuery::branch("file.txt"))
+        .expect("分支比较不应失败");
+
+    assert_eq!(diff.availability, GitDiffAvailability::Patch);
+    let patch = diff.patch.expect("应当有 patch");
+    assert!(patch.contains("-v1"), "patch：{patch}");
+    assert!(patch.contains("+v2"), "patch：{patch}");
+    // 完整内容来自 merge-base（v1）与 HEAD（v2）
+    assert_eq!(diff.before_content.as_deref(), Some("v1\n"));
+    assert_eq!(diff.after_content.as_deref(), Some("v2\n"));
+}
+
+#[test]
+fn diff_rejects_paths_outside_the_repository() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-services-e2e-diff-outside");
+    let repo = GitCliRepo::new();
+
+    let failure = repo
+        .get_diff(dir.path(), &GitDiffQuery::unstaged("../outside.txt"))
+        .unwrap_err();
+    assert_eq!(
+        failure.kind,
+        zcode_services::git::cli_helpers::GitCommandFailureKind::PathOutsideRepository
     );
 }

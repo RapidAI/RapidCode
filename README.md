@@ -14,7 +14,7 @@
 4. **真实业务链路**（移植自 `packages/services`）—— 见 **[PORTING.md](./PORTING.md) §2.4**
 
 **当前状态，请先读这一句**：**可编译、可测试**已经做到（`cargo build` 零警告、
-1028 个测试全绿），但**桌面窗口渲染不出内容**（环境层面的依赖不兼容，见「已知问题」）。
+1116 个测试全绿），但**桌面窗口渲染不出内容**（环境层面的依赖不兼容，见「已知问题」）。
 
 **应用外壳已经能显示并修改真实数据**：「变更」页走的是**真正移植过来的 git 工作区状态链路**
 （`crates/zcode-services`）—— 它会真的去 `git status --porcelain=v2` / `git diff --numstat`，
@@ -30,7 +30,7 @@
 
 ```bash
 cargo build                          # 编译整个工作区
-cargo test                           # 运行全部测试（1028 个）
+cargo test                           # 运行全部测试（1116 个）
 cargo run -p zcode-app               # 桌面窗口（⚠️ 本机开得出窗口但内容是空白，见「已知问题」）
 cargo build --release
 
@@ -57,7 +57,7 @@ cargo run -p zcode-app --example app_preview  # → ./app-preview.html        �
 >
 > ⚠️ **`cargo run -p zcode-app` 能开出窗口，但窗口内容区是空白的** —— UI 渲染不出来。
 > 这是 dioxus-desktop 0.6.3（wry 0.45）与较新 WebView2 Runtime 的兼容性问题，
-> **与本仓库代码无关**（`cargo build` 零警告、1028 个测试全绿，SSR 渲染出的组件树
+> **与本仓库代码无关**（`cargo build` 零警告、1116 个测试全绿，SSR 渲染出的组件树
 > 也完整正确）。完整证据链与可选出路见「已知问题」一节。
 > 想直接看 UI，用浏览器打开 `app-preview.html` / `app-preview-changes.html`
 > （SSR 静态快照），或直接看下面的截图。
@@ -143,7 +143,7 @@ cargo run -p zcode-app --example app_preview  # → ./app-preview.html        �
     │   │   └── html_snapshot.rs          dioxus-ssr HTML 快照测试（75）
     │   └── examples/preview.rs           预览页生成器
     └── zcode-app/                  # 可运行的桌面应用（用上面三个 crate 拼出来）
-        ├── assets/app.css                由 .tailwind-build/build.sh 生成（117,728 字节）
+        ├── assets/app.css                由 .tailwind-build/build.sh 生成（117,806 字节）
         ├── src/
         │   ├── lib.rs                    App / AppShell / WorkspaceBootstrap，内嵌样式表
         │   ├── main.rs                   桌面入口（LaunchBuilder::desktop）
@@ -153,8 +153,8 @@ cargo run -p zcode-app --example app_preview  # → ./app-preview.html        �
         │                                 detail / settings / gallery / changes
         ├── examples/app_preview.rs       整屏静态快照生成器（对话页 + 变更页）
         └── tests/
-            ├── smoke.rs                  整树冒烟测试（30 + 1 ignored）
-            └── workspace_loader.rs       跨线程取数 / 写操作链路测试（6）
+            ├── smoke.rs                  整树冒烟测试（36 + 1 ignored）
+            └── workspace_loader.rs       跨线程取数 / 写操作 / diff 链路测试（9）
 ```
 
 ## 设计要点（逻辑层）
@@ -184,38 +184,44 @@ cargo run -p zcode-app --example app_preview  # → ./app-preview.html        �
 ## 测试
 
 ```
-cargo test                    # 工作区 1028 个测试
+cargo test                    # 工作区 1116 个测试
 cargo test -p zcode-ui        # UI 层 828 个测试
-cargo test -p zcode-services  # 服务层 111 个测试（含真起临时仓库的端到端）
-cargo test -p zcode-app       # 应用层 61 个测试
+cargo test -p zcode-services  # 服务层 181 个测试（含真起临时仓库的端到端）
+cargo test -p zcode-app       # 应用层 78 个测试
 ```
 
 | crate | 单元 | 集成 | 小计 |
 | --- | ---: | ---: | ---: |
 | `zcode-rpc` | 10 | — | 10 |
-| `zcode-shared` | 18 | — | 18 |
-| `zcode-services` | 91 | 20 | 111 |
+| `zcode-shared` | 19 | — | 19 |
+| `zcode-services` | 144 | 37 | 181 |
 | `zcode-ui` | 742 | 75 + 11 | 828 |
-| `zcode-app` | 25 | 30 + 6 | 61 |
-| **合计** | **886** | **142** | **1028** |
+| `zcode-app` | 33 | 36 + 9 | 78 |
+| **合计** | **948** | **168** | **1116** |
 
 - **逻辑层**：VQL 序列化往返、嵌套 `Uint8Array` 的 JSON 回退、Base64、
   事件缓冲、基于内存队列（`create_queue_pair`）的端到端 RPC 调用 / 事件订阅。
 - **UI 层**：类名 / 几何 / 键盘 / 格式化的纯函数断言（742）、mutation 记录式
   渲染（11）、`dioxus-ssr` HTML 快照（75）—— 全部不需要 wasm / 窗口 / 浏览器。
-- **服务层**：`porcelain=v2` / `numstat` 解析与路径归一的纯函数断言（91）；
-  以及**真起临时 git 仓库**跑端到端的集成测试（20）—— 建仓库、造提交、
-  改文件、建未跟踪目录，再验证解析结果，其中 14 条覆盖写操作
-  （`stage` / `unstage` / `discard` / `commit` / `push` 的成与不成）。
+- **服务层**：`porcelain=v2` / `numstat` / `git log` decorations 的解析、
+  路径归一、diff 结果构造的纯函数断言（144）；
+  以及**真起临时 git 仓库**跑端到端的集成测试（37）—— 建仓库、造提交、
+  改文件、建未跟踪目录，再验证解析结果，其中 20 条覆盖写操作
+  （`stage` / `unstage` / `discard` / `commit` / `push` 的成与不成）、
+  17 条覆盖读接口（仓库解析 / 分支列表 / `getIdentity` / `getIgnoredPaths` /
+  `getCommitGraph` / `getDiff` 的三种来源：分支比较 / 暂存区 / 未跟踪）。
   没有 git 时这些测试会跳过并打印说明。
 - **应用层**：整棵应用树（含三个浮层）真渲染一遍，断言区域文案、
   `data-slot` 锚点、`data-*` 语义属性、浮层默认关闭、内嵌样式表覆盖到了
-  所需的 `@custom-variant` 与设计令牌，以及写操作入口（逐行暂存 / 整组暂存、
-  提交框、推送按钮、丢弃确认弹窗、成功 / 失败提示条）（30）；
+  所需的 `@custom-variant` 与设计令牌、写操作入口（逐行暂存 / 整组暂存、
+  提交框、推送按钮、丢弃确认弹窗、成功 / 失败提示条），以及 diff 预览的
+  六条断言（默认不展开 / 有 patch / 加载中 / 不可用且说明原因 /
+  命令失败要报错 / 展开不遮住页面其余部分）（36）；
   另有一组用**手写 executor** 驱动
-  `refresh / run → 后台线程 → 通道 → 结果` 整条链路、不依赖 dioxus 运行时的
-  测试（6），覆盖「加载成功 / 不是仓库 / 重复刷新被忽略 / 暂存后重新扫描 /
-  失败也要刷新 / 丢弃真的改了磁盘」。
+  `refresh / run / load_diff → 后台线程 → 通道 → 结果` 整条链路、
+  不依赖 dioxus 运行时的测试（9），覆盖「加载成功 / 不是仓库 / 重复刷新被忽略 /
+  暂存后重新扫描 / 失败也要刷新 / 丢弃真的改了磁盘 / diff 走的是独立通道 /
+  并发 diff 请求各自带 id / diff 失败要说出原因」。
 
 > 「能正常运行」的判定方法（进程存活 / `MainWindowHandle` 非零 /
 > `MainWindowTitle` 与 `WindowBuilder` 一致 / `Responding=True`）见
@@ -230,7 +236,8 @@ cargo test -p zcode-app       # 应用层 61 个测试
 git 进程 ──► provider.rs ──► cli_helpers.rs ──► repo.rs ──► changes.rs ──► workspace.rs ──► 界面
             跑命令/超时     porcelain v2       GitCliRepo  按暂存区    后台线程 + 通道
                             解析（纯函数）      get_status   分组         （futures-channel）
-                                               + 写操作 ↑
+                             + graph.rs / diff.rs（提交图与 diff 的纯函数层）
+                                               + 写操作 / diff 预览 ↑
 ```
 
 | 环节 | 说明 |
@@ -238,9 +245,11 @@ git 进程 ──► provider.rs ──► cli_helpers.rs ──► repo.rs ─�
 | `config.rs` | 清掉 `GIT_DIR` / `GIT_WORK_TREE` 等 16 个环境变量（否则在 git hook 里跑会被带偏），强制 `LC_ALL=C`、`GIT_PAGER=cat`；探测 Windows 下 4 个常见 `git.exe` 位置 |
 | `provider.rs` | 只用 `std::process`（**零第三方依赖**）；每根管道一个读取线程（否则管道缓冲区满会死锁）；超时后 `kill` + 汇总诊断信息；支持**单条命令的环境变量覆盖**（在清理之后叠加，顺序与上游 `{ ...createCommandEnv(), ...command.env }` 一致） |
 | `cli_helpers.rs` | 手写解析 `--porcelain=v2 -z` 与 `--numstat -z`，**不用正则**（本 crate 零依赖）；重命名记录会吃掉下一条空记录；`normalizeInputPath` 等价物把用户给的相对路径**以 workspace（不是 repo 根）为基准**解析、`realpath` 后转成仓库相对路径并拒绝越界 |
-| `repo.rs` | `rev-parse --show-toplevel --show-prefix --absolute-git-dir --git-common-dir` 定位仓库；未跟踪文件按 4 线程池数行（>1 MiB 跳过、含 NUL 视为二进制）；写操作 `stage` / `unstage` / `discard` / `commit` / `push` 就在同一层 |
+| `graph.rs` | `git log` 的纯解析层：记录分隔符 `` / 字段分隔符 ` `、`HEAD -> main` 要**同时**产出 `HEAD` 与 `main`、`tag: v1.0` 与 `tag: refs/tags/v1.0` 是同一个标签、无前缀的 ref 按「含 `/` 判远端」兜底 |
+| `diff.rs` | diff 结果的构造与降级：超时 → 截断 → 退出码 → 空输出 → 二进制 → 有 patch（**顺序不能换**）；两条硬规则 —— 完整内容必须成对（任一侧读不到就整体降级，否则 UI 会把「读不到」当成「空文件」）、patch 成功时不因全文预览失败而丢弃 patch |
+| `repo.rs` | `rev-parse --show-toplevel --show-prefix --absolute-git-dir --git-common-dir` 定位仓库；未跟踪文件按 4 线程池数行（>1 MiB 跳过、含 NUL 视为二进制）；写操作 `stage` / `unstage` / `discard` / `commit` / `push`，以及读接口 `getIdentity` / `getIgnoredPaths` / `getCommitGraph` / `getDiff` 都在同一层 |
 | `changes.rs` | 对齐 `gitService.getChanges`：一个 `MM` 状态会**同时**产出「已暂存」和「未暂存」两条变更（是展开，不是过滤） |
-| `workspace.rs` | 把同步阻塞的调用挪到后台线程，用 `futures-channel` 唤醒 dioxus（**不用轮询定时器**，也不引入 tokio）；`refresh` 与 `run` 共用一个 `busy` 原子量，**所有 git 操作串行化**（并发的 `git add` 与 `git commit` 会争 `index.lock`） |
+| `workspace.rs` | 把同步阻塞的调用挪到后台线程，用 `futures-channel` 唤醒 dioxus（**不用轮询定时器**，也不引入 tokio）；`refresh` 与 `run` 共用一个 `busy` 原子量，**所有 git 操作串行化**（并发的 `git add` 与 `git commit` 会争 `index.lock`）；**`load_diff` 刻意不共用这个标志** —— 读 diff 不改仓库、不碰 `index.lock`，没理由和刷新互相阻塞，代价是结果要带 `id` 回来由界面丢弃过期的那一份 |
 
 写操作的三条约定（见 `repo.rs` 上的文档注释）：
 
@@ -248,6 +257,15 @@ git 进程 ──► provider.rs ──► cli_helpers.rs ──► repo.rs ─�
 2. 路径一律先过 `normalize_input_paths`，空列表是 **no-op**（不报错，也不跑 git）；
 3. 写操作**不返回新状态**，调用方自己重新扫描一遍 —— 界面因此在动作完成后
    先收到一条 `Notice`（成功 / 失败），再收到刷新后的 `Loaded`。
+
+读接口的两条约定：
+
+1. **「不是仓库」是正常状态，不是错误** —— 一律返回空身份 / 空列表 / 空提交图 /
+   `unavailable` 的 diff，界面才能把「没有仓库」和「命令失败」分开渲染；
+2. 未跟踪文件不在 `git diff` 的视野里，所以 `getDiff` 对它会**手搓一份最简
+   unified diff**（`--- /dev/null` + `+++ b/<path>` + `@@ -0,0 +1,N @@`），
+   而不是用 `git diff --no-index` —— 后者在 Windows 上会带上平台相关头部，
+   前端 diff 组件对某些 `diff --git` 头部格式不兼容，展开时会直接抛异常。
 
 **没移植的**（有意为之，避免「看起来移植了其实没有」）：`gitCommitMessageGenerator`
 （依赖 LLM）、`gitCheckpoint*`（依赖检查点存储），以及 `commit` 的
@@ -259,7 +277,7 @@ git 进程 ──► provider.rs ──► cli_helpers.rs ──► repo.rs ─�
 **结论先说**：`cargo run -p zcode-app` 能开出一个标题正确的窗口，但**窗口内容区一片空白**
 —— UI 渲染不出来。这是 **dioxus-desktop 0.6.3（内置 wry 0.45）与 WebView2 Runtime
 `154.0.4258.62` 之间的兼容性问题，不是本仓库代码的问题**。同一份代码
-`cargo build` 零警告、1028 个测试全绿；SSR 渲染出的组件树也完整正确（见下方
+`cargo build` 零警告、1116 个测试全绿；SSR 渲染出的组件树也完整正确（见下方
 「能看的东西」）。
 
 ### 证据链
@@ -368,10 +386,12 @@ cargo run -p zcode-app --example app_preview   # → ./app-preview.html         
 ![对话页快照](./docs/screenshot-conversation.png)
 
 **变更页**（`app-preview-changes.html`）—— 左上角分支 `rust-only`、
-工作区路径 `F:/RapidCode`、`18 个文件 · +2257 -75`、以及每个文件的
+工作区路径 `F:/RapidCode`、文件数与 `+N/-M` 汇总、以及每个文件的
 `修改 / 新增` 与 `+N/-M` 全部来自真实 git 查询；右上角的 `推送` / `提交`、
 每个分组上的 `全部暂存` / `全部丢弃`、每行的 `暂存` 与垃圾桶按钮，
-都是这一轮新接上的写操作入口：
+是写操作入口；列表里**展开的那一块就是 diff 预览** —— 它同样是真的：
+`app_preview` 会同步调一次 `getDiff`，把真实 patch 注入界面，所以截图里
+hunk 头、行号、增删配色都来自你当前这份仓库。
 
 ![变更页快照](./docs/screenshot-changes.png)
 
@@ -379,7 +399,12 @@ cargo run -p zcode-app --example app_preview   # → ./app-preview.html         
 # 重新生成截图（需要 Edge 或 Chrome）
 EDGE="/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
 "$EDGE" --headless=new --disable-gpu --hide-scrollbars --window-size=1440,960 \
-        --screenshot=docs/screenshot-changes.png "file://$PWD/app-preview-changes.html"
+        --screenshot='F:\RapidCode\docs\screenshot-changes.png' \
+        "file:///F:/RapidCode/app-preview-changes.html"
 ```
+
+> ⚠️ `--screenshot` 必须给 **Windows 绝对路径**。相对路径会报
+> 「系统找不到指定的路径 (0x3)」，**但退出码仍是 0** —— 很容易误判成「截图成功了」，
+> 结果入库的是上一次的旧图。
 
 判断「能正常运行」的完整观测清单见 [PORTING-UI.md](./PORTING-UI.md) §5.5。

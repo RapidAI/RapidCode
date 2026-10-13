@@ -1,16 +1,19 @@
 //! Git 仓库解析与工作区状态查询。
 //!
-//! Rust 移植自 `packages/services/src/git/repo/gitCliRepo.ts` 的只读部分：
-//! `resolveRepository` / `getStatus` / `listLocalBranches`。
+//! Rust 移植自 `packages/services/src/git/repo/gitCliRepo.ts`：
+//! `resolveRepository` / `getStatus` / `listLocalBranches` / `getIdentity` /
+//! `getIgnoredPaths` / `getCommitGraph` / `getDiff`，以及
+//! `stage` / `unstage` / `discard` / `commit` / `push` 这几个写操作。
 //!
-//! ## 没有移植的两样东西
+//! ## 没有移植的几样东西
 //!
 //! 1. **`reuseInFlightRequest`**：上游用「同一 key 的并发请求复用同一个 Promise」
 //!    把一轮渲染里的多次 `git rev-parse` / `git status` 合并成一次。那是 JS 事件循环
 //!    的产物；Rust 侧的调用方（应用层后台线程）本来就是一问一答，没有 in-flight
 //!    窗口，因此这里不做缓存 —— 也就没有 `invalidate(workspacePath)` 的必要。
-//! 2. **写操作**（stage / unstage / discard / commit / push / switch / createBranch）。
-//!    它们会改用户的仓库，超出当前只读链路的目标。
+//! 2. **分支写操作**（`switchBranch` / `createBranchAndSwitch`）与
+//!    `getBranchComparison`：各自依赖一套尚未移植的「分支变更结果」类型。
+//! 3. **`commitMessageFileScope`** 与 `gitCommitMessageGenerator`：依赖 LLM provider。
 //!
 //! 唯一保留的「记忆」是未跟踪目录折叠：大仓库的逐文件未跟踪状态会撑爆输出上限，
 //! 上游首次超限后按 repoRoot 记住折叠模式，避免每次刷新都重跑一遍必然失败的详细命令。
@@ -21,22 +24,33 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use zcode_shared::git::{
-    GitHeadRefType, GitLocalBranch, GitLocalBranchListResult, GitRepositoryAutoRefreshWatchPath,
+    GitChangeSourceId, GitCommitGraphResult, GitDiffResult, GitHeadRefType, GitIdentity,
+    GitLocalBranch, GitLocalBranchListResult, GitRepositoryAutoRefreshWatchPath,
     GitRepositorySummary,
 };
 
 use super::cli_helpers::{
     build_untracked_stats, ensure_git_command_succeeded, ensure_git_command_succeeded_with,
     ensure_repository_available, is_missing_working_directory_result, is_not_repository_result,
-    normalize_input_paths, parse_numstat, parse_status_porcelain, GitCommandFailure,
-    GitCommandFailureKind,
+    normalize_input_path, normalize_input_paths, parse_git_config_value, parse_numstat,
+    parse_status_porcelain, GitCommandFailure, GitCommandFailureKind,
 };
 use super::config::{
-    normalize_lexically, normalize_workspace_in_repo_path, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    get_git_null_device_path, normalize_lexically, normalize_workspace_in_repo_path,
+    DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_GIT_DIFF_BYTES, DEFAULT_GIT_DIFF_TIMEOUT_MS,
     DEFAULT_GIT_OUTPUT_BYTES, DEFAULT_GIT_PUSH_OUTPUT_BYTES, DEFAULT_GIT_PUSH_TIMEOUT_MS,
 };
+use super::diff::{
+    build_untracked_text_diff_result, is_previewable_text, to_complete_diff_contents,
+    to_diff_result, to_unavailable_diff, with_diff_contents, GitDiffContents, ToDiffResultOptions,
+};
+use super::graph::{
+    normalize_git_graph_max_count, normalize_git_graph_skip, parse_git_graph_records,
+};
 use super::provider::{GitCommandProvider, GitCommandRequest};
-use super::types::{GitCommitResult, GitPushResult, GitResolvedRepository, GitStatusSnapshot};
+use super::types::{
+    GitCommitResult, GitDiffQuery, GitPushResult, GitResolvedRepository, GitStatusSnapshot,
+};
 
 /// `git status` 的未跟踪模式。
 ///
@@ -271,6 +285,450 @@ impl GitCliRepo {
             current_branch_name,
             branches,
         })
+    }
+
+    // -----------------------------------------------------------------
+    // 其余读操作
+    //
+    // `getIdentity` / `getIgnoredPaths` / `getCommitGraph` / `getDiff`。
+    // 四条共同约定：**「不是仓库」是正常状态而不是错误** —— 一律返回一个
+    // 空/降级结果（空身份、空列表、空提交图、`unavailable` diff），
+    // 让界面能把「没有仓库」与「命令失败」分开渲染。
+    // -----------------------------------------------------------------
+
+    /// 读 `user.name` / `user.email` 及其作用域与来源。
+    ///
+    /// 用 `--show-scope --show-origin` 一次问出「值 + 它写在哪」，
+    /// 这样设置页能显示「来自 global 的 ~/.gitconfig」而不只是一个值。
+    pub fn get_identity(&self, workspace_path: &Path) -> Result<GitIdentity, GitCommandFailure> {
+        let resolution = self.resolve_repository(workspace_path)?;
+        if !resolution.is_usable() {
+            return Ok(GitIdentity::default());
+        }
+
+        let name_result = self.provider.run(
+            &GitCommandRequest::new(
+                &resolution.repo_root,
+                [
+                    "config",
+                    "--show-scope",
+                    "--show-origin",
+                    "--get",
+                    "user.name",
+                ],
+            )
+            .with_timeout_ms(DEFAULT_GIT_COMMAND_TIMEOUT_MS),
+        )?;
+        let email_result = self.provider.run(
+            &GitCommandRequest::new(
+                &resolution.repo_root,
+                [
+                    "config",
+                    "--show-scope",
+                    "--show-origin",
+                    "--get",
+                    "user.email",
+                ],
+            )
+            .with_timeout_ms(DEFAULT_GIT_COMMAND_TIMEOUT_MS),
+        )?;
+
+        let name = parse_git_config_value(&name_result)?;
+        let email = parse_git_config_value(&email_result)?;
+
+        Ok(GitIdentity {
+            user_name: name.value,
+            user_email: email.value,
+            name_source: name.source,
+            email_source: email.source,
+            // 两个键的作用域通常相同，优先用 name 的；name 没配就退到 email 的。
+            scope_label: name.scope.or(email.scope),
+        })
+    }
+
+    /// 在给定的一组路径里挑出**被 ignore 的**那些，返回它们的绝对路径。
+    ///
+    /// 输入里落在仓库之外的项会被**静默跳过**（上游 `try/catch → null` 的等价物），
+    /// 而不是让整次查询失败 —— 文件树里混进一个越界路径不该让所有忽略标记消失。
+    pub fn get_ignored_paths(
+        &self,
+        workspace_path: &Path,
+        paths: &[String],
+    ) -> Result<Vec<String>, GitCommandFailure> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let resolution = self.resolve_repository(workspace_path)?;
+        if !resolution.is_usable() {
+            return Ok(Vec::new());
+        }
+
+        let mut pairs: Vec<(String, String)> = Vec::with_capacity(paths.len());
+        for path in paths {
+            let Ok(repo_relative) = normalize_input_path(&resolution, path) else {
+                continue;
+            };
+            pairs.push((absolute_input_path(&resolution, path), repo_relative));
+        }
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut args: Vec<String> = vec!["check-ignore".to_string(), "--".to_string()];
+        args.extend(pairs.iter().map(|(_, repo_relative)| repo_relative.clone()));
+
+        let result = self.provider.run(
+            &GitCommandRequest::new(&resolution.repo_root, args)
+                .with_timeout_ms(DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+                .with_max_output_bytes(DEFAULT_GIT_OUTPUT_BYTES),
+        )?;
+
+        // 退出码 1 = 一个都没被忽略，是正常结果而不是失败。
+        if result.exit_code == Some(1) {
+            return Ok(Vec::new());
+        }
+        ensure_git_command_succeeded("git check-ignore", &result)?;
+
+        // 注意**不能**用 `-z`：`git check-ignore -z` 只能配 `--stdin`，
+        // 这里通过 argv 传路径，所以必须解析普通换行输出，否则命令直接失败。
+        let ignored: HashSet<String> = result
+            .stdout
+            .split('\n')
+            .map(|line| line.trim_end_matches('\r'))
+            .filter(|line| !line.is_empty())
+            .map(|line| line.replace('\\', "/"))
+            .collect();
+
+        Ok(pairs
+            .into_iter()
+            .filter(|(_, repo_relative)| ignored.contains(repo_relative))
+            .map(|(absolute, _)| absolute)
+            .collect())
+    }
+
+    /// 取一页提交图。
+    ///
+    /// 只展示用户可见历史：显式列 `HEAD --branches --tags --remotes`，
+    /// **不用 `--all`** —— 否则 `refs/zcode/checkpoints` 之类的内部 hidden ref
+    /// 会把检查点提交也画进图里。
+    ///
+    /// 多取一条（`max-count = max + 1`）来判断 `has_more`，返回前再切掉。
+    pub fn get_commit_graph(
+        &self,
+        workspace_path: &Path,
+        max_count: Option<i64>,
+        skip: Option<i64>,
+    ) -> Result<GitCommitGraphResult, GitCommandFailure> {
+        let resolution = self.resolve_repository(workspace_path)?;
+        if !resolution.is_usable() {
+            return Ok(GitCommitGraphResult {
+                commits: Vec::new(),
+                has_more: false,
+            });
+        }
+
+        let normalized_max = normalize_git_graph_max_count(max_count);
+        let normalized_skip = normalize_git_graph_skip(skip);
+        let skip_arg = format!("--skip={normalized_skip}");
+        let max_arg = format!("--max-count={}", normalized_max + 1);
+
+        let result = self.provider.run(
+            &GitCommandRequest::new(
+                &resolution.repo_root,
+                [
+                    "log",
+                    "HEAD",
+                    "--branches",
+                    "--tags",
+                    "--remotes",
+                    "--date-order",
+                    "--topo-order",
+                    skip_arg.as_str(),
+                    max_arg.as_str(),
+                    "--format=%H%x00%P%x00%an%x00%at%x00%s%x00%D%x1e",
+                ],
+            )
+            .with_timeout_ms(DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .with_max_output_bytes(DEFAULT_GIT_OUTPUT_BYTES),
+        )?;
+
+        if result.exit_code != Some(0) {
+            // 空仓库（还没有任何提交）不是错误，而是一个正常的空图。
+            let stderr = result.stderr.to_lowercase();
+            if stderr.contains("does not have any commits yet")
+                || stderr.contains("your current branch")
+                || stderr.contains("bad default revision")
+                || stderr.contains("ambiguous argument 'head'")
+            {
+                return Ok(GitCommitGraphResult {
+                    commits: Vec::new(),
+                    has_more: false,
+                });
+            }
+            ensure_git_command_succeeded("git log visible refs", &result)?;
+        }
+
+        let parsed = parse_git_graph_records(&result.stdout);
+        let has_more = parsed.len() > normalized_max;
+        Ok(GitCommitGraphResult {
+            commits: parsed.into_iter().take(normalized_max).collect(),
+            has_more,
+        })
+    }
+
+    /// 取单个文件的 diff（patch + 可选完整内容）。
+    ///
+    /// 三条来源分别走不同路径（对齐上游 `getDiff`）：
+    ///
+    /// - `source_id == Branch`：`git diff <tracking>...HEAD`，完整内容取
+    ///   `merge-base` 与 `HEAD` 两个 blob；
+    /// - `staged`：`git diff --cached`，完整内容取 `HEAD` 与索引（`":path"`）；
+    /// - 其余（未跟踪）：`git diff` 拿不到东西，于是**手搓一份最小 unified diff**
+    ///   （见 [`build_untracked_text_diff_result`]），只有文本不可预览时才退回
+    ///   `git diff --no-index`。
+    pub fn get_diff(
+        &self,
+        workspace_path: &Path,
+        query: &GitDiffQuery,
+    ) -> Result<GitDiffResult, GitCommandFailure> {
+        let resolution = self.resolve_repository(workspace_path)?;
+        let absolute_path = absolute_input_path(&resolution, &query.path);
+
+        if !resolution.is_git_available {
+            return Ok(to_unavailable_diff(
+                &absolute_path,
+                "Git binary is not available in the current environment.",
+            ));
+        }
+        if !resolution.is_repository {
+            return Ok(to_unavailable_diff(
+                &absolute_path,
+                "Workspace is not inside a Git repository.",
+            ));
+        }
+
+        let repo_relative_path = normalize_input_path(&resolution, &query.path)?;
+        let repo_root = PathBuf::from(&resolution.repo_root);
+
+        if query.source_id == Some(GitChangeSourceId::Branch) {
+            let status = self.get_status(workspace_path)?;
+            let Some(tracking_branch_name) = status.summary.tracking_branch_name else {
+                return Ok(to_unavailable_diff(
+                    &absolute_path,
+                    "Current branch does not have an upstream branch.",
+                ));
+            };
+
+            let range = format!("{tracking_branch_name}...HEAD");
+            let result = self.provider.run(
+                &GitCommandRequest::new(
+                    &repo_root,
+                    [
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-color",
+                        "--binary",
+                        "--find-renames",
+                        range.as_str(),
+                        "--",
+                        repo_relative_path.as_str(),
+                    ],
+                )
+                .with_timeout_ms(DEFAULT_GIT_DIFF_TIMEOUT_MS)
+                .with_max_output_bytes(DEFAULT_GIT_DIFF_BYTES),
+            )?;
+
+            let parsed = to_diff_result(
+                &absolute_path,
+                &result,
+                ToDiffResultOptions {
+                    empty_summary: Some("No branch comparison diff is available for this file."),
+                    ..Default::default()
+                },
+            );
+            let contents =
+                self.read_branch_diff_contents(&resolution, &repo_relative_path, &tracking_branch_name);
+            return Ok(with_diff_contents(parsed, contents));
+        }
+
+        let staged = query.staged.unwrap_or(query.source_id == Some(GitChangeSourceId::Staged));
+        let mut args: Vec<&str> = vec!["diff"];
+        if staged {
+            args.push("--cached");
+        }
+        args.extend([
+            "--no-ext-diff",
+            "--no-color",
+            "--binary",
+            "--",
+            repo_relative_path.as_str(),
+        ]);
+
+        let result = self.provider.run(
+            &GitCommandRequest::new(&repo_root, args)
+                .with_timeout_ms(DEFAULT_GIT_DIFF_TIMEOUT_MS)
+                .with_max_output_bytes(DEFAULT_GIT_DIFF_BYTES),
+        )?;
+
+        let parsed = to_diff_result(
+            &absolute_path,
+            &result,
+            ToDiffResultOptions {
+                empty_summary: Some("No Git diff is available for this file."),
+                ..Default::default()
+            },
+        );
+
+        // 未跟踪文件根本不在 `git diff` 的视野里 —— 那会得到 `unavailable`。
+        // 只有这种情况下才走下面的兜底；已暂存即使空输出也要取完整内容。
+        if parsed.availability != zcode_shared::git::GitDiffAvailability::Unavailable || staged {
+            let contents = if staged {
+                self.read_staged_diff_contents(&resolution, &repo_relative_path)
+            } else {
+                self.read_unstaged_diff_contents(
+                    Path::new(&absolute_path),
+                    &resolution,
+                    &repo_relative_path,
+                )
+            };
+            return Ok(with_diff_contents(parsed, contents));
+        }
+
+        if !Path::new(&absolute_path).exists() {
+            return Ok(parsed);
+        }
+
+        // 未跟踪文件：手搓最小 unified diff（不用 `--no-index`，理由见函数文档）。
+        if let Some(untracked) = read_untracked_text_diff(
+            &absolute_path,
+            &repo_relative_path,
+            DEFAULT_GIT_DIFF_BYTES,
+        ) {
+            return Ok(untracked);
+        }
+
+        let no_index_result = self.provider.run(
+            &GitCommandRequest::new(
+                &repo_root,
+                [
+                    "diff",
+                    "--no-index",
+                    "--no-ext-diff",
+                    "--no-color",
+                    "--binary",
+                    get_git_null_device_path(),
+                    absolute_path.as_str(),
+                ],
+            )
+            .with_timeout_ms(DEFAULT_GIT_DIFF_TIMEOUT_MS)
+            .with_max_output_bytes(DEFAULT_GIT_DIFF_BYTES),
+        )?;
+
+        Ok(to_diff_result(
+            &absolute_path,
+            &no_index_result,
+            ToDiffResultOptions {
+                // `git diff --no-index` 用退出码 1 表示「有差异」，那是正常结果。
+                allowed_exit_codes: Some(&[0, 1]),
+                empty_summary: Some("No previewable diff is available for this file."),
+                ..Default::default()
+            },
+        ))
+    }
+
+    // -----------------------------------------------------------------
+    // diff 的完整内容（before/after）
+    // -----------------------------------------------------------------
+
+    /// 读一个 Git 对象（blob）的文本内容；任何异常都返回 `None`。
+    ///
+    /// `ref_` 为空串时 `git show ":path"` 取的是**索引**里的版本 —— 暂存区
+    /// diff 的「改动后」就是它。
+    fn read_git_blob_preview_content(
+        &self,
+        resolution: &GitResolvedRepository,
+        ref_: &str,
+        repo_relative_path: &str,
+    ) -> Option<String> {
+        let spec = format!("{ref_}:{repo_relative_path}");
+        let result = self
+            .provider
+            .run(
+                &GitCommandRequest::new(&resolution.repo_root, ["show", spec.as_str()])
+                    .with_timeout_ms(DEFAULT_GIT_DIFF_TIMEOUT_MS)
+                    .with_max_output_bytes(DEFAULT_GIT_DIFF_BYTES),
+            )
+            .ok()?;
+
+        if result.timed_out
+            || result.output_truncated
+            || result.exit_code != Some(0)
+            || !is_previewable_text(&result.stdout)
+        {
+            return None;
+        }
+        Some(result.stdout)
+    }
+
+    /// 暂存区 diff 的完整内容：`HEAD` → 索引。
+    fn read_staged_diff_contents(
+        &self,
+        resolution: &GitResolvedRepository,
+        repo_relative_path: &str,
+    ) -> Option<GitDiffContents> {
+        let before = self.read_git_blob_preview_content(resolution, "HEAD", repo_relative_path);
+        let after = self.read_git_blob_preview_content(resolution, "", repo_relative_path);
+        to_complete_diff_contents(before, after)
+    }
+
+    /// 未暂存 diff 的完整内容：索引 → 工作区。
+    fn read_unstaged_diff_contents(
+        &self,
+        absolute_path: &Path,
+        resolution: &GitResolvedRepository,
+        repo_relative_path: &str,
+    ) -> Option<GitDiffContents> {
+        let before = self.read_git_blob_preview_content(resolution, "", repo_relative_path);
+        let after = read_working_tree_preview_content(absolute_path);
+        to_complete_diff_contents(before, after)
+    }
+
+    /// 分支比较 diff 的完整内容：`merge-base` → `HEAD`。
+    ///
+    /// `merge-base` 拿不到时（比如两个分支没有共同祖先）退回用 tracking 分支本身，
+    /// 与上游一致。
+    fn read_branch_diff_contents(
+        &self,
+        resolution: &GitResolvedRepository,
+        repo_relative_path: &str,
+        tracking_branch_name: &str,
+    ) -> Option<GitDiffContents> {
+        let merge_base_result = self
+            .provider
+            .run(
+                &GitCommandRequest::new(
+                    &resolution.repo_root,
+                    ["merge-base", tracking_branch_name, "HEAD"],
+                )
+                .with_timeout_ms(DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+                .with_max_output_bytes(DEFAULT_GIT_OUTPUT_BYTES),
+            )
+            .ok()?;
+        let merge_base = if merge_base_result.exit_code == Some(0) {
+            merge_base_result.stdout.trim().to_string()
+        } else {
+            String::new()
+        };
+        let before_ref = if merge_base.is_empty() {
+            tracking_branch_name.to_string()
+        } else {
+            merge_base
+        };
+
+        let before = self.read_git_blob_preview_content(resolution, &before_ref, repo_relative_path);
+        let after = self.read_git_blob_preview_content(resolution, "HEAD", repo_relative_path);
+        to_complete_diff_contents(before, after)
     }
 
     // -----------------------------------------------------------------
@@ -753,6 +1211,57 @@ fn is_windows_drive_root(value: &str) -> bool {
 /// 加锁时忽略中毒状态：集合里只有字符串，中毒也不会让它变成坏数据。
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 把用户给的路径变成绝对路径（**纯词法**，不做 realpath）。
+///
+/// 对应上游 `isAbsolute(path) ? path : resolve(workspacePath, path.split("/").join(sep))`。
+/// 刻意不做 `canonicalize`：这些绝对路径会被原样回传给调用方（`get_ignored_paths`
+/// 用它标记哪些输入被忽略），换个形式反而对不上。
+fn absolute_input_path(resolution: &GitResolvedRepository, path: &str) -> String {
+    if Path::new(path).is_absolute() {
+        return path.to_string();
+    }
+    Path::new(&resolution.workspace_path)
+        .join(path.replace('/', std::path::MAIN_SEPARATOR_STR))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// 读工作区里一个文件的文本内容；任何异常都返回 `None`。
+///
+/// 对应上游 `readWorkingTreePreviewContent`。**不能把读失败当成空文件** ——
+/// 文件被删除、编辑器原子保存的窗口期都会让 `metadata`/`read` 失败，
+/// 猜成空文件会让 UI 把整个文件渲染成「全新增」。
+fn read_working_tree_preview_content(absolute_path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(absolute_path).ok()?;
+    if !metadata.is_file() || metadata.len() > DEFAULT_GIT_DIFF_BYTES as u64 {
+        return None;
+    }
+
+    let bytes = std::fs::read(absolute_path).ok()?;
+    // 与 Node 的 `Buffer.toString("utf-8")` 一致：非法字节替换成 U+FFFD，而不是报错。
+    let content = String::from_utf8_lossy(&bytes).into_owned();
+    is_previewable_text(&content).then_some(content)
+}
+
+/// 读文件内容并手搓未跟踪文件的 diff；读失败返回 `None`。
+///
+/// 上游 `buildUntrackedTextDiffResult` 把「读文件」和「拼 patch」放在一起；
+/// 这里拆开，拼 patch 的纯逻辑在 [`build_untracked_text_diff_result`] 里。
+/// 返回 `None` 表示**文件读不出来**，调用方应退回 `git diff --no-index`。
+fn read_untracked_text_diff(
+    absolute_path: &str,
+    repo_relative_path: &str,
+    max_preview_bytes: usize,
+) -> Option<GitDiffResult> {
+    let content = std::fs::read(absolute_path).ok()?;
+    Some(build_untracked_text_diff_result(
+        absolute_path,
+        repo_relative_path,
+        &content,
+        max_preview_bytes,
+    ))
 }
 
 #[cfg(test)]

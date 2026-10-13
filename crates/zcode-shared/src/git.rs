@@ -79,6 +79,35 @@ impl GitChangeSectionId {
     }
 }
 
+/// 一次 diff 查询针对的是哪一类改动来源。
+///
+/// 对应上游 `GitChangeSourceId`（`"unstaged" | "staged" | "branch" | "last-turn"`）。
+/// 注意它比 [`GitChangeSectionId`] 少两个值 —— `conflicted` / `untracked` 是
+/// **分区**，不是 diff 来源。
+///
+/// 只有 `Branch` 与 `Staged` 会改变 `get_diff` 的行为：
+/// `Branch` 走 `merge-base` 比较，`Staged` 走 `--cached`；`Unstaged` 与
+/// `LastTurn` 都是「工作区 vs 索引」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GitChangeSourceId {
+    #[default]
+    Unstaged,
+    Staged,
+    Branch,
+    LastTurn,
+}
+
+impl GitChangeSourceId {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GitChangeSourceId::Unstaged => "unstaged",
+            GitChangeSourceId::Staged => "staged",
+            GitChangeSourceId::Branch => "branch",
+            GitChangeSourceId::LastTurn => "last-turn",
+        }
+    }
+}
+
 /// Git 元数据 watcher 的边界。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitRepositoryAutoRefreshWatchPath {
@@ -217,6 +246,54 @@ pub struct GitIdentity {
     pub scope_label: Option<String>,
 }
 
+/// 提交图上一个 ref 属于哪一类。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitCommitGraphRefKind {
+    Branch,
+    Remote,
+    Tag,
+    /// 当前 HEAD 本身（`git log` 的 `HEAD ->` 会额外产出一条）。
+    Head,
+}
+
+impl GitCommitGraphRefKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GitCommitGraphRefKind::Branch => "branch",
+            GitCommitGraphRefKind::Remote => "remote",
+            GitCommitGraphRefKind::Tag => "tag",
+            GitCommitGraphRefKind::Head => "head",
+        }
+    }
+}
+
+/// 挂在某个提交上的 ref。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitCommitGraphRef {
+    pub name: String,
+    pub kind: GitCommitGraphRefKind,
+}
+
+/// 提交图上的一条提交。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitCommitGraphCommit {
+    pub hash: String,
+    pub parents: Vec<String>,
+    pub refs: Vec<GitCommitGraphRef>,
+    pub subject: String,
+    pub author_name: Option<String>,
+    /// 作者时间的毫秒时间戳；解析不出来时是 `None`（不是 0）。
+    pub authored_at_ms: Option<i64>,
+}
+
+/// 一页提交图。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitCommitGraphResult {
+    pub commits: Vec<GitCommitGraphCommit>,
+    /// 是否还有下一页（靠多取一条判断）。
+    pub has_more: bool,
+}
+
 /// 构造一个「仓库不可用」的空摘要。
 ///
 /// 对应上游 `createEmptySummary()`：`isGitAvailable` 由调用方传入，
@@ -261,6 +338,19 @@ mod tests {
             "linked-worktree"
         );
         assert_eq!(GitDiffAvailability::Unavailable.as_str(), "unavailable");
+        assert_eq!(GitCommitGraphRefKind::Branch.as_str(), "branch");
+        assert_eq!(GitCommitGraphRefKind::Remote.as_str(), "remote");
+        assert_eq!(GitCommitGraphRefKind::Tag.as_str(), "tag");
+        assert_eq!(GitCommitGraphRefKind::Head.as_str(), "head");
+        assert_eq!(GitChangeSourceId::Unstaged.as_str(), "unstaged");
+        assert_eq!(GitChangeSourceId::Staged.as_str(), "staged");
+        assert_eq!(GitChangeSourceId::Branch.as_str(), "branch");
+        assert_eq!(GitChangeSourceId::LastTurn.as_str(), "last-turn");
+    }
+
+    #[test]
+    fn change_source_defaults_to_unstaged() {
+        assert_eq!(GitChangeSourceId::default(), GitChangeSourceId::Unstaged);
     }
 
     #[test]

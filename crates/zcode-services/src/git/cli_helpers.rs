@@ -272,6 +272,56 @@ pub fn normalize_input_paths(
     Ok(normalized)
 }
 
+/// `git config --show-scope --show-origin --get <key>` 的一条解析结果。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitConfigValue {
+    /// 作用域：`local` / `global` / `system` / `command`。
+    pub scope: Option<String>,
+    /// 值来自哪个文件（`file:<路径>`）。
+    pub source: Option<String>,
+    pub value: Option<String>,
+}
+
+/// 解析 `git config --show-scope --show-origin --get <key>` 的输出。
+///
+/// 对应上游 `parseGitConfigValue`。输出形如
+/// `global\tfile:C:/Users/x/.gitconfig\tAda`（制表符分隔）：
+///
+/// - **退出码 1 是「键不存在」**，不是错误 —— 直接返回三项全 `None`；
+/// - 值本身可能含制表符，所以只按前两个制表符切，剩下的整段（再拼回来）才是值；
+/// - 少于三段时说明这条 git 版本没带 `--show-scope/--show-origin` 的完整信息，
+///   此时把整行当作值。
+pub fn parse_git_config_value(
+    result: &GitCommandExecutionResult,
+) -> Result<GitConfigValue, GitCommandFailure> {
+    if result.exit_code == Some(1) {
+        return Ok(GitConfigValue::default());
+    }
+
+    ensure_git_command_succeeded("git config", result)?;
+
+    // 只去掉一个行尾换行（`/\r?\n$/`），不能 `trim()` —— 否则会吃掉值两端的空格。
+    let line = result.stdout.strip_suffix('\n').unwrap_or(&result.stdout);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() < 3 {
+        return Ok(GitConfigValue {
+            scope: None,
+            source: None,
+            value: (!line.is_empty()).then(|| line.to_string()),
+        });
+    }
+
+    let value = parts[2..].join("\t");
+    Ok(GitConfigValue {
+        // 上游用 `?? null`（空串不会被当成 null），所以空串也照留。
+        scope: Some(parts[0].to_string()),
+        source: Some(parts[1].to_string()),
+        value: (!value.is_empty()).then_some(value),
+    })
+}
+
 /// 单个状态码归一成变更性质。
 pub fn infer_kind_from_status_code(status_code: char) -> GitChangeKind {
     match status_code {
@@ -1248,5 +1298,81 @@ mod tests {
     fn normalize_input_paths_is_empty_for_no_input() {
         let res = resolution("/repo", "/repo", true, true);
         assert!(normalize_input_paths(&res, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn config_value_parses_scope_origin_and_value() {
+        let mut result = succeeded_result();
+        result.stdout = "global\tfile:C:/Users/x/.gitconfig\tAda\n".to_string();
+        let parsed = parse_git_config_value(&result).unwrap();
+        assert_eq!(parsed.scope.as_deref(), Some("global"));
+        assert_eq!(parsed.source.as_deref(), Some("file:C:/Users/x/.gitconfig"));
+        assert_eq!(parsed.value.as_deref(), Some("Ada"));
+    }
+
+    #[test]
+    fn config_value_missing_key_is_not_an_error() {
+        // 退出码 1 = 键不存在；三项全 None，而不是 Err。
+        let mut result = succeeded_result();
+        result.exit_code = Some(1);
+        result.stdout = String::new();
+        let parsed = parse_git_config_value(&result).unwrap();
+        assert_eq!(parsed, GitConfigValue::default());
+    }
+
+    #[test]
+    fn config_value_keeps_tabs_inside_the_value() {
+        // 只切前两个制表符，值里的制表符要拼回来。
+        let mut result = succeeded_result();
+        result.stdout = "local\tfile:.git/config\ta\tb\n".to_string();
+        let parsed = parse_git_config_value(&result).unwrap();
+        assert_eq!(parsed.value.as_deref(), Some("a\tb"));
+    }
+
+    #[test]
+    fn config_value_without_scope_columns_falls_back_to_the_whole_line() {
+        // 老版本 git 不带 --show-scope/--show-origin 时，整行就是值。
+        let mut result = succeeded_result();
+        result.stdout = "Ada\n".to_string();
+        let parsed = parse_git_config_value(&result).unwrap();
+        assert!(parsed.scope.is_none());
+        assert!(parsed.source.is_none());
+        assert_eq!(parsed.value.as_deref(), Some("Ada"));
+    }
+
+    #[test]
+    fn config_value_strips_only_the_trailing_newline() {
+        // 值两端的空格必须保留（不能 trim）。
+        let mut result = succeeded_result();
+        result.stdout = "global\tfile:x\t  padded  \n".to_string();
+        let parsed = parse_git_config_value(&result).unwrap();
+        assert_eq!(parsed.value.as_deref(), Some("  padded  "));
+    }
+
+    #[test]
+    fn config_value_handles_crlf_output() {
+        let mut result = succeeded_result();
+        result.stdout = "global\tfile:x\tAda\r\n".to_string();
+        let parsed = parse_git_config_value(&result).unwrap();
+        assert_eq!(parsed.value.as_deref(), Some("Ada"));
+    }
+
+    #[test]
+    fn config_value_empty_value_is_none_but_scope_is_kept() {
+        let mut result = succeeded_result();
+        result.stdout = "global\tfile:x\t\n".to_string();
+        let parsed = parse_git_config_value(&result).unwrap();
+        assert_eq!(parsed.scope.as_deref(), Some("global"));
+        assert!(parsed.value.is_none());
+    }
+
+    #[test]
+    fn config_value_reports_real_failures() {
+        let mut result = succeeded_result();
+        result.exit_code = Some(128);
+        result.stderr = "fatal: not a git repository\n".to_string();
+        let failure = parse_git_config_value(&result).unwrap_err();
+        assert_eq!(failure.kind, GitCommandFailureKind::NonZeroExit);
+        assert_eq!(failure.label, "git config");
     }
 }

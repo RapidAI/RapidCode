@@ -13,7 +13,10 @@
 
 use dioxus::prelude::*;
 use zcode_app::state::{demo_state, AppCtx};
-use zcode_app::workspace::{WorkspaceData, WorkspaceNotice, WorkspaceStatus};
+use zcode_app::workspace::{
+    DiffPreviewState, WorkspaceData, WorkspaceNotice, WorkspaceStatus,
+};
+use zcode_shared::git::{GitDiffAvailability, GitDiffResult};
 use zcode_ui::*;
 
 /// 把组件渲染成 HTML 字符串。
@@ -80,6 +83,7 @@ fn Harness(
         workspace: use_signal(|| None::<WorkspaceData>),
         workspace_status: use_signal(WorkspaceStatus::default),
         workspace_notice: use_signal(|| None::<WorkspaceNotice>),
+        diff_preview: use_signal(|| None::<DiffPreviewState>),
     };
     use_context_provider(|| ctx);
 
@@ -762,6 +766,8 @@ fn WorkspaceHarness(
     #[props(default = "changes")] tab: &'static str,
     /// 注入一条写操作反馈（`None` = 没有反馈）。
     #[props(default)] notice: Option<WorkspaceNotice>,
+    /// 注入一个已展开的 diff 面板（`None` = 没有展开项）。
+    #[props(default)] diff: Option<DiffPreviewState>,
 ) -> Element {
     let channel = use_hook(zcode_app::workspace::create_workspace_channel);
     let requester = channel.requester();
@@ -782,6 +788,7 @@ fn WorkspaceHarness(
         workspace: use_signal(move || data),
         workspace_status: use_signal(move || status),
         workspace_notice: use_signal(move || notice),
+        diff_preview: use_signal(move || diff),
     };
     use_context_provider(|| ctx);
 
@@ -1007,4 +1014,201 @@ fn notices_still_render_on_top_of_a_non_repository_state() {
     assert!(out.contains("workspace-notice"));
     assert!(out.contains("推送失败：没有配置 remote"));
     assert!(out.contains("当前目录不是 Git 仓库"));
+}
+
+// ---------------------------------------------------------------------------
+// diff 预览
+// ---------------------------------------------------------------------------
+//
+// 同样只测渲染层：把 `DiffPreviewState` 直接注入 AppCtx，断言四种结果
+// （加载中 / 有 patch / 二进制 / 不可用 / 命令失败）**都看得见**。
+// 「diff 内容对不对」由 `crates/zcode-services/tests/git_workspace.rs` 在
+// 真实仓库上覆盖。
+
+/// 造一份 diff 结果。
+fn diff_result(availability: GitDiffAvailability, patch: Option<&str>, summary: Option<&str>) -> GitDiffResult {
+    GitDiffResult {
+        path: "F:/demo/workspace/src/dirty.rs".to_string(),
+        availability,
+        patch: patch.map(str::to_string),
+        before_content: None,
+        after_content: None,
+        summary: summary.map(str::to_string),
+    }
+}
+
+/// 一个展开在 `src/dirty.rs` 那一行之下的 diff 面板。
+#[component]
+fn DiffFixture(state: DiffPreviewState) -> Element {
+    rsx! { WorkspaceHarness { case: "changes", diff: Some(state) } }
+}
+
+#[component]
+fn DiffPatchFixture() -> Element {
+    rsx! {
+        DiffFixture {
+            state: DiffPreviewState::Ready {
+                id: 1,
+                path: "src/dirty.rs".to_string(),
+                diff: Box::new(diff_result(
+                    GitDiffAvailability::Patch,
+                    Some("--- a/src/dirty.rs\n+++ b/src/dirty.rs\n@@ -1 +1 @@\n-let a = 1;\n+let a = 2;\n"),
+                    None,
+                )),
+            },
+        }
+    }
+}
+
+#[component]
+fn DiffLoadingFixture() -> Element {
+    rsx! {
+        DiffFixture {
+            state: DiffPreviewState::Loading {
+                id: 1,
+                path: "src/dirty.rs".to_string(),
+            },
+        }
+    }
+}
+
+#[component]
+fn DiffBinaryFixture() -> Element {
+    rsx! {
+        DiffFixture {
+            state: DiffPreviewState::Ready {
+                id: 1,
+                path: "src/dirty.rs".to_string(),
+                diff: Box::new(diff_result(
+                    GitDiffAvailability::Binary,
+                    None,
+                    Some("Binary diff is not previewable."),
+                )),
+            },
+        }
+    }
+}
+
+#[component]
+fn DiffTruncatedFixture() -> Element {
+    rsx! {
+        DiffFixture {
+            state: DiffPreviewState::Ready {
+                id: 1,
+                path: "src/dirty.rs".to_string(),
+                diff: Box::new(diff_result(
+                    GitDiffAvailability::Truncated,
+                    None,
+                    Some("Git diff output exceeded the preview limit."),
+                )),
+            },
+        }
+    }
+}
+
+#[component]
+fn DiffUnavailableFixture() -> Element {
+    rsx! {
+        DiffFixture {
+            state: DiffPreviewState::Ready {
+                id: 1,
+                path: "src/dirty.rs".to_string(),
+                diff: Box::new(diff_result(
+                    GitDiffAvailability::Unavailable,
+                    None,
+                    Some("No Git diff is available for this file."),
+                )),
+            },
+        }
+    }
+}
+
+#[component]
+fn DiffFailedFixture() -> Element {
+    rsx! {
+        DiffFixture {
+            state: DiffPreviewState::Failed {
+                id: 1,
+                path: "src/dirty.rs".to_string(),
+                message: "git 起不来".to_string(),
+            },
+        }
+    }
+}
+
+#[test]
+fn diff_preview_is_closed_by_default() {
+    // 默认不该有任何一个面板是展开的 —— 否则一进页面就挂着一堆 diff。
+    let out = html(ChangesFixture);
+    assert!(
+        !out.contains(r#"data-slot="diff-preview""#),
+        "默认不应展开任何 diff 面板"
+    );
+    assert!(!out.contains(r#"data-expanded="true""#));
+    // 但每一行都要带着「可展开」的锚点
+    assert!(out.contains(r#"data-slot="change-row""#));
+}
+
+#[test]
+fn diff_preview_renders_the_real_patch() {
+    let out = html(DiffPatchFixture);
+    assert!(out.contains(r#"data-slot="diff-preview""#), "面板没渲染");
+    assert!(out.contains(r#"data-diff-path="src/dirty.rs""#));
+    assert!(out.contains(r#"data-slot="diff-patch""#), "缺少 patch 容器");
+    // 用的是已经移植好的轻量 diff 原语
+    assert!(out.contains("data-lightweight-diff-preview"));
+    // patch 原文逐行渲染出来了。注意 `LightweightDiffPreview` 会把行首的
+    // 协议标记（`+` / `-` / 空格）**取出来做样式**，所以正文里看到的是
+    // 去掉标记之后的内容，而标记体现在 diff-removed / diff-added 类名上。
+    assert!(out.contains("let a = 1;"), "缺少删除行内容");
+    assert!(out.contains("let a = 2;"), "缺少新增行内容");
+    assert!(
+        out.contains("text-diff-removed") && out.contains("text-diff-added"),
+        "行首标记应当被识别成删除/新增"
+    );
+    // 展开的那一行要标出来
+    assert!(out.contains(r#"data-expanded="true""#));
+}
+
+#[test]
+fn diff_preview_shows_a_loading_hint() {
+    let out = html(DiffLoadingFixture);
+    assert!(out.contains(r#"data-slot="diff-preview""#));
+    assert!(out.contains("正在读取 diff"), "加载中必须有文案");
+    // 加载中不该已经有 patch 容器
+    assert!(!out.contains(r#"data-slot="diff-patch""#));
+}
+
+#[test]
+fn diff_preview_explains_why_there_is_no_patch() {
+    // 关键约束：拿不到 patch 的三种情况**不能是空白**，
+    // 否则用户会以为界面坏了。
+    let binary = html(DiffBinaryFixture);
+    assert!(binary.contains(r#"data-slot="diff-unavailable""#));
+    assert!(binary.contains(r#"data-diff-availability="binary""#));
+    assert!(binary.contains("Binary diff is not previewable."));
+
+    let truncated = html(DiffTruncatedFixture);
+    assert!(truncated.contains(r#"data-diff-availability="truncated""#));
+    assert!(truncated.contains("exceeded the preview limit"));
+
+    let unavailable = html(DiffUnavailableFixture);
+    assert!(unavailable.contains(r#"data-diff-availability="unavailable""#));
+    assert!(unavailable.contains("No Git diff is available for this file."));
+}
+
+#[test]
+fn diff_preview_surfaces_command_failures() {
+    let out = html(DiffFailedFixture);
+    assert!(out.contains("读取 diff 失败"), "失败必须显式呈现");
+    assert!(out.contains("git 起不来"), "失败原因必须带出来");
+}
+
+#[test]
+fn diff_preview_does_not_hide_the_rest_of_the_page() {
+    // 展开一个面板不该让分组、汇总、写操作入口消失。
+    let out = html(DiffPatchFixture);
+    for needle in ["已暂存", "未暂存", "未跟踪", "冲突", "全部暂存", "推送"] {
+        assert!(out.contains(needle), "展开 diff 后 `{needle}` 不见了");
+    }
 }

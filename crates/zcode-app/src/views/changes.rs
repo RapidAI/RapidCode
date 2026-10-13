@@ -17,17 +17,36 @@
 //! 2. **失败必须看得见**：写操作的结果走 `workspace_notice`，渲染成顶部横幅 ——
 //!    上一轮「只有个壳子」的根因就是一个被吞掉的错误；
 //! 3. **会丢数据的操作要二次确认**：只有「丢弃」属于这一类，走 `AlertDialog`。
+//!
+//! ## diff 预览
+//!
+//! 点一行就在它下面展开这个文件的 diff，用的是已经移植好的
+//! [`zcode_ui::LightweightDiffPreview`] 原语。四种结果都**必须看得见**，
+//! 不能出现「点了没反应」：
+//!
+//! | 状态 | 界面 |
+//! | --- | --- |
+//! | 加载中 | 转圈 + 「正在读取 diff」 |
+//! | `Patch` | 真的 patch 逐行渲染 |
+//! | `Binary` / `Truncated` / `Unavailable` | 各自的说明文案（不是空白） |
+//! | 命令本身失败 | 红色错误行 |
+//!
+//! 展开状态只由 [`crate::workspace::DiffPreviewState`] 一个信号承载
+//! （行的 key 就是它的 `path`），因此不会出现「展开了 A 却显示 B 的内容」。
 
 use std::path::PathBuf;
 
 use dioxus::prelude::*;
-use zcode_shared::git::{GitChangeKind, GitChangeSectionId, GitFileChange};
+use zcode_shared::git::{
+    GitChangeKind, GitChangeSectionId, GitDiffAvailability, GitDiffResult, GitFileChange,
+};
 use zcode_ui::*;
 
 use crate::state::use_app;
 use crate::workspace::{
-    action_paths, default_workspace_path, display_path, kind_label, section_label,
-    use_workspace_requester, WorkspaceAction, WorkspaceData, WorkspaceNotice, WorkspaceStatus,
+    action_paths, default_workspace_path, diff_query_for, display_path, kind_label, section_label,
+    split_patch_lines, use_workspace_requester, DiffPreviewState, WorkspaceAction, WorkspaceData,
+    WorkspaceNotice, WorkspaceStatus,
 };
 
 /// 待确认的「丢弃」请求。
@@ -443,8 +462,13 @@ fn ChangeSection(
 
 /// 带操作按钮的一行变更。
 ///
+/// 整行可点：点一下在下面展开这个文件的 diff，再点一下收起。
+///
 /// 按钮默认半透明，hover 时才完全显形 —— 否则每一行都挂着两个按钮，
 /// 变更列表会变成一片按钮墙。
+///
+/// 行上的按钮必须 `stop_propagation()`：dioxus 的事件会向上冒泡，
+/// 不拦住的话「暂存」会顺带把 diff 面板开开关关。
 #[component]
 fn ActionableChangeRow(
     change: GitFileChange,
@@ -452,7 +476,10 @@ fn ActionableChangeRow(
     busy: bool,
     on_discard: EventHandler<PendingDiscard>,
 ) -> Element {
+    let ctx = use_app();
     let requester = use_workspace_requester();
+    let mut diff_preview = ctx.diff_preview;
+
     let path = action_paths(&[&change]);
 
     // 已暂存的条目给「取消暂存」，其余给「暂存」
@@ -468,37 +495,171 @@ fn ActionableChangeRow(
     let discard_paths = path;
     let discard_label = display_path(&change).to_string();
 
+    // 展开状态直接由 diff 预览信号决定：行 key 就是它的 path。
+    let row_key = display_path(&change).to_string();
+    let is_open = diff_preview
+        .read()
+        .as_ref()
+        .is_some_and(|state| state.is_open_for(&row_key));
+    let preview_state = if is_open {
+        diff_preview.read().clone()
+    } else {
+        None
+    };
+
+    let query = diff_query_for(&change);
+    let workspace_for_diff = workspace_path.clone();
+    let requester_for_diff = requester.clone();
+    let row_key_for_click = row_key.clone();
+
     rsx! {
-        div { class: "group flex items-center gap-1 border-b border-border pr-1.5 last:border-b-0",
-            div { class: "min-w-0 flex-1",
-                ChangeRow { change: change.clone() }
-            }
-            div { class: "flex shrink-0 items-center gap-0.5 opacity-40 transition-opacity group-hover:opacity-100",
-                Button {
-                    variant: ButtonVariant::Ghost,
-                    size: ButtonSize::Sm,
-                    class: "h-5 px-1.5 text-ui-xs",
-                    disabled: busy,
-                    aria_label: "{label}",
-                    onclick: move |_| {
-                        requester.run(workspace_for_stage.clone(), action_for_click.clone());
-                    },
-                    {label}
+        div {
+            class: "border-b border-border last:border-b-0",
+            "data-slot": "change-row",
+            "data-expanded": if is_open { "true" } else { "false" },
+            div {
+                class: "group flex cursor-pointer items-center gap-1 pr-1.5",
+                onclick: move |_| {
+                    if is_open {
+                        diff_preview.set(None);
+                        return;
+                    }
+                    let id = requester_for_diff.load_diff(
+                        workspace_for_diff.clone(),
+                        query.clone(),
+                        row_key_for_click.clone(),
+                    );
+                    diff_preview.set(Some(DiffPreviewState::Loading {
+                        id,
+                        path: row_key_for_click.clone(),
+                    }));
+                },
+                div { class: "min-w-0 flex-1",
+                    ChangeRow { change: change.clone() }
                 }
-                Button {
-                    variant: ButtonVariant::Ghost,
-                    size: ButtonSize::IconSm,
-                    class: "size-5 text-destructive",
-                    disabled: busy,
-                    aria_label: "丢弃改动",
-                    onclick: move |_| {
-                        on_discard.call(PendingDiscard {
-                            paths: discard_paths.clone(),
-                            staged: is_staged,
-                            labels: vec![discard_label.clone()],
-                        });
-                    },
-                    IconTrash { class: "size-3" }
+                div { class: "flex shrink-0 items-center gap-0.5 opacity-40 transition-opacity group-hover:opacity-100",
+                    Button {
+                        variant: ButtonVariant::Ghost,
+                        size: ButtonSize::Sm,
+                        class: "h-5 px-1.5 text-ui-xs",
+                        disabled: busy,
+                        aria_label: "{label}",
+                        onclick: move |event: MouseEvent| {
+                            event.stop_propagation();
+                            requester.run(workspace_for_stage.clone(), action_for_click.clone());
+                        },
+                        {label}
+                    }
+                    Button {
+                        variant: ButtonVariant::Ghost,
+                        size: ButtonSize::IconSm,
+                        class: "size-5 text-destructive",
+                        disabled: busy,
+                        aria_label: "丢弃改动",
+                        onclick: move |event: MouseEvent| {
+                            event.stop_propagation();
+                            on_discard.call(PendingDiscard {
+                                paths: discard_paths.clone(),
+                                staged: is_staged,
+                                labels: vec![discard_label.clone()],
+                            });
+                        },
+                        IconTrash { class: "size-3" }
+                    }
+                }
+            }
+            if let Some(state) = preview_state {
+                DiffPreviewPane { state }
+            }
+        }
+    }
+}
+
+/// 一行下面的 diff 面板。
+#[component]
+fn DiffPreviewPane(state: DiffPreviewState) -> Element {
+    let path = state.path().to_string();
+    let body = match state {
+        DiffPreviewState::Loading { .. } => rsx! {
+            div { class: "flex items-center gap-2 px-2 py-2 text-ui-xs text-foreground-subtle",
+                Spinner { class: "size-3" }
+                "正在读取 diff…"
+            }
+        },
+        DiffPreviewState::Failed { message, .. } => rsx! {
+            div { class: "flex items-start gap-2 px-2 py-2",
+                IconTriangleAlert { class: "mt-0.5 size-3 shrink-0 text-destructive" }
+                span { class: "min-w-0 break-all text-ui-xs text-destructive",
+                    "读取 diff 失败：{message}"
+                }
+            }
+        },
+        DiffPreviewState::Ready { diff, .. } => rsx! { DiffReadyPane { diff: *diff } },
+    };
+
+    rsx! {
+        div {
+            // 注意用 `bg-background-alt` 而不是 `bg-muted/30`：本设计系统里
+            // **没有 `--color-muted` 令牌**，写了也只会得到「类名在 DOM 上、
+            // 样式表里没有规则」，背景静默不生效。
+            class: "border-t border-border bg-background-alt",
+            "data-slot": "diff-preview",
+            "data-diff-path": "{path}",
+            div { class: "flex items-center gap-2 px-2 py-1",
+                IconFileText { class: "size-3 shrink-0 text-foreground-subtlest" }
+                span { class: "min-w-0 flex-1 truncate text-ui-xs text-foreground-subtle",
+                    "{path}"
+                }
+            }
+            {body}
+        }
+    }
+}
+
+/// diff 已经拿到了 —— 按 `availability` 分四种渲染。
+///
+/// 关键点：**非 `Patch` 的三种也必须有文案**。空面板会让用户以为界面坏了，
+/// 而这正是「失败必须看得见」这条约束要防的东西。
+#[component]
+fn DiffReadyPane(diff: GitDiffResult) -> Element {
+    match diff.availability {
+        GitDiffAvailability::Patch => {
+            let lines = diff
+                .patch
+                .as_deref()
+                .map(split_patch_lines)
+                .unwrap_or_default();
+            rsx! {
+                div { class: "max-h-80 overflow-auto px-2 pb-2",
+                    "data-slot": "diff-patch",
+                    LightweightDiffPreview { lines, font_size_px: 11.0 }
+                }
+            }
+        }
+        availability => {
+            // 图标要显式标成 `Element`：dioxus 0.6 的组件在 Rust 代码里是
+            // **结构体字面量**，`IconInfo {}` 与 `IconTriangleAlert {}` 是不同类型，
+            // 直接放进同一个 `match` 的分支里会编译不过。
+            let icon: Element = match availability {
+                GitDiffAvailability::Truncated => {
+                    rsx! { IconTriangleAlert { class: "size-3" } }
+                }
+                _ => rsx! { IconInfo { class: "size-3" } },
+            };
+            let fallback = match availability {
+                GitDiffAvailability::Binary => "这是二进制文件，无法预览内容。",
+                GitDiffAvailability::Truncated => "diff 输出超过预览上限，已省略。",
+                _ => "没有可预览的 diff。",
+            };
+            rsx! {
+                div {
+                    class: "flex items-start gap-2 px-2 pb-2 text-foreground-subtle",
+                    "data-slot": "diff-unavailable",
+                    "data-diff-availability": "{availability.as_str()}",
+                    div { class: "mt-0.5 shrink-0", {icon} }
+                    span { class: "min-w-0 break-all text-ui-xs",
+                        {diff.summary.unwrap_or_else(|| fallback.to_string())}
+                    }
                 }
             }
         }

@@ -24,7 +24,10 @@
 //! 所以样式表由本文件手工包进 `<style>`（内容仍是同一份 `APP_CSS` 常量）。
 
 use dioxus::prelude::*;
-use zcode_app::workspace::{default_workspace_path, WorkspaceData, WorkspaceStatus};
+use zcode_app::workspace::{
+    default_workspace_path, diff_query_for, display_path, DiffPreviewState, WorkspaceData,
+    WorkspaceStatus,
+};
 use zcode_app::{AppShell, WorkspaceSeed};
 use zcode_services::git::changes::{get_workspace_changes, summarize_changes};
 use zcode_services::git::repo::GitCliRepo;
@@ -51,26 +54,91 @@ fn scan_workspace() -> (Option<WorkspaceData>, WorkspaceStatus) {
     }
 }
 
+/// 同步取一个变更的 diff，用来在快照里展开一个真的 diff 面板。
+///
+/// 挑选规则：**优先挑一个 patch 行数适中、单行不过长**的变更。
+/// 变更列表里的第一个往往正好是压缩过的 `app.css`（整份文件一行），
+/// 展开它只会得到一条横到屏幕外的巨长行，快照完全没法看。
+/// 挑不到合适的就退回第一个变更。
+///
+/// 失败（例如变更是未跟踪的二进制文件）时返回 `None`，
+/// 快照里就只是没有展开项 —— 不影响其它内容。
+fn scan_first_diff(data: &WorkspaceData) -> Option<DiffPreviewState> {
+    /// 太长/太多行的 patch 不适合放进静态快照。
+    fn is_readable(diff: &zcode_shared::git::GitDiffResult) -> bool {
+        use zcode_shared::git::GitDiffAvailability;
+        if diff.availability != GitDiffAvailability::Patch {
+            return false;
+        }
+        let Some(patch) = diff.patch.as_deref() else {
+            return false;
+        };
+        patch.lines().count() <= 80 && patch.lines().all(|line| line.chars().count() <= 200)
+    }
+
+    let workspace = default_workspace_path();
+    let repo = GitCliRepo::new();
+
+    let mut fallback: Option<(String, DiffPreviewState)> = None;
+    for change in &data.changes {
+        let query = diff_query_for(change);
+        let path = display_path(change).to_string();
+        let Ok(diff) = repo.get_diff(&workspace, &query) else {
+            continue;
+        };
+        let state = DiffPreviewState::Ready {
+            id: 1,
+            path: path.clone(),
+            diff: Box::new(diff),
+        };
+        let readable = matches!(
+            &state,
+            DiffPreviewState::Ready { diff, .. } if is_readable(diff)
+        );
+        if readable {
+            return Some(state);
+        }
+        if fallback.is_none() {
+            fallback = Some((path, state));
+        }
+    }
+
+    fallback.map(|(_, state)| state)
+}
+
 /// 把种子塞进 context，然后渲染真实的 `AppShell`。
 #[component]
-fn PreviewRoot(data: Option<WorkspaceData>, status: WorkspaceStatus, tab: String) -> Element {
+fn PreviewRoot(
+    data: Option<WorkspaceData>,
+    status: WorkspaceStatus,
+    tab: String,
+    diff: Option<DiffPreviewState>,
+) -> Element {
     use_context_provider(move || WorkspaceSeed {
         data,
         status,
         tab: Some(tab),
+        diff,
     });
 
     rsx! { AppShell {} }
 }
 
 /// 渲染一份快照并落盘。
-fn write_snapshot(path: &str, data: Option<WorkspaceData>, status: WorkspaceStatus, tab: &str) {
+fn write_snapshot(
+    path: &str,
+    data: Option<WorkspaceData>,
+    status: WorkspaceStatus,
+    tab: &str,
+    diff: Option<DiffPreviewState>,
+) {
     let mut dom = VirtualDom::new_with_props(
         PreviewRoot,
         PreviewRootProps {
             data,
             status,
             tab: tab.to_string(),
+            diff,
         },
     );
     dom.rebuild_in_place();
@@ -135,6 +203,26 @@ fn main() {
         None => println!("工作区扫描失败：{}", status.failure().unwrap_or("未知原因")),
     }
 
-    write_snapshot("app-preview.html", data.clone(), status.clone(), "conversation");
-    write_snapshot("app-preview-changes.html", data, status, "changes");
+    // 「变更」页那份快照额外展开第一个变更的 diff，让静态快照也能证明
+    // diff 预览这块真的在工作（否则它在快照里永远是收起的）。
+    let diff = data.as_ref().and_then(scan_first_diff);
+    match diff.as_ref() {
+        Some(DiffPreviewState::Ready { path, diff, .. }) => println!(
+            "已展开 diff：{path}（{}）",
+            diff.availability.as_str()
+        ),
+        Some(DiffPreviewState::Failed { path, message, .. }) => {
+            println!("展开 diff 失败：{path} —— {message}")
+        }
+        _ => println!("没有可展开的变更"),
+    }
+
+    write_snapshot(
+        "app-preview.html",
+        data.clone(),
+        status.clone(),
+        "conversation",
+        None,
+    );
+    write_snapshot("app-preview-changes.html", data, status, "changes", diff);
 }

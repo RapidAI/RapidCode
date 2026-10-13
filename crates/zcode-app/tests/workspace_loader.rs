@@ -21,7 +21,8 @@ use futures_channel::mpsc::UnboundedReceiver;
 use zcode_app::workspace::{
     create_workspace_channel, next_workspace_message, WorkspaceAction, WorkspaceMessage,
 };
-use zcode_shared::git::GitChangeSectionId;
+use zcode_services::git::types::GitDiffQuery;
+use zcode_shared::git::{GitChangeSectionId, GitDiffAvailability};
 
 /// 本机能不能跑 git。
 fn git_available() -> bool {
@@ -456,5 +457,144 @@ fn discard_through_the_channel_restores_the_working_tree() {
             );
         }
         other => panic!("第三条应当是 Loaded，实际 {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// diff 加载
+// ---------------------------------------------------------------------------
+//
+// 这条路刻意**不共用** `busy` 标志：读 diff 不改仓库、也不碰 `index.lock`，
+// 没有理由和「刷新 / 提交」互相阻塞。所以它也不发 Loading —— 界面上的
+// 「加载中」是由视图自己置的（它才是知道「哪一行被展开」的那一方）。
+
+#[test]
+fn load_diff_returns_a_patch_through_the_background_channel() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-app-loader-diff");
+    let channel = create_workspace_channel();
+    let receiver = channel.take_receiver().expect("第一次应当能取到结果端");
+
+    let id = channel.requester().load_diff(
+        dir.path().to_path_buf(),
+        GitDiffQuery::unstaged("tracked.txt"),
+        "tracked.txt".to_string(),
+    );
+    assert!(id > 0, "请求 id 必须从 1 开始");
+
+    let messages = collect_messages(receiver, 1, Duration::from_secs(30));
+    assert_eq!(
+        messages.len(),
+        1,
+        "diff 不该顺带发 Loading/Loaded —— 它不走 busy 那条路：{messages:?}"
+    );
+
+    match &messages[0] {
+        WorkspaceMessage::Diff(preview) => {
+            assert_eq!(preview.id, id, "回传的 id 必须与请求一致");
+            assert_eq!(preview.path, "tracked.txt");
+            let diff = preview.outcome.as_ref().expect("取 diff 不该失败");
+            assert_eq!(diff.availability, GitDiffAvailability::Patch);
+            let patch = diff.patch.as_deref().expect("应当有 patch");
+            assert!(patch.contains("+two"), "patch：{patch}");
+            // 完整内容也要一并回传（before 来自索引，after 来自工作区）
+            assert_eq!(diff.before_content.as_deref(), Some("one\n"));
+            assert_eq!(diff.after_content.as_deref(), Some("one\ntwo\n"));
+        }
+        other => panic!("应当是 Diff，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn concurrent_diff_requests_get_distinct_ids() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-app-loader-diff-ids");
+    let channel = create_workspace_channel();
+    let receiver = channel.take_receiver().unwrap();
+    let requester = channel.requester();
+
+    // 连开两个文件：两次都必须被接受（不排队、不丢弃），各自带自己的 id，
+    // 由界面按 id 决定采纳哪一份。
+    let first = requester.load_diff(
+        dir.path().to_path_buf(),
+        GitDiffQuery::unstaged("tracked.txt"),
+        "tracked.txt".to_string(),
+    );
+    let second = requester.load_diff(
+        dir.path().to_path_buf(),
+        GitDiffQuery::unstaged("untracked.txt"),
+        "untracked.txt".to_string(),
+    );
+    assert!(second > first, "id 必须单调递增：{first} → {second}");
+
+    let messages = collect_messages(receiver, 2, Duration::from_secs(30));
+    assert_eq!(messages.len(), 2, "两次请求都应当回来：{messages:?}");
+
+    let mut ids: Vec<u64> = messages
+        .iter()
+        .map(|message| match message {
+            WorkspaceMessage::Diff(preview) => preview.id,
+            other => panic!("应当是 Diff，实际 {other:?}"),
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![first, second]);
+
+    // 未跟踪文件走的是「手搓 patch」那条路
+    let untracked = messages
+        .iter()
+        .find_map(|message| match message {
+            WorkspaceMessage::Diff(preview) if preview.path == "untracked.txt" => Some(preview),
+            _ => None,
+        })
+        .expect("应当有 untracked.txt 的结果");
+    let diff = untracked.outcome.as_ref().expect("不该失败");
+    assert_eq!(diff.availability, GitDiffAvailability::Patch);
+    assert!(
+        diff.patch.as_deref().unwrap().starts_with("--- /dev/null"),
+        "未跟踪文件应当走最简 unified diff"
+    );
+}
+
+#[test]
+fn a_failing_diff_reports_the_reason_instead_of_going_silent() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository("zcode-app-loader-diff-outside");
+    let channel = create_workspace_channel();
+    let receiver = channel.take_receiver().unwrap();
+
+    // 越界路径在服务层就被拦下，于是这条会以 Err 回来。
+    let id = channel.requester().load_diff(
+        dir.path().to_path_buf(),
+        GitDiffQuery::unstaged("../outside.txt"),
+        "../outside.txt".to_string(),
+    );
+
+    let messages = collect_messages(receiver, 1, Duration::from_secs(30));
+    match &messages[0] {
+        WorkspaceMessage::Diff(preview) => {
+            assert_eq!(preview.id, id);
+            let message = preview
+                .outcome
+                .as_ref()
+                .expect_err("越界路径应当以 Err 回来");
+            assert!(
+                message.contains("outside repository"),
+                "原因必须带出来，否则界面只能显示一个空的「加载中」：{message}"
+            );
+        }
+        other => panic!("应当是 Diff，实际 {other:?}"),
     }
 }
