@@ -820,6 +820,11 @@ fn WorkspaceHarness(
     #[props(default)] diff: Option<DiffPreviewState>,
     /// 预先塞进批注 store 的一条批注（`None` = 没有批注）。
     #[props(default)] comment: Option<CodeCommentPreviewEntry>,
+    /// 上面那条批注挂在哪个文件上（决定它进哪个桶）。
+    ///
+    /// 默认 `src/dirty.rs`（未暂存）；测提交范围裁剪时要换成 `src/staged.rs`
+    /// 或别的路径，才能构造出「裁剪前 = 裁剪后」与「裁剪后为空」两种情形。
+    #[props(default = "src/dirty.rs")] comment_path: &'static str,
 ) -> Element {
     let channel = use_hook(zcode_app::workspace::create_workspace_channel);
     let requester = channel.requester();
@@ -840,7 +845,7 @@ fn WorkspaceHarness(
                     // 视图层用**分支名**当 identity（见 `workspace_identity_of`），
                     // fixture 的分支是 `rust-only`，这里必须对齐。
                     workspace_identity: Some("rust-only".to_string()),
-                    source_path: "src/dirty.rs".to_string(),
+                    source_path: comment_path.to_string(),
                 },
                 comment,
             );
@@ -1140,6 +1145,78 @@ fn commit_box_is_absent_for_a_non_repository() {
 }
 
 #[test]
+fn commit_scope_hint_is_absent_without_any_session_files() {
+    // 没有任何批注 ⇒ session_paths 为空 ⇒ 范围计算退化成「不裁剪」。
+    // 此时若还渲染提示，就等于告诉用户「你的提交信息被裁剪了」，而事实上没有 ——
+    // 这是会让人误删文件、误改提交范围的错误信息。
+    let out = html(ChangesFixture);
+    assert!(
+        !out.contains("data-slot=\"commit-scope-hint\""),
+        "没有会话批注时不该出现提交范围提示"
+    );
+    assert!(
+        !out.contains("生成提交信息时只会带上这些"),
+        "没有会话批注时不该出现裁剪文案"
+    );
+}
+
+#[test]
+fn commit_scope_hint_is_absent_when_the_scope_changes_nothing() {
+    // 会话碰过的文件与已暂存列表**完全重合**（`src/staged.rs` 是唯一已暂存文件，
+    // 也正是唯一批注过的文件）⇒ 裁剪前后个数相同 ⇒ 提示没有信息量，不该出现。
+    //
+    // 反过来说：如果这条断言挂了，说明判断条件退化成了「只要有会话文件就提示」，
+    // 用户会在没有裁剪的时候被告知「被裁剪了」。
+    let out = html(ScopedAllStagedFixture);
+    assert!(
+        !out.contains("data-slot=\"commit-scope-hint\""),
+        "裁剪前后一致时不该出现提交范围提示"
+    );
+}
+
+#[test]
+fn commit_scope_hint_reports_how_many_staged_files_are_in_scope() {
+    // 夹具里已暂存 1 个文件（`src/staged.rs`），但会话批注落在 `src/dirty.rs` 上
+    // —— 一个未暂存文件。于是裁剪结果是**空集**：写提交信息时一个已暂存文件都不带。
+    //
+    // 这正是这个提示存在的理由：用户明明暂存了东西，却被告知「本次会话没碰过它们」，
+    // 才会意识到自己看的不是将要提交的那批文件。
+    let out = html(ScopedNoneStagedFixture);
+    let hint = scoped_hint_section(&out);
+    assert!(
+        !hint.is_empty(),
+        "已暂存文件全被裁掉时，必须出现提交范围提示，否则用户以为提交信息覆盖了全部改动"
+    );
+    assert!(
+        hint.contains("data-scoped-count=\"0\""),
+        "`data-scoped-count` 应为 0（一个已暂存文件都不在范围内），实际：{hint}"
+    );
+    assert!(
+        hint.contains("data-staged-count=\"1\""),
+        "`data-staged-count` 应为 1（真实已暂存文件数），实际：{hint}"
+    );
+    assert!(
+        hint.contains("本次会话只碰过其中 0 个文件"),
+        "提示文案必须带上真实数字，否则用户看不懂发生了什么"
+    );
+}
+
+/// 从整页 HTML 里裁出提交范围提示那一段。
+///
+/// 与 [`branch_comparison_section`] 同理：直接对整页断言 `contains("0")` 是无效的
+/// —— 页面上到处都有数字，断言必然通过。
+fn scoped_hint_section(out: &str) -> String {
+    const MARKER: &str = "data-slot=\"commit-scope-hint\"";
+    let Some(start) = out.find(MARKER) else {
+        return String::new();
+    };
+    let rest = &out[start..];
+    // 提示是个单层 div，取到它自己闭合为止即可。
+    let end = rest.find("</div>").map(|i| i + 6).unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+#[test]
 fn discard_asks_for_confirmation_before_doing_anything() {
     // 「丢弃」是会丢数据的操作，默认必须是关闭的确认框，而不是直接执行。
     let out = html(ChangesFixture);
@@ -1205,8 +1282,49 @@ fn diff_result(availability: GitDiffAvailability, patch: Option<&str>, summary: 
 fn DiffFixture(
     state: DiffPreviewState,
     #[props(default)] comment: Option<CodeCommentPreviewEntry>,
+    #[props(default = "src/dirty.rs")] comment_path: &'static str,
 ) -> Element {
-    rsx! { WorkspaceHarness { case: "changes", diff: Some(state), comment } }
+    rsx! { WorkspaceHarness { case: "changes", diff: Some(state), comment, comment_path } }
+}
+
+/// 会话批注**恰好落在唯一的已暂存文件**上 ⇒ 裁剪前后个数一致 ⇒ 不该有提示。
+#[component]
+fn ScopedAllStagedFixture() -> Element {
+    rsx! {
+        WorkspaceHarness {
+            case: "changes",
+            comment_path: "src/staged.rs",
+            comment: Some(CodeCommentPreviewEntry {
+                id: "code-comment:1:src/staged.rs".to_string(),
+                source_path: Some("src/staged.rs".to_string()),
+                source_title: "staged.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                selected_text: "let a = 1;".to_string(),
+                comment: "这条改动我确认过了".to_string(),
+            }),
+        }
+    }
+}
+
+/// 会话批注落在**未暂存**文件上 ⇒ 已暂存文件全被裁掉 ⇒ 必须有提示，且数字为 0。
+#[component]
+fn ScopedNoneStagedFixture() -> Element {
+    rsx! {
+        WorkspaceHarness {
+            case: "changes",
+            comment_path: "src/dirty.rs",
+            comment: Some(CodeCommentPreviewEntry {
+                id: "code-comment:1:src/dirty.rs".to_string(),
+                source_path: Some("src/dirty.rs".to_string()),
+                source_title: "dirty.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                selected_text: "let a = 1;".to_string(),
+                comment: "看看这一行".to_string(),
+            }),
+        }
+    }
 }
 
 #[component]
@@ -1480,3 +1598,4 @@ fn diff_preview_does_not_hide_the_rest_of_the_page() {
         assert!(out.contains(needle), "展开 diff 后 `{needle}` 不见了");
     }
 }
+

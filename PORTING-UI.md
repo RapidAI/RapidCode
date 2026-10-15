@@ -22,7 +22,7 @@
   界面上列出的分支、变更文件、`+N/-M` 都来自真实 `git status` / `git diff`，
   不是硬编码；`暂存` / `取消暂存` / `丢弃` / `提交` / `推送` 五个动作也是真的在跑 `git`；
   **点开任意一行会展开真实补丁**（行号、增删着色都来自 `git diff` 本身）；
-- `cargo build` / `cargo test` **全绿**（工作区 **1130** 个测试，零警告），
+- `cargo build` / `cargo test` **全绿**（工作区 **1217** 个测试，零警告），
   且测试层**不需要 wasm、不需要窗口、不需要浏览器**；
 - 类名（`class`）输出与 TS 版本**逐字符对齐** —— 移植后仍复用 `packages/ui` 的
   同一套 Tailwind 样式与 `@custom-variant` 语义，不需要改一行 CSS。
@@ -38,7 +38,7 @@
 ```
 cargo run   -p zcode-app                  # 开一个 1360×860 的桌面窗口（默认 feature = desktop）
 cargo build -p zcode-ui                   # 纯组件模型，任意环境可编译
-cargo test  --workspace                   # 1130 个测试，全部在 host 上跑
+cargo test  --workspace                   # 1217 个测试，全部在 host 上跑
 cargo run   -p zcode-ui --example preview # 生成可直接打开的 preview.html
 ```
 
@@ -416,7 +416,7 @@ rsx! {
 | `src/workspace.rs` | **真实数据桥**：`WorkspaceRequester`（后台线程 + `futures-channel`）、`use_workspace_requester()`、`WorkspaceStatus` 四态；`refresh()` 读、`run(WorkspaceAction)` 写，两者共用同一个 `busy` 原子量**串行化**；`load_diff()` 读补丁，**刻意不共用 `busy`**（读 diff 不碰 `index.lock`），代价是每次请求带一个单调递增 `id`，轮询端只采纳当前那次的结果；`WorkspaceNotice` 回传单次写操作的成败 |
 | `src/views/sidebar.rs` | 品牌行 + 搜索（`InputGroup`）+ 按「今天/昨天/更早」分组的会话列表 + 右键菜单（`DropdownMenu`，destructive 删除）+ 上下文用量（`Progress`）+ 头像；**底部显示真实工作区目录名与「分支 · N 个变更」** |
 | `src/views/topbar.rs` | 会话标题 + **`WorkspaceBadge`**（五态：失败 / 加载中 / 未扫描 / 非仓库 / 真实分支 + ahead-behind + 变更数）+ 视图 `Tabs` + 模型选择器（`DropdownMenuRadioItem`）+ 带 `Tooltip` 的图标按钮（刷新按钮接 `requester.refresh()`） |
-| `src/views/changes.rs` | **「变更」页**：`WorkspaceBar`（分支 / 仓库根 / 汇总 / 刷新 + **推送按钮** + **提交输入框与提交按钮**）+ 按「已暂存 / 未暂存 / 未跟踪 / 冲突」分节（每组带 **全部暂存 / 全部丢弃**）+ `ActionableChangeRow`（`+N/-M` + 行内 **暂存** 按钮 + 垃圾桶按钮，默认 `opacity-40`、hover 才完全显形；**整行可点，点开就地展开真实补丁**）+ `DiffPreviewPane`（四种状态：有补丁 / 加载中 / 不可用且说明原因 / 命令失败）+ **`AnnotatablePatch`**（可批注的补丁：逐行带**文件行号**与「加批注」按钮，行下挂已有批注与草稿，行号映射走 `map_patch_lines_to_file_numbers`）+ `NoticeBanner`（成功 / 失败提示条）+ 丢弃前的 `AlertDialog` 二次确认 + 加载 / 干净 / 非仓库 / 失败 / 空 五种落空态 + `NotPortedPane` |
+| `src/views/changes.rs` | **「变更」页**：`WorkspaceBar`（分支 / 仓库根 / 汇总 / 刷新 + **推送按钮** + **提交输入框与提交按钮**）+ 按「已暂存 / 未暂存 / 未跟踪 / 冲突」分节（每组带 **全部暂存 / 全部丢弃**）+ `ActionableChangeRow`（`+N/-M` + 行内 **暂存** 按钮 + 垃圾桶按钮，默认 `opacity-40`、hover 才完全显形；**整行可点，点开就地展开真实补丁**）+ `DiffPreviewPane`（四种状态：有补丁 / 加载中 / 不可用且说明原因 / 命令失败）+ **`AnnotatablePatch`**（可批注的补丁：逐行带**文件行号**与「加批注」按钮，行下挂已有批注与草稿，行号映射走 `map_patch_lines_to_file_numbers`）+ `NoticeBanner`（成功 / 失败提示条）+ 丢弃前的 `AlertDialog` 二次确认 + **提交范围提示**（「本次会话只碰过其中 N 个文件」，由批注反推会话文件、再经 `filter_commit_message_files_by_current_session` 裁剪得到，仅当裁剪真的改变结果时出现）+ 加载 / 干净 / 非仓库 / 失败 / 空 五种落空态 + `NotPortedPane` |
 | `src/views/conversation.rs` | 消息流；助手头像挂 `HoverCard`；工具调用卡片（分段 `Progress`）；流式提示用受控 `Collapsible` + `Alert` |
 | `src/views/composer.rs` | `InputGroup`（`InlineStart` 回形针 / `Textarea` / `InlineEnd` 发送或停止）+ 审批模式选择器 + **待发送批注计数**（`N 条代码批注将一并发送`）+ **上一条实际发出内容**（含 `# Code comments:` 块的折叠展示）；发送时把批注经 `build_prompt_with_code_comments` 拼进正文并清空 store |
 | `src/views/detail.rs` | 执行计划（受控 `Collapsible`）+ **变更文件（`ChangesSection`，真实数据）** + 工具调用 / 上下文来源（`Accordion`）+ 权限 `RadioGroup` + 分段 `Progress` + 图例 + `AvatarGroup` + `ButtonGroup` |
@@ -492,7 +492,7 @@ cargo run -p zcode-app --example app_preview
 > 逐个到 `app.css` 里查有没有规则，剩下的就是这类「静默失效」的类名。
 
 ```bash
-bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,806 字节）
+bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,930 字节）
 ```
 
 > ⚠️ Tailwind v4 会**按需裁剪** `@theme`：只有被实际用到的令牌才会作为 CSS 变量输出。
@@ -508,7 +508,7 @@ bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,806 
 | 纯函数单测 | `zcode-ui/src/**` 内联 `#[cfg(test)]` | 803 | 字符串包含 / 相等 / 数值 |
 | mutation 记录式渲染 | `zcode-ui/tests/render.rs` | 11 | 区分静态属性 / 动态属性 / 文本节点 |
 | HTML 快照 | `zcode-ui/tests/html_snapshot.rs` | 75 | 序列化后的 HTML 字符串 |
-| 整树冒烟（真实数据注入） | `zcode-app/tests/smoke.rs` | 43（+1 ignored） | 把整个应用（含浮层）真渲染一遍，变更页用 fixture 注入六种数据状态 + 写操作入口与提示条 + **diff 预览的四种状态** + **可批注的补丁行**（文件行号 / 不可批注的行 / 已有批注卡片 / 无批注时的提示）+ **只读分支分组**（有上游 / 无上游 / 干净但领先） |
+| 整树冒烟（真实数据注入） | `zcode-app/tests/smoke.rs` | 46（+1 ignored） | 把整个应用（含浮层）真渲染一遍，变更页用 fixture 注入六种数据状态 + 写操作入口与提示条 + **diff 预览的四种状态** + **可批注的补丁行**（文件行号 / 不可批注的行 / 已有批注卡片 / 无批注时的提示）+ **只读分支分组**（有上游 / 无上游 / 干净但领先）+ **提交范围提示**（无会话文件不提示 / 裁剪前后一致不提示 / 全被裁掉时报 0） |
 | 跨线程读 / 写 / diff 链路 | `zcode-app/tests/workspace_loader.rs` | 10 | 手写 executor 驱动 `refresh` / `run` / `load_diff → 后台线程 → 通道 → 结果`，不依赖 dioxus 运行时；含**分支比较穿透后台通道** |
 | git 端到端 | `zcode-services/tests/git_workspace.rs` | 43 | 真起临时仓库，跑真实 `git status` / `git log` / `git config` / `git diff`（读 23，含分支比较）与 `stage` / `unstage` / `discard` / `commit` / `push`（写 20） |
 
@@ -518,10 +518,10 @@ bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,806 
 | --- | --- | --- | --- |
 | `zcode-rpc` | 10 | — | 10 |
 | `zcode-shared` | 19 | — | 19 |
-| `zcode-services` | 148 | 43 | 191 |
+| `zcode-services` | 167 | 43 | 210 |
 | `zcode-ui` | 803 | 75 + 11 | 889 |
-| `zcode-app` | 33 | 43 + 10 | 86 |
-| **合计** | **1013** | **182** | **1195** |
+| `zcode-app` | 33 | 46 + 10 | 89 |
+| **合计** | **1032** | **185** | **1217** |
 
 > **为什么「变更」页的冒烟测试不跑真 git**：快照测试只跑同步代码，
 > `spawn` 出来的 future 根本不会被 poll，所以 `AppShell` 在拿不到
@@ -603,6 +603,71 @@ buckets 的 key 也有一个签名级别的坑：`get_code_comment_workspace_key
 `AnnotatablePatch` 少传一次，算出来的桶 key 就和别处不一致，
 表现正是「批注加上了却一条也看不见」（这个 bug 在开发过程中真的踩过一次，
 集成测试把它挡住了）。
+
+#### 5.1.2 提交范围：批注反过来决定「哪些文件进 prompt」
+
+批注不只是给模型看的注释，它还回答了另一个问题：**这次会话到底碰过哪些文件**。
+生成提交信息时，上游不会把整个已暂存列表塞进去 —— 一次会话可能改了 20 个文件、
+用户这次只动过 2 个，全塞进去模型只会写出一段覆盖全部改动的废话。
+裁剪逻辑在 `zcode-services/src/git/commit_message_scope.rs`（移植
+`commitMessageFileScope.ts`，纯路径运算、零 IO）。
+
+本移植还没有文件编辑链路，所以「会话碰过的文件」暂时**由批注反推**
+（`changes.rs::session_touched_paths` 取 `collect_composer_attachments().source_path`）。
+这是有意的降级：批注同样表达了「用户真的在看这些文件」，等编辑链路移植过来再换掉。
+
+三个容易搞错的地方：
+
+- **安全默认是「不裁剪」，不是「全裁掉」**。`current_session_file_paths` 为
+  `None` / 空 ⇒ 返回**全部**文件。「不知道要裁什么」和「什么都不要发」是两回事；
+  前者若退化成后者，用户会发现提交信息是空的却不知道为什么。
+  与之相对，**有**会话信息但一个都对不上 ⇒ 结果是**真的空集**。
+- **三路匹配，命中任意一条即可**：`path` / `repoRelativePath` /
+  `workspaceRelativePath` 中任意一个归一化后落进范围就算数。
+  当 `workspaceInRepoPath != "."` 时，工作区相对路径还要额外生成一个
+  `"{workspaceInRepoPath}/{path}"` 候选，否则它永远匹配不上 `repoRelativePath`。
+- **`normalizeCommitMessageScopePath` 只削一个前导 `/`**（上游 `^\.?\/` 没有 `+`），
+  尾部 `/` 全削。所以 `//a/b.ts` 归一化后是 `/a/b.ts` —— **仍然是绝对路径**，
+  会被后续的绝对路径判定拒掉。顺手「多削一个」会让它变成一个看起来相对的路径，
+  从而错误地匹配上 scope。
+
+`node:path.relative` 没有第三方依赖可用（`zcode-services` 的零依赖策略），
+所以在 `git/config.rs` 里手写了一份 `relative_path`。**它的语义是拿 Node 当基准
+验证过的**，不是照着自己的推理写的：
+
+```rust
+#[test]
+fn relative_path_matches_the_node_baseline() {
+    // 期望值全部来自 `path.win32.relative` 的真实输出
+    let cases: &[(&str, &str, &str)] = &[
+        ("/a/b/c", "/a/b/c/d.ts", "d.ts"),
+        ("/a/b/c", "/a/b/d.ts", "../d.ts"),
+        ("/a/b/c", "/a/b/c", ""),
+        ("/a", "/a/b/c/d.ts", "b/c/d.ts"),
+        ("C:/repo", "C:/repo/a/b.ts", "a/b.ts"),
+        ("C:/r", "C:/r/../b.ts", "../b.ts"),
+        ("/a/b/c", "/x/y.ts", "../../../x/y.ts"),
+        ("", "a.ts", "a.ts"),
+        // 跨盘：Node **原样返回 to**（于是 isAbsolute 为真，调用方据此拒掉）
+        ("C:/a", "D:/b", "D:/b"),
+        ...
+    ];
+    ...
+}
+```
+
+最关键的一条是**跨盘**：`path.win32.relative("C:/a", "D:/b")` 不返回相对路径，
+而是**原样返回 `"D:/b"`**（此时 `isAbsolute` 为真）。这正是
+`isRelativePathInsideScope` 必须拦掉的情形 —— 若把它当成相对路径，
+一个 D 盘的文件会被误判成「在 C 盘的工作区里」。盘符本身**大小写不敏感**
+（`c:` ≡ `C:`），而**没有盘符**的路径（posix `/…`、UNC `//…`）按普通路径比较，
+不当作跨盘。
+
+界面上这条裁剪结果只在**真的改变了结果**时才提示（`data-slot="commit-scope-hint"`）：
+没有会话批注、或裁剪前后个数一致，都不出现 —— 否则就是在没有裁剪的时候
+告诉用户「被裁剪了」。冒烟测试三条正对着这个判断：
+不提示（无会话文件）、不提示（前后一致）、**必须提示且数字为 0**
+（已暂存文件全被会话范围排除，此时用户才知道自己看的不是将要提交的那批文件）。
 
 ### 5.2 mutation 记录式渲染（11 个）
 

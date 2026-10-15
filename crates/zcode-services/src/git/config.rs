@@ -177,9 +177,102 @@ pub fn to_workspace_relative_git_path(
     }
 }
 
+/// `node:path.relative(from, to)` 的等价物。
+///
+/// 逐条对齐 Node 的实测语义（用 `path.win32.relative` 验过）：
+///
+/// | `from` | `to` | 结果 |
+/// | --- | --- | --- |
+/// | `/a/b/c` | `/a/b/c/d.ts` | `d.ts` |
+/// | `/a/b/c` | `/a/b/d.ts` | `../d.ts` |
+/// | `/a/b/c` | `/a/b/c` | `""` |
+/// | `/a/b/c` | `/a/b` | `..` |
+/// | `C:\repo` | `D:\other\b.ts` | **`D:\other\b.ts`（原样返回）** |
+///
+/// 最后一行是关键：**跨盘符时 Node 不硬凑 `..`，而是把目标原样吐回来**。
+/// 调用方（[`crate::git::commit_message_scope`]）正是靠
+/// 「返回值是不是绝对路径」来判断要不要收下这个候选，所以这里必须照抄 ——
+/// 换成「凑一串 `..`」会把一个完全无关的盘符路径当成仓库内的相对路径。
+///
+/// 输出一律用 `/` 分隔：本移植全程用 `/` 表示 git 路径，
+/// 混进 `\` 会让下游的 `starts_with(".../")` 判断失效。
+pub fn relative_path(from: &str, to: &str) -> String {
+    let from = normalize_git_path(from);
+    let to = normalize_git_path(to);
+
+    // 跨盘符 / 一侧有盘符另一侧没有 —— Node 直接返回 to
+    if drive_of(&from) != drive_of(&to) {
+        return to;
+    }
+
+    // 词法归约后再比，`a/b/../c` 与 `a/c` 要算同一条路径
+    let from_parts = absolute_parts(&from);
+    let to_parts = absolute_parts(&to);
+
+    let common = from_parts
+        .iter()
+        .zip(to_parts.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut result: Vec<String> = Vec::new();
+    // 先退到公共祖先
+    for _ in common..from_parts.len() {
+        result.push("..".to_string());
+    }
+    // 再往下走到目标
+    result.extend(to_parts[common..].iter().cloned());
+
+    result.join("/")
+}
+
+/// 取盘符（`C:` / `c:`）。没有盘符时返回空串 —— posix 路径与 UNC 都走这条。
+///
+/// 只归一大小写，不做别的：Node 在 Windows 上认为 `C:` 与 `c:` 是同一个盘。
+fn drive_of(path: &str) -> String {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && (bytes[0] as char).is_ascii_alphabetic() {
+        return (bytes[0] as char)
+            .to_ascii_lowercase()
+            .to_string()
+            .to_uppercase();
+    }
+    String::new()
+}
+
+/// 拆成「去掉盘符与根、消解了 `.` / `..`」的段列表。
+///
+/// 起点的 `..` 会保留（不越过根），与 Node 一致。
+fn absolute_parts(path: &str) -> Vec<String> {
+    let without_drive = {
+        let bytes = path.as_bytes();
+        if bytes.len() >= 2 && bytes[1] == b':' && (bytes[0] as char).is_ascii_alphabetic() {
+            &path[2..]
+        } else {
+            path
+        }
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    for segment in without_drive.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                // 只有前面有普通段时才回退，否则保留 `..`
+                if parts.last().is_some_and(|last| last != "..") {
+                    parts.pop();
+                } else {
+                    parts.push("..".to_string());
+                }
+            }
+            other => parts.push(other.to_string()),
+        }
+    }
+    parts
+}
+
 /// 去掉开头至多一处 `/` 或 `./`（对应上游 `path.replace(/^\.?\//, "")`）。
-fn strip_leading_dot_slash(value: &str) -> &str {
-    if let Some(rest) = value.strip_prefix("./") {
+fn strip_leading_dot_slash(value: &str) -> &str {    if let Some(rest) = value.strip_prefix("./") {
         rest
     } else if let Some(rest) = value.strip_prefix('/') {
         rest

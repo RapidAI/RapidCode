@@ -13,6 +13,7 @@
 //! | `repo/gitCliRepo.ts`（`git log` 解析那一组纯函数） | [`graph`] |
 //! | `repo/gitCliRepo.ts`（diff 结果构造那一组纯函数） | [`diff`] |
 //! | `gitService.ts`（`getChanges`） | [`changes`] |
+//! | `commitMessageFileScope.ts` | [`commit_message_scope`] |
 //!
 //! [`graph`] 与 [`diff`] 在上游并不是独立文件 —— 它们是 `gitCliRepo.ts` /
 //! `gitCliHelpers.ts` 顶部的模块级纯函数。拆出来只是为了能脱离进程直接测，
@@ -20,6 +21,7 @@
 
 pub mod changes;
 pub mod cli_helpers;
+pub mod commit_message_scope;
 pub mod config;
 pub mod diff;
 pub mod graph;

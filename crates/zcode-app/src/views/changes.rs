@@ -46,10 +46,11 @@ use zcode_ui::*;
 use crate::state::use_app;
 use crate::workspace::{
     action_paths, default_workspace_path, diff_query_for, display_path, kind_label, section_label,
-    split_patch_lines, use_code_comments, use_workspace_requester, DiffPreviewState,
-    WorkspaceAction, WorkspaceData, WorkspaceNotice, WorkspaceStatus,
+    split_patch_lines, use_code_comments, use_workspace_requester, CodeCommentCtx,
+    DiffPreviewState, WorkspaceAction, WorkspaceData, WorkspaceNotice, WorkspaceStatus,
 };
 
+use zcode_services::git::commit_message_scope::filter_commit_message_files_by_current_session;
 use zcode_services::git::types::GitDiffQuery;
 
 /// 待确认的「丢弃」请求。
@@ -275,6 +276,36 @@ pub fn WorkspaceBar(data: Option<WorkspaceData>, status: WorkspaceStatus) -> Ele
     let requester_for_push = requester.clone();
     let requester_for_refresh = requester.clone();
 
+    // 「本次会话碰过的文件」= 用户批注过的那些文件。拿它把已暂存列表裁一遍，
+    // 得到「写提交信息时真正会进 prompt 的文件」。
+    //
+    // 为什么不直接把整个已暂存列表拿去写提交信息：一次会话可能改了 20 个文件，
+    // 用户这次只碰了 2 个 —— 全塞进去模型只会写出一段覆盖全部改动的废话。
+    // 裁剪规则见 `zcode_services::git::commit_message_scope`。
+    let session_paths = session_touched_paths(&use_code_comments());
+    let scoped_staged = data.as_ref().map(|data| {
+        let staged: Vec<GitFileChange> = data
+            .changes_in(GitChangeSectionId::Staged)
+            .into_iter()
+            .cloned()
+            .collect();
+        let workspace_root = data.summary.workspace_path.clone();
+        let repo_root = data.summary.repo_root.clone();
+        let in_repo = data.summary.workspace_in_repo_path.clone();
+        filter_commit_message_files_by_current_session(
+            &staged,
+            &workspace_root,
+            &repo_root,
+            &in_repo,
+            Some(&session_paths),
+        )
+    });
+    // 有会话信息、且裁剪结果与总数不同 —— 才值得提示，否则是噪音
+    let scoped_hint = scoped_staged.as_ref().and_then(|scoped| {
+        (!session_paths.is_empty() && scoped.len() != staged_count)
+            .then_some(scoped.len())
+    });
+
     rsx! {
         div { class: "flex flex-col border-b border-border",
             div { class: "flex h-11 shrink-0 items-center gap-2 px-4",
@@ -353,6 +384,23 @@ pub fn WorkspaceBar(data: Option<WorkspaceData>, status: WorkspaceStatus) -> Ele
                         },
                         IconCheck { class: "size-3.5" }
                         "提交"
+                    }
+                }
+
+                // 生成提交信息时**实际会进 prompt** 的文件数。
+                //
+                // 只在「裁剪真的改变了结果」时才出现：没有会话批注、
+                // 或裁剪后一个不少，都说明没有信息量，显示出来只是噪音。
+                if let Some(scoped) = scoped_hint {
+                    div {
+                        class: "flex shrink-0 items-center gap-1.5 px-4 pb-2 text-ui-xs text-foreground-subtle",
+                        "data-slot": "commit-scope-hint",
+                        "data-scoped-count": "{scoped}",
+                        "data-staged-count": "{staged_count}",
+                        IconInfo { class: "size-3 shrink-0" }
+                        span {
+                            "本次会话只碰过其中 {scoped} 个文件，生成提交信息时只会带上这些。"
+                        }
                     }
                 }
             }
@@ -778,6 +826,22 @@ fn workspace_identity_of(ctx: &crate::state::AppCtx) -> Option<String> {
         .read()
         .as_ref()
         .and_then(|data| data.summary.branch_name.clone())
+}
+
+/// 「本次会话碰过的文件」= 用户留下批注的那些文件。
+///
+/// 上游用的是「本会话里打开 / 编辑过的文件列表」，本移植还没有文件编辑链路，
+/// 所以退一步用**批注过的文件**——它同样表达了「用户这次真的在看这些文件」。
+/// 一个批注都没有时返回空，此时范围计算会退化成「不裁剪」。
+fn session_touched_paths(comments: &CodeCommentCtx) -> Vec<String> {
+    comments
+        .previews
+        .read()
+        .collect_composer_attachments()
+        .into_iter()
+        .filter_map(|attachment| attachment.source_path)
+        .filter(|path| !path.trim().is_empty())
+        .collect()
 }
 
 /// 一行下面的 diff 面板。

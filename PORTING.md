@@ -37,7 +37,7 @@
 > 并为 UI 层选定 Rust 等价框架（Dioxus）从原语组件开始迁移，  
 > 最后从 `packages/services` 里挑自包含的链路接上真实 IO。**
 
-产出保证：`cargo build` 与 `cargo test` 全部通过（零警告、1130 个测试全绿）。
+产出保证：`cargo build` 与 `cargo test` 全部通过（零警告、1217 个测试全绿）。
 
 ---
 
@@ -123,6 +123,7 @@ Rust 侧与 React 语义最贴近的等价框架是 **Dioxus 0.6**（RSX ≈ JSX
 | `repo/gitCliRepo.ts`（diff 结果构造那一组纯函数） | `git/diff.rs` | ✅ 完整（可用性判定 / 二进制探测 / 未跟踪文件最小补丁） |
 | `repo/gitCliRepo.ts` | `git/repo.rs` | ✅ 读路径（`resolve` / `getStatus` / `listLocalBranches` / `getIdentity` / `getIgnoredPaths` / `getCommitGraph` / `getDiff` / `getBranchComparison`）+ 写路径（`stage` / `unstage` / `discard` / `commit` / `push`） |
 | `gitService.ts` 的 `getChanges` | `git/changes.rs` | ✅ 完整（按暂存区分组 + 汇总 + 分支比较条目构造） |
+| `git/commitMessageFileScope.ts` | `git/commit_message_scope.rs` | ✅ 完整（按「本会话碰过的文件」裁剪已暂存列表，供生成提交信息用；含手写的 `node:path.relative` 等价物，语义以 Node 输出为基准钉住） |
 | `packages/shared/src/git.ts` | `crates/zcode-shared/src/git.rs` | ✅ 类型层完整 |
 
 > `graph.rs` / `diff.rs` 在上游**并不是独立文件** —— 它们是 `gitCliRepo.ts` /
@@ -135,9 +136,6 @@ Rust 侧与 React 语义最贴近的等价框架是 **Dioxus 0.6**（RSX ≈ JSX
 
 - `gitCommitMessageGenerator*` —— 依赖 LLM provider；
 - `gitCheckpoint*` —— 依赖检查点存储（另一个未移植的子系统）；
-- `commitMessageFileScope`；
-- `getBranchComparison` —— 分支比较的「提交列表 + 文件列表」聚合视图，
-  需要先有提交图之外的 merge-base 计算链路；
 - `reuseInFlightRequest` —— 上游用它把并发发起的同一个查询合并成一次。
   本移植的读接口是**无状态**的，调用方自己决定要不要合并；
 - `commit` 的 **`stagedOnly` 部分提交变体** —— 上游靠临时 `GIT_INDEX_FILE`
@@ -411,7 +409,7 @@ while let Some(message) = next_workspace_message(receiver).await { … }
 
 ```bash
 cargo build                              # 编译整个工作区
-cargo test                               # 工作区 1130 个测试
+cargo test                               # 工作区 1217 个测试
 cargo run -p zcode-app                   # 桌面窗口（⚠️ 本机能开窗但内容空白，见 README「已知问题」）
 cargo run -p zcode-ui --example preview  # 生成 UI 预览页 ./preview.html
 cargo build --release
@@ -423,7 +421,7 @@ cargo build --release
 | --- | ---: | ---: | --- |
 | `zcode-rpc` | 10 | — | 序列化 / 事件 / 端到端 RPC |
 | `zcode-shared` | 19 | — | 行级变更统计 / 供应商族 / 套餐身份 / git 类型（含提交图 ref、改动来源枚举） |
-| `zcode-services` | 148 | 43 | git 解析 / 路径归一 / 提交图 / diff 结果构造纯函数，**真起临时仓库**的端到端（读 23 + 写 20） |
+| `zcode-services` | 167 | 43 | git 解析 / 路径归一 / 提交图 / diff 结果构造纯函数，**真起临时仓库**的端到端（读 23 + 写 20） |
 | `zcode-ui` | 742 | 75 + 11 | 类名 / 几何 / 键盘纯函数、渲染指令、HTML 快照 |
 | `zcode-app` | 33 | 39 + 10 | 应用外壳 + 整树冒烟（含写操作入口、diff 预览四种状态、只读分支分组）+ 跨线程读 / 写 / diff / 分支比较链路 |
 
@@ -521,7 +519,7 @@ cargo build --release
 2. **`packages/rpc` 的补充**：真实 `Socket` 实现（TCP / WebSocket）、  
    `MessagePortLike` 的 Electron/浏览器绑定、与 `packages/provider*` 的对接。
 3. **UI 层**（见 [PORTING-UI.md](./PORTING-UI.md) §6/§7）：  
-   **47 / 47 个原语已全部移植完毕**，并拼出了可运行的 `zcode-app`（1130 个测试全绿）。
+   **47 / 47 个原语已全部移植完毕**，并拼出了可运行的 `zcode-app`（1217 个测试全绿）。
    剩余的是**宿主接线**而非移植：`overlay.rs` 的边缘翻转碰撞检测，以及为
    `code_viewer` / `diff_viewer` / `pdf_viewer` / `pptx_preview_viewer` / `chart` /
    `carousel` 接上各自的 JS 引擎等价物（这些属于宿主应用职责，见 §4.4）。
