@@ -155,6 +155,46 @@ pub struct GitFileChange {
     pub is_conflicted: bool,
 }
 
+/// 分支比较里的一条变更（上游 `GitBranchComparisonChange`）。
+///
+/// 与 [`GitFileChange`] 的区别：这里**没有** `x` / `y` 状态码，也没有
+/// `is_staged` / `is_untracked` / `is_conflicted` —— 因为它描述的不是
+/// 「工作区相对索引」的状态，而是「两个提交之间的差异」，
+/// 那些状态位在语义上不存在。
+///
+/// 路径同样给三份（绝对 / 仓库相对 / workspace 相对），
+/// 因为下游要按 workspace 范围过滤、又要拼绝对路径去读文件内容。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitBranchComparisonChange {
+    /// 绝对路径（平台分隔符）。
+    pub path: String,
+    /// 相对仓库根的路径，恒为 `/` 分隔。
+    pub repo_relative_path: String,
+    /// 相对 workspace 的路径（workspace 是仓库子目录时才有意义）。
+    pub workspace_relative_path: String,
+    /// 重命名前的仓库相对路径。
+    pub original_path: Option<String>,
+    pub kind: GitChangeKind,
+    pub added: u32,
+    pub removed: u32,
+}
+
+/// 分支比较的快照（上游 `GitBranchComparison` 的 `changes` + 标签部分）。
+///
+/// 上游把 `resolution` 也塞在这个类型里，这里**刻意不塞** ——
+/// 调用方本来就已经拿着 [`GitResolvedRepository`] 了（`get_status` 会返回），
+/// 再复制一份只会有两个可能不一致的真源。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct GitBranchComparison {
+    /// 比较基准（上游跟踪分支）。
+    pub base_ref: Option<String>,
+    /// 比较目标（当前分支；detached 时是 `"HEAD"`）。
+    pub head_ref: Option<String>,
+    /// 展示用标签，形如 `main -> origin/main`；无从比较时为 `None`。
+    pub comparison_label: Option<String>,
+    pub changes: Vec<GitBranchComparisonChange>,
+}
+
 /// workspace 与仓库的关系。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GitWorkspaceRepositoryKind {

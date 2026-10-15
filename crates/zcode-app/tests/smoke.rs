@@ -16,7 +16,7 @@ use zcode_app::state::{demo_state, AppCtx};
 use zcode_app::workspace::{
     DiffPreviewState, WorkspaceData, WorkspaceNotice, WorkspaceStatus,
 };
-use zcode_shared::git::{GitDiffAvailability, GitDiffResult};
+use zcode_shared::git::{GitBranchComparison, GitBranchComparisonChange, GitDiffAvailability, GitDiffResult};
 use zcode_ui::*;
 
 /// 把组件渲染成 HTML 字符串。
@@ -716,6 +716,37 @@ fn workspace_fixture(case: &str) -> (Option<WorkspaceData>, WorkspaceStatus) {
         removed: changes.iter().map(|change| change.removed).sum(),
     };
 
+    // 一个「本地领先上游两个文件」的分支比较。
+    //
+    // 刻意**不叫** `git_status` / `status` —— 它是 `WorkspaceData` 的一个字段，
+    // 与 `summary()` 里的 `ahead` / `behind` 是两回事：后者数的是提交数，
+    // 这里列的是文件级差异。
+    let branch_comparison = || GitBranchComparison {
+        base_ref: Some("origin/main".to_string()),
+        head_ref: Some("rust-only".to_string()),
+        comparison_label: Some("rust-only -> origin/main".to_string()),
+        changes: vec![
+            GitBranchComparisonChange {
+                path: "F:/demo/workspace/src/ahead.rs".to_string(),
+                repo_relative_path: "src/ahead.rs".to_string(),
+                workspace_relative_path: "src/ahead.rs".to_string(),
+                original_path: None,
+                kind: GitChangeKind::Modified,
+                added: 5,
+                removed: 2,
+            },
+            GitBranchComparisonChange {
+                path: "F:/demo/workspace/src/renamed.rs".to_string(),
+                repo_relative_path: "src/renamed.rs".to_string(),
+                workspace_relative_path: "src/renamed.rs".to_string(),
+                original_path: Some("src/old.rs".to_string()),
+                kind: GitChangeKind::Renamed,
+                added: 0,
+                removed: 0,
+            },
+        ],
+    };
+
     match case {
         "changes" => {
             let changes = vec![
@@ -730,6 +761,8 @@ fn workspace_fixture(case: &str) -> (Option<WorkspaceData>, WorkspaceStatus) {
                     summary: summary("rust-only", true),
                     changes,
                     totals,
+                    // 有上游 —— 「与上游比较」分组会跟着一起渲染。
+                    branch_comparison: branch_comparison(),
                 }),
                 WorkspaceStatus::Ready,
             )
@@ -739,6 +772,22 @@ fn workspace_fixture(case: &str) -> (Option<WorkspaceData>, WorkspaceStatus) {
                 summary: summary("main", true),
                 changes: Vec::new(),
                 totals: GitChangeSummary::default(),
+                // 「干净」只说明没有未提交改动，不代表和上游一致。
+                // 这里故意给一个非空的分支比较：工作区干净但本地领先上游时，
+                // 这个分组**必须**照样出现，否则用户会以为「没东西可推」。
+                branch_comparison: branch_comparison(),
+            }),
+            WorkspaceStatus::Ready,
+        ),
+        "clean-no-upstream" => (
+            Some(WorkspaceData {
+                summary: summary("main", true),
+                changes: Vec::new(),
+                totals: GitChangeSummary::default(),
+                // 没有上游 ⇒ `base_ref` 是 `None` ⇒ 整个分组不渲染。
+                // 这是与上面 `"clean"` 配对的反例：两边工作区一样干净，
+                // 差别只在「有没有可比较的基准」。
+                branch_comparison: GitBranchComparison::default(),
             }),
             WorkspaceStatus::Ready,
         ),
@@ -747,6 +796,7 @@ fn workspace_fixture(case: &str) -> (Option<WorkspaceData>, WorkspaceStatus) {
                 summary: summary("main", false),
                 changes: Vec::new(),
                 totals: GitChangeSummary::default(),
+                branch_comparison: GitBranchComparison::default(),
             }),
             WorkspaceStatus::Ready,
         ),
@@ -830,6 +880,12 @@ fn ConversationTabFixture() -> Element {
     rsx! { WorkspaceHarness { case: "clean", tab: "conversation" } }
 }
 
+/// 工作区干净、**没有**上游 —— 「与上游比较」分组不该出现。
+#[component]
+fn CleanNoUpstreamFixture() -> Element {
+    rsx! { WorkspaceHarness { case: "clean-no-upstream" } }
+}
+
 #[test]
 fn changes_view_lists_real_change_sections() {
     let out = html(ChangesFixture);
@@ -860,6 +916,84 @@ fn changes_view_shows_clean_state() {
     assert!(out.contains("工作区干净"), "干净工作区应当有明确文案");
     // 干净不等于「什么都不显示」——分支信息仍要在
     assert!(out.contains("main"));
+}
+
+#[test]
+fn branch_comparison_group_renders_as_readonly() {
+    let out = html(ChangesFixture);
+
+    // 分组标题与 `comparisonLabel`（上游 `branch` 数据集那个字段）
+    assert!(out.contains("与上游比较"), "缺少「与上游比较」分组");
+    assert!(
+        out.contains("rust-only -&gt; origin/main") || out.contains("rust-only -> origin/main"),
+        "缺少 comparisonLabel，实际没有把 base/head 带出来"
+    );
+    // 分组内的文件
+    assert!(out.contains("src/ahead.rs"), "缺少分支比较里的文件");
+    // 重命名行要显示成 `旧 → 新`，否则用户看到一个没见过的文件名，
+    // 会以为它是新加的文件
+    assert!(
+        out.contains("src/old.rs → src/renamed.rs"),
+        "重命名行没有显示成 `旧 → 新`"
+    );
+
+    // 只读的含义：这一分组里**不能**出现写操作按钮。
+    // 两侧都是提交，`stage` / `discard` 没有意义可言。
+    let group = branch_comparison_section(&out);
+    for forbidden in ["暂存", "取消暂存", "丢弃"] {
+        assert!(
+            !group.contains(forbidden),
+            "分支比较是只读的，不该出现 `{forbidden}` 按钮"
+        );
+    }
+    assert!(
+        group.contains("data-slot=\"change-row\""),
+        "只读分组里的行仍应可点开看 diff"
+    );
+}
+
+/// 从整页 HTML 里裁出「与上游比较」那一段，供「不该出现什么」类断言使用。
+///
+/// 用整页去断言 `!contains("丢弃")` 是无效的 —— 工作区那几组里本来就有
+/// 「丢弃」按钮，无论只读分组对不对，断言都会通过。
+fn branch_comparison_section(out: &str) -> String {
+    const MARKER: &str = "data-slot=\"branch-comparison-section\"";
+    let start = out.find(MARKER).expect("页面里应当有分支比较分组");
+    let rest = &out[start + MARKER.len()..];
+    // 分组是同级里的最后一个；截到「拿不到闭合标签」为止即可，
+    // 只要把后面的内容排除掉就够做出「这一段里有没有 X」的判断。
+    let end = rest
+        .find("</section>")
+        .or_else(|| rest.find("data-slot=\"not"))
+        .unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+#[test]
+fn branch_comparison_group_is_absent_without_an_upstream() {
+    // `base_ref == None` 是「整个分组不该渲染」的信号，与
+    // 「有基准但没差异」是两回事 —— 后者要渲染一个空分组说明「和上游一致」，
+    // 前者渲染出来只会让人误以为「已经同步」。
+    let out = html(CleanNoUpstreamFixture);
+    assert!(
+        !out.contains("与上游比较"),
+        "没有上游时不该渲染分支比较分组"
+    );
+    // 但工作区的「干净」状态本身照常呈现
+    assert!(out.contains("工作区干净"));
+}
+
+#[test]
+fn a_clean_workspace_can_still_be_ahead_of_upstream() {
+    // 「干净」只说明没有未提交改动。本地领先上游时，
+    // 分支比较分组**必须**照常出现，否则用户会以为「没东西可推」。
+    let out = html(CleanFixture);
+    assert!(out.contains("工作区干净"));
+    assert!(
+        out.contains("与上游比较"),
+        "工作区干净但领先上游时，分支比较分组必须照样渲染"
+    );
+    assert!(out.contains("src/ahead.rs"));
 }
 
 #[test]

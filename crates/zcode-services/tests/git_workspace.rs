@@ -1212,12 +1212,20 @@ fn diff_with_a_branch_source_compares_against_the_upstream() {
     }
 
     // 用一个本地目录当 remote，避免测试碰网络。
+    //
+    // ⚠️ 这里**必须 clone**，不能各建一个仓库再 `remote add`。
+    // 两个独立 `git init` 出来的仓库，即使文件内容一样，初始提交也是两个不同的
+    // 对象 —— 它们没有共同祖先，`origin/main...HEAD` 会直接报
+    // `fatal: no merge base`。之前那版就是各建一个，测试能不能过取决于
+    // 上次运行残留的目录，属于「靠运气绿」。
     let remote = build_clean_repository("zcode-services-e2e-branch-remote", "file.txt", "v1\n");
 
-    let dir = build_clean_repository("zcode-services-e2e-branch-local", "file.txt", "v1\n");
+    let dir = TempDir::new("zcode-services-e2e-branch-local");
     let remote_url = remote.path().to_str().unwrap().to_string();
-    git(dir.path(), &["remote", "add", "origin", &remote_url]);
-    git(dir.path(), &["fetch", "--quiet", "origin"]);
+    git(
+        dir.path(),
+        &["clone", "--quiet", &remote_url, "."],
+    );
     git(
         dir.path(),
         &["branch", "--set-upstream-to=origin/main", "main"],
@@ -1259,4 +1267,237 @@ fn diff_rejects_paths_outside_the_repository() {
         failure.kind,
         zcode_services::git::cli_helpers::GitCommandFailureKind::PathOutsideRepository
     );
+}
+
+/// 搭一个「本地克隆 + 上游」，并把本地往前推一条提交。
+///
+/// 返回 `(remote, local)` —— `remote` 必须一起活着，否则本地那个 `origin`
+/// 指向的路径会在中途消失。
+fn build_repository_with_upstream(
+    name: &str,
+    file: &str,
+    base_content: &str,
+    next_content: &str,
+) -> (TempDir, TempDir) {
+    let remote = build_clean_repository(&format!("{name}-remote"), file, base_content);
+
+    let local = TempDir::new(&format!("{name}-local"));
+    let remote_url = remote.path().to_str().unwrap().to_string();
+    // clone 而不是各自 init —— 见 diff_with_a_branch_source 里的注释。
+    git(local.path(), &["clone", "--quiet", &remote_url, "."]);
+    git(
+        local.path(),
+        &["branch", "--set-upstream-to=origin/main", "main"],
+    );
+
+    std::fs::write(local.path().join(file), next_content).unwrap();
+    git(local.path(), &["add", "--", file]);
+    git(local.path(), &["commit", "--quiet", "-m", "next"]);
+
+    (remote, local)
+}
+
+#[test]
+fn branch_comparison_lists_the_files_that_differ_from_upstream() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let (_remote, dir) =
+        build_repository_with_upstream("zcode-services-e2e-compare", "file.txt", "v1\n", "v2\n");
+    let repo = GitCliRepo::new();
+
+    let comparison = repo
+        .get_branch_comparison(dir.path())
+        .expect("分支比较不应失败");
+
+    assert_eq!(comparison.base_ref.as_deref(), Some("origin/main"));
+    assert_eq!(comparison.head_ref.as_deref(), Some("main"));
+    // 标签用「当前分支 -> 上游」的顺序，不是反过来。
+    assert_eq!(
+        comparison.comparison_label.as_deref(),
+        Some("main -> origin/main")
+    );
+
+    assert_eq!(comparison.changes.len(), 1, "只改了一个文件");
+    let change = &comparison.changes[0];
+    assert_eq!(change.repo_relative_path, "file.txt");
+    // 改一行、删一行 ⇒ 既不是纯加也不是纯删 ⇒ modified。
+    assert_eq!(change.kind, GitChangeKind::Modified);
+    assert_eq!(change.added, 1);
+    assert_eq!(change.removed, 1);
+    // 绝对路径按平台分隔符拼，且指向真实存在的文件。
+    assert!(Path::new(&change.path).is_absolute(), "{}", change.path);
+    assert_eq!(change.workspace_relative_path, "file.txt");
+    assert_eq!(change.original_path, None);
+}
+
+#[test]
+fn branch_comparison_is_empty_when_the_branch_matches_upstream() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let remote = build_clean_repository("zcode-services-e2e-compare-clean-remote", "a.txt", "a\n");
+    let local = TempDir::new("zcode-services-e2e-compare-clean-local");
+    let remote_url = remote.path().to_str().unwrap().to_string();
+    git(local.path(), &["clone", "--quiet", &remote_url, "."]);
+    git(
+        local.path(),
+        &["branch", "--set-upstream-to=origin/main", "main"],
+    );
+
+    let repo = GitCliRepo::new();
+    let comparison = repo
+        .get_branch_comparison(local.path())
+        .expect("分支比较不应失败");
+
+    // 「和上游一致」是**正常状态**：refs 与标签都在，只是没有差异文件。
+    // 这里必须能区分「没差异」和「没法比较」—— 后者 base_ref 是 None。
+    assert_eq!(comparison.base_ref.as_deref(), Some("origin/main"));
+    assert!(comparison.changes.is_empty());
+}
+
+#[test]
+fn branch_comparison_without_an_upstream_is_a_graceful_degradation() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    // 注意用 dir_outside_any_repository 而不是 build_clean_repository：
+    // 后者建在 `CARGO_TARGET_TMPDIR`（= 本仓库的 `target/`）里，仍在 work tree 内，
+    // 于是 `git status` 报的是**外层真实仓库**的分支名与上游。
+    // 想测「没有上游」，就必须真的站在任何仓库之外。
+    let Some(dir) = dir_outside_any_repository("e2e-compare-no-upstream") else {
+        return;
+    };
+    git(dir.path(), &["init", "--quiet", "-b", "main"]);
+    std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    git(dir.path(), &["add", "--", "a.txt"]);
+    git(dir.path(), &["commit", "--quiet", "-m", "initial"]);
+
+    let repo = GitCliRepo::new();
+    let comparison = repo
+        .get_branch_comparison(dir.path())
+        .expect("没有上游不是错误");
+
+    // base_ref 为 None 是调用方判断「这个分组压根不该出现」的依据。
+    assert_eq!(comparison.base_ref, None);
+    assert_eq!(comparison.comparison_label, None);
+    assert!(comparison.changes.is_empty());
+    // head_ref 仍然有值 —— 分支名本来就读得到，只是没有比较基准。
+    assert_eq!(comparison.head_ref.as_deref(), Some("main"));
+}
+
+#[test]
+fn branch_comparison_is_empty_for_a_plain_directory() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    // 同上：必须真的在任何仓库之外，否则拿到的是外层仓库的上游。
+    let Some(dir) = dir_outside_any_repository("e2e-compare-not-a-repo") else {
+        return;
+    };
+    let repo = GitCliRepo::new();
+
+    let comparison = repo
+        .get_branch_comparison(dir.path())
+        .expect("非仓库也不该报错");
+    assert_eq!(comparison.base_ref, None);
+    assert!(comparison.changes.is_empty());
+}
+
+#[test]
+fn branch_comparison_reports_renames_and_deletions() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let remote =
+        build_clean_repository("zcode-services-e2e-compare-rename-remote", "old.txt", "a\nb\nc\n");
+    let local = TempDir::new("zcode-services-e2e-compare-rename-local");
+    let remote_url = remote.path().to_str().unwrap().to_string();
+    git(local.path(), &["clone", "--quiet", &remote_url, "."]);
+    git(
+        local.path(),
+        &["branch", "--set-upstream-to=origin/main", "main"],
+    );
+
+    // 重命名（内容不变）+ 新增一个文件 + 删掉一个文件。
+    git(local.path(), &["mv", "old.txt", "new.txt"]);
+    std::fs::write(local.path().join("added.txt"), "x\n").unwrap();
+    git(local.path(), &["add", "--", "added.txt"]);
+    git(local.path(), &["commit", "--quiet", "-m", "rename + add"]);
+
+    let repo = GitCliRepo::new();
+    let comparison = repo
+        .get_branch_comparison(local.path())
+        .expect("分支比较不应失败");
+
+    let by_path = |path: &str| {
+        comparison
+            .changes
+            .iter()
+            .find(|change| change.repo_relative_path == path)
+            .unwrap_or_else(|| panic!("缺少 {path}：{:?}", comparison.changes))
+    };
+
+    // 重命名：kind 来自 numstat 的显式标记，而不是行数（内容没变，行数推不出来）。
+    let renamed = by_path("new.txt");
+    assert_eq!(renamed.kind, GitChangeKind::Renamed);
+    assert_eq!(renamed.original_path.as_deref(), Some("old.txt"));
+
+    assert_eq!(by_path("added.txt").kind, GitChangeKind::Added);
+}
+
+#[test]
+fn branch_comparison_is_scoped_to_the_workspace_subdirectory() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let remote = build_clean_repository("zcode-services-e2e-compare-scope-remote", "top.txt", "t\n");
+    let clone_root = TempDir::new("zcode-services-e2e-compare-scope");
+    let remote_url = remote.path().to_str().unwrap().to_string();
+    git(clone_root.path(), &["clone", "--quiet", &remote_url, "."]);
+    git(
+        clone_root.path(),
+        &["branch", "--set-upstream-to=origin/main", "main"],
+    );
+
+    // 造两个目录，各自一个文件；两个都相对上游有改动。
+    std::fs::create_dir_all(clone_root.path().join("nested")).unwrap();
+    std::fs::write(clone_root.path().join("nested/inner.txt"), "inner\n").unwrap();
+    std::fs::write(clone_root.path().join("top.txt"), "top-changed\n").unwrap();
+    git(clone_root.path(), &["add", "-A"]);
+    git(clone_root.path(), &["commit", "--quiet", "-m", "both"]);
+
+    let repo = GitCliRepo::new();
+
+    // 从子目录看：只应看到 nested/ 里的那个文件。
+    let from_nested = repo
+        .get_branch_comparison(&clone_root.path().join("nested"))
+        .expect("分支比较不应失败");
+    assert_eq!(
+        from_nested.changes.len(),
+        1,
+        "workspace 是子目录时不该看到仓库别处的改动：{:?}",
+        from_nested.changes
+    );
+    assert_eq!(from_nested.changes[0].repo_relative_path, "nested/inner.txt");
+    // 相对路径要相对 workspace（不是相对仓库根）。
+    assert_eq!(from_nested.changes[0].workspace_relative_path, "inner.txt");
+
+    // 从仓库根看：两个都在。
+    let from_root = repo
+        .get_branch_comparison(clone_root.path())
+        .expect("分支比较不应失败");
+    assert_eq!(from_root.changes.len(), 2);
 }

@@ -22,7 +22,7 @@
   界面上列出的分支、变更文件、`+N/-M` 都来自真实 `git status` / `git diff`，
   不是硬编码；`暂存` / `取消暂存` / `丢弃` / `提交` / `推送` 五个动作也是真的在跑 `git`；
   **点开任意一行会展开真实补丁**（行号、增删着色都来自 `git diff` 本身）；
-- `cargo build` / `cargo test` **全绿**（工作区 **1116** 个测试，零警告），
+- `cargo build` / `cargo test` **全绿**（工作区 **1130** 个测试，零警告），
   且测试层**不需要 wasm、不需要窗口、不需要浏览器**；
 - 类名（`class`）输出与 TS 版本**逐字符对齐** —— 移植后仍复用 `packages/ui` 的
   同一套 Tailwind 样式与 `@custom-variant` 语义，不需要改一行 CSS。
@@ -38,7 +38,7 @@
 ```
 cargo run   -p zcode-app                  # 开一个 1360×860 的桌面窗口（默认 feature = desktop）
 cargo build -p zcode-ui                   # 纯组件模型，任意环境可编译
-cargo test  --workspace                   # 1116 个测试，全部在 host 上跑
+cargo test  --workspace                   # 1130 个测试，全部在 host 上跑
 cargo run   -p zcode-ui --example preview # 生成可直接打开的 preview.html
 ```
 
@@ -506,9 +506,9 @@ bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,806 
 | 纯函数单测 | `zcode-ui/src/**` 内联 `#[cfg(test)]` | 742 | 字符串包含 / 相等 / 数值 |
 | mutation 记录式渲染 | `zcode-ui/tests/render.rs` | 11 | 区分静态属性 / 动态属性 / 文本节点 |
 | HTML 快照 | `zcode-ui/tests/html_snapshot.rs` | 75 | 序列化后的 HTML 字符串 |
-| 整树冒烟（真实数据注入） | `zcode-app/tests/smoke.rs` | 36（+1 ignored） | 把整个应用（含浮层）真渲染一遍，变更页用 fixture 注入五种数据状态 + 写操作入口与提示条 + **diff 预览的四种状态** |
-| 跨线程读 / 写 / diff 链路 | `zcode-app/tests/workspace_loader.rs` | 9 | 手写 executor 驱动 `refresh` / `run` / `load_diff → 后台线程 → 通道 → 结果`，不依赖 dioxus 运行时 |
-| git 端到端 | `zcode-services/tests/git_workspace.rs` | 37 | 真起临时仓库，跑真实 `git status` / `git log` / `git config` / `git diff`（读 17）与 `stage` / `unstage` / `discard` / `commit` / `push`（写 20） |
+| 整树冒烟（真实数据注入） | `zcode-app/tests/smoke.rs` | 39（+1 ignored） | 把整个应用（含浮层）真渲染一遍，变更页用 fixture 注入六种数据状态 + 写操作入口与提示条 + **diff 预览的四种状态** + **只读分支分组**（有上游 / 无上游 / 干净但领先） |
+| 跨线程读 / 写 / diff 链路 | `zcode-app/tests/workspace_loader.rs` | 10 | 手写 executor 驱动 `refresh` / `run` / `load_diff → 后台线程 → 通道 → 结果`，不依赖 dioxus 运行时；含**分支比较穿透后台通道** |
+| git 端到端 | `zcode-services/tests/git_workspace.rs` | 43 | 真起临时仓库，跑真实 `git status` / `git log` / `git config` / `git diff`（读 23，含分支比较）与 `stage` / `unstage` / `discard` / `commit` / `push`（写 20） |
 
 各 crate 明细：
 
@@ -516,17 +516,21 @@ bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,806 
 | --- | --- | --- | --- |
 | `zcode-rpc` | 10 | — | 10 |
 | `zcode-shared` | 19 | — | 19 |
-| `zcode-services` | 144 | 37 | 181 |
+| `zcode-services` | 148 | 43 | 191 |
 | `zcode-ui` | 742 | 75 + 11 | 828 |
-| `zcode-app` | 33 | 36 + 9 | 78 |
-| **合计** | **948** | **168** | **1116** |
+| `zcode-app` | 33 | 39 + 10 | 82 |
+| **合计** | **952** | **178** | **1130** |
 
 > **为什么「变更」页的冒烟测试不跑真 git**：快照测试只跑同步代码，
 > `spawn` 出来的 future 根本不会被 poll，所以 `AppShell` 在拿不到
 > `WorkspaceBootstrap` 时不会发起扫描。测试用 `WorkspaceHarness` 直接注入
-> `WorkspaceSeed`（`changes` / `clean` / `not-repo` / `failed` / `loading` 五个 fixture）
-> 与 `WorkspaceNotice`（成功 / 失败两种），
+> `WorkspaceSeed`（`changes` / `clean` / `clean-no-upstream` / `not-repo` /
+> `failed` / `loading` 六个 fixture）与 `WorkspaceNotice`（成功 / 失败两种），
 > 于是**渲染层测试完全确定**，真 git 的行为交给 `zcode-services` 那两层去测。
+>
+> `clean` 与 `clean-no-upstream` 这一对是刻意配的：工作区状态**一模一样**
+> （都是干净的、都没有未提交改动），唯一差别是「有没有可比较的上游」。
+> 于是「分组该不该渲染」这个判断被单独隔离出来测，不受其它状态干扰。
 >
 > 写操作那条路因此被拆成三段各自验证：**渲染**（smoke 断言按钮 / 提交框 /
 > 确认弹窗在不在）、**通道语义**（loader 断言 `Loading → Notice → Loaded`

@@ -16,24 +16,41 @@
 
 use std::path::Path;
 
-use zcode_shared::git::{GitChangeSectionId, GitFileChange};
+use zcode_shared::git::{GitBranchComparisonChange, GitChangeSectionId, GitFileChange};
 
-use super::cli_helpers::join_repo_relative;
+use super::cli_helpers::{infer_kind_from_numstat, join_repo_relative};
 use super::config::{is_path_in_workspace_scope, to_workspace_relative_git_path};
-use super::types::{GitChangeSection, GitLineStat, GitStatusEntry, GitStatusSnapshot};
+use super::types::{
+    GitChangeSection, GitLineStat, GitResolvedRepository, GitStatusEntry, GitStatusSnapshot,
+};
 
 /// 变更的来源分组。上游是 `"unstaged" | "staged"` 的字面量联合。
+///
+/// ## 为什么这里不复用 `zcode_shared::git::GitChangeSourceId`
+///
+/// 两者**不是同一件事**，刻意分开：
+///
+/// - 本枚举是 `git status` 快照的**展开维度** —— 一条 status 记录按它展开成
+///   0～2 条变更。它对应上游 `toChangeForSource` 的 `sourceId` 形参，
+///   取值范围就只有这两个。
+/// - `zcode_shared::git::GitChangeSourceId` 是**改动来源**（多出 `branch` /
+///   `last-turn`），用来回答「这次 diff 跟谁比」，对应上游 `getDiff` 的入参。
+///   它的取值不可能喂进 [`to_change_for_source`] —— 拿一个 `Branch` 去展开
+///   `git status` 是没有意义的。
+///
+/// 早期两者同名，只靠模块路径区分，一旦有文件同时 `use` 两侧就会撞名。
+/// 改名是为了让「名字不同 = 用途不同」在类型上直接可见。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GitChangeSourceId {
+pub enum GitStatusChangeSource {
     Unstaged,
     Staged,
 }
 
-impl GitChangeSourceId {
+impl GitStatusChangeSource {
     pub fn as_str(&self) -> &'static str {
         match self {
-            GitChangeSourceId::Unstaged => "unstaged",
-            GitChangeSourceId::Staged => "staged",
+            GitStatusChangeSource::Unstaged => "unstaged",
+            GitStatusChangeSource::Staged => "staged",
         }
     }
 }
@@ -50,7 +67,7 @@ pub struct GitChangeSummary {
 pub fn to_change_for_source(
     snapshot: &GitStatusSnapshot,
     entry: &GitStatusEntry,
-    source_id: GitChangeSourceId,
+    source_id: GitStatusChangeSource,
 ) -> Option<GitFileChange> {
     // workspace 是仓库子目录时，仓库里其它目录的改动不该出现在面板上。
     if !matches_workspace_scope(&snapshot.summary.workspace_in_repo_path, entry) {
@@ -58,7 +75,7 @@ pub fn to_change_for_source(
     }
 
     match source_id {
-        GitChangeSourceId::Staged => {
+        GitStatusChangeSource::Staged => {
             // 未跟踪与冲突条目没有「索引态改动」可言。
             if entry.is_untracked || entry.is_conflicted || !has_change_marker(entry.x.as_deref()) {
                 return None;
@@ -73,7 +90,7 @@ pub fn to_change_for_source(
                 stat.removed,
             ))
         }
-        GitChangeSourceId::Unstaged => {
+        GitStatusChangeSource::Unstaged => {
             if entry.is_conflicted {
                 // 冲突文件的行数统计没有意义（三方合并），统一给 0。
                 return Some(build_file_change(
@@ -116,7 +133,7 @@ pub fn to_change_for_source(
 }
 
 /// 取某个来源下的全部变更。
-pub fn get_changes(snapshot: &GitStatusSnapshot, source_id: GitChangeSourceId) -> Vec<GitFileChange> {
+pub fn get_changes(snapshot: &GitStatusSnapshot, source_id: GitStatusChangeSource) -> Vec<GitFileChange> {
     snapshot
         .entries
         .iter()
@@ -127,8 +144,8 @@ pub fn get_changes(snapshot: &GitStatusSnapshot, source_id: GitChangeSourceId) -
 /// 取工作区的全部变更（staged + unstaged），顺序与上游 `refresh` 一致：
 /// 先未暂存（含未跟踪、冲突），再已暂存。
 pub fn get_workspace_changes(snapshot: &GitStatusSnapshot) -> Vec<GitFileChange> {
-    let mut changes = get_changes(snapshot, GitChangeSourceId::Unstaged);
-    changes.extend(get_changes(snapshot, GitChangeSourceId::Staged));
+    let mut changes = get_changes(snapshot, GitStatusChangeSource::Unstaged);
+    changes.extend(get_changes(snapshot, GitStatusChangeSource::Staged));
     changes
 }
 
@@ -144,6 +161,62 @@ pub fn summarize_changes(changes: &[GitFileChange]) -> GitChangeSummary {
         summary.removed += change.removed;
     }
     summary
+}
+
+/// 把 numstat 的一条记录转成「分支比较」里的一条变更。
+///
+/// 对应上游 `gitService.ts` 的 `toBranchComparisonChange`。两处与
+/// [`build_file_change`] 不同，都是刻意的：
+///
+/// 1. **范围过滤用同一套规则，但判断的字段不同。** `git status` 条目有 `path`
+///    与 `original_path` 两个字段；这里传入的是 [`GitLineStat`] 的
+///    `original_path`（重命名前路径）。重命名跨越 workspace 边界时，
+///    **只要任一侧在范围内就保留** —— 否则用户会看到「文件凭空消失了」。
+/// 2. **没有状态码与布尔位。** 分支比较的两侧都是提交，`is_staged` /
+///    `is_untracked` / `is_conflicted` 在语义上不存在，一律不填。
+///
+/// 返回 `None` 表示这条变更落在 workspace 范围之外，调用方应丢弃它。
+pub fn to_branch_comparison_change(
+    resolution: &GitResolvedRepository,
+    workspace_in_repo_path: &str,
+    repo_relative_path: &str,
+    stat: &GitLineStat,
+) -> Option<GitBranchComparisonChange> {
+    if !branch_change_is_in_workspace_scope(
+        repo_relative_path,
+        stat.original_path.as_deref(),
+        workspace_in_repo_path,
+    ) {
+        return None;
+    }
+
+    Some(GitBranchComparisonChange {
+        path: join_repo_relative(Path::new(&resolution.repo_root), repo_relative_path)
+            .to_string_lossy()
+            .into_owned(),
+        repo_relative_path: repo_relative_path.to_string(),
+        workspace_relative_path: to_workspace_relative_git_path(
+            repo_relative_path,
+            workspace_in_repo_path,
+        ),
+        original_path: stat.original_path.clone(),
+        // 分支比较的 kind 只能从行数反推 —— numstat 不带状态码。
+        kind: infer_kind_from_numstat(stat),
+        added: stat.added,
+        removed: stat.removed,
+    })
+}
+
+/// 分支比较条目是否落在 workspace 范围内（重命名时任一侧在即可）。
+fn branch_change_is_in_workspace_scope(
+    repo_relative_path: &str,
+    original_path: Option<&str>,
+    workspace_in_repo_path: &str,
+) -> bool {
+    is_path_in_workspace_scope(repo_relative_path, workspace_in_repo_path)
+        || original_path.is_some_and(|original| {
+            is_path_in_workspace_scope(original, workspace_in_repo_path)
+        })
 }
 
 /// 未跟踪文件是否值得进面板。
@@ -481,16 +554,108 @@ mod tests {
         snap.entries.push(entry("staged.rs", Some("M"), Some(".")));
         snap.entries.push(entry("unstaged.rs", Some("."), Some("M")));
 
-        let staged = get_changes(&snap, GitChangeSourceId::Staged);
+        let staged = get_changes(&snap, GitStatusChangeSource::Staged);
         assert_eq!(staged.len(), 1);
         assert_eq!(staged[0].repo_relative_path, "staged.rs");
 
-        let unstaged = get_changes(&snap, GitChangeSourceId::Unstaged);
+        let unstaged = get_changes(&snap, GitStatusChangeSource::Unstaged);
         assert_eq!(unstaged.len(), 1);
         assert_eq!(unstaged[0].repo_relative_path, "unstaged.rs");
 
-        assert_eq!(GitChangeSourceId::Staged.as_str(), "staged");
-        assert_eq!(GitChangeSourceId::Unstaged.as_str(), "unstaged");
+        assert_eq!(GitStatusChangeSource::Staged.as_str(), "staged");
+        assert_eq!(GitStatusChangeSource::Unstaged.as_str(), "unstaged");
+    }
+
+    /// 造一个仓库根在 `/repo` 的解析结果，供分支比较的转换测试用。
+    fn resolution(repo_root: &str) -> GitResolvedRepository {
+        GitResolvedRepository {
+            workspace_path: repo_root.to_string(),
+            repo_root: repo_root.to_string(),
+            workspace_in_repo_path: ".".to_string(),
+            auto_refresh_watch_paths: Vec::new(),
+            is_git_available: true,
+            is_repository: true,
+        }
+    }
+
+    #[test]
+    fn branch_change_is_built_from_the_numstat_stat() {
+        let stat = GitLineStat {
+            added: 2,
+            removed: 1,
+            kind: None,
+            original_path: None,
+        };
+        let change =
+            to_branch_comparison_change(&resolution("/repo"), ".", "src/lib.rs", &stat)
+                .expect("在范围内应当产出变更");
+
+        assert_eq!(change.repo_relative_path, "src/lib.rs");
+        assert_eq!(change.workspace_relative_path, "src/lib.rs");
+        // 既加又减 ⇒ modified（numstat 没有状态码可依据）。
+        assert_eq!(change.kind, GitChangeKind::Modified);
+        assert_eq!(change.added, 2);
+        assert_eq!(change.removed, 1);
+        assert_eq!(change.original_path, None);
+    }
+
+    #[test]
+    fn branch_change_kind_comes_from_the_explicit_rename_marker() {
+        // 重命名的 numstat 是 0/0，靠行数只能推出 modified —— 必须靠显式标记。
+        let stat = GitLineStat {
+            added: 0,
+            removed: 0,
+            kind: Some(GitChangeKind::Renamed),
+            original_path: Some("src/old.rs".into()),
+        };
+        let change =
+            to_branch_comparison_change(&resolution("/repo"), ".", "src/new.rs", &stat)
+                .expect("在范围内应当产出变更");
+
+        assert_eq!(change.kind, GitChangeKind::Renamed);
+        assert_eq!(change.original_path.as_deref(), Some("src/old.rs"));
+    }
+
+    #[test]
+    fn branch_change_outside_the_workspace_is_dropped() {
+        let stat = GitLineStat {
+            added: 1,
+            removed: 0,
+            kind: None,
+            original_path: None,
+        };
+
+        assert!(
+            to_branch_comparison_change(
+                &resolution("/repo"),
+                "crates/zcode-app",
+                "crates/zcode-ui/src/lib.rs",
+                &stat,
+            )
+            .is_none(),
+            "workspace 之外的文件不该出现在分支比较里"
+        );
+    }
+
+    #[test]
+    fn branch_change_moved_out_of_workspace_is_kept_by_its_original_path() {
+        // 与 git status 那边同一条规则：新路径在外面但原路径在里面，
+        // 用户需要看到「文件被挪走了」，所以放行。
+        let stat = GitLineStat {
+            added: 0,
+            removed: 0,
+            kind: Some(GitChangeKind::Renamed),
+            original_path: Some("crates/zcode-app/src/moved.rs".into()),
+        };
+        let change = to_branch_comparison_change(
+            &resolution("/repo"),
+            "crates/zcode-app",
+            "crates/zcode-ui/src/moved.rs",
+            &stat,
+        )
+        .expect("原路径在范围内时应当保留");
+
+        assert_eq!(change.kind, GitChangeKind::Renamed);
     }
 
     #[test]

@@ -244,6 +244,85 @@ fn non_repository_workspace_loads_as_a_normal_state_not_a_failure() {
     }
 }
 
+/// 建一个**带本地 remote** 的仓库：`origin/main` 是基准，本地 `main` 领先一个提交。
+///
+/// 特意用本地目录当 remote 而不是网络地址 —— 测试不该依赖网络。
+/// 但 remote 必须是**真 clone** 出来的，不能两边各 `git init`：两个独立
+/// `git init` 的仓库没有共同祖先，`origin/main...HEAD` 会直接报
+/// `fatal: no merge base`。
+fn build_repository_with_upstream(name: &str) -> TempDir {
+    let remote = TempDir::new(&format!("{name}-remote"));
+    git(remote.path(), &["init", "--quiet", "-b", "main"]);
+    std::fs::write(remote.path().join("base.txt"), "base\n").unwrap();
+    git(remote.path(), &["add", "--", "base.txt"]);
+    git(remote.path(), &["commit", "--quiet", "-m", "base"]);
+
+    let dir = TempDir::new(name);
+    let remote_url = remote.path().to_str().unwrap().to_string();
+    git(dir.path(), &["clone", "--quiet", &remote_url, "."]);
+    git(dir.path(), &["branch", "--set-upstream-to=origin/main", "main"]);
+
+    // 领先上游一个提交：新增一个文件 + 改一个已跟踪文件。
+    // 工作区**是干净的** —— 这正是这一条要覆盖的状态。
+    std::fs::write(dir.path().join("base.txt"), "base\nmore\n").unwrap();
+    std::fs::write(dir.path().join("added.txt"), "new\n").unwrap();
+    git(dir.path(), &["add", "--", "base.txt", "added.txt"]);
+    git(dir.path(), &["commit", "--quiet", "-m", "ahead of upstream"]);
+
+    // remote 目录不能在函数返回时被删掉，否则 clone 出来的仓库就丢了
+    // 它的 `origin`。泄漏一个临时目录比让测试依赖释放顺序更可控。
+    std::mem::forget(remote);
+    dir
+}
+
+#[test]
+fn branch_comparison_flows_through_the_background_channel() {
+    if !git_available() {
+        eprintln!("跳过：本机找不到 git");
+        return;
+    }
+
+    let dir = build_repository_with_upstream("zcode-app-loader-upstream");
+    let channel = create_workspace_channel();
+    let receiver = channel.take_receiver().unwrap();
+    assert!(channel.requester().refresh(dir.path().to_path_buf()));
+
+    let messages = collect_messages(receiver, 2, Duration::from_secs(30));
+    assert_eq!(messages.len(), 2);
+
+    match &messages[1] {
+        WorkspaceMessage::Loaded(data) => {
+            assert!(data.is_repository());
+            // 工作区干净 —— 但**领先上游**，两者并不矛盾。
+            assert!(!data.summary.is_dirty, "刚提交完，工作区应当是干净的");
+            assert_eq!(data.totals.file_count, 0, "干净工作区没有未提交改动");
+
+            // 关键：干净 ≠ 与上游一致。分支比较分组必须照样有数据。
+            let comparison = &data.branch_comparison;
+            assert_eq!(
+                comparison.base_ref.as_deref(),
+                Some("origin/main"),
+                "基准应当是上游分支"
+            );
+            assert_eq!(comparison.head_ref.as_deref(), Some("main"));
+            assert_eq!(
+                data.branch_comparison_label(),
+                Some("main -> origin/main"),
+                "界面标题用的就是这一串"
+            );
+
+            let mut paths: Vec<&str> = comparison
+                .changes
+                .iter()
+                .map(|change| change.repo_relative_path.as_str())
+                .collect();
+            paths.sort_unstable();
+            assert_eq!(paths, vec!["added.txt", "base.txt"], "实际：{paths:?}");
+        }
+        other => panic!("应当是 Loaded，实际 {other:?}"),
+    }
+}
+
 #[test]
 fn a_second_refresh_is_ignored_while_one_is_running() {
     if !git_available() {

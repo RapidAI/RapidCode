@@ -38,7 +38,8 @@ use std::path::PathBuf;
 
 use dioxus::prelude::*;
 use zcode_shared::git::{
-    GitChangeKind, GitChangeSectionId, GitDiffAvailability, GitDiffResult, GitFileChange,
+    GitBranchComparisonChange, GitChangeKind, GitChangeSectionId, GitDiffAvailability,
+    GitDiffResult, GitFileChange,
 };
 use zcode_ui::*;
 
@@ -48,6 +49,8 @@ use crate::workspace::{
     split_patch_lines, use_workspace_requester, DiffPreviewState, WorkspaceAction, WorkspaceData,
     WorkspaceNotice, WorkspaceStatus,
 };
+
+use zcode_services::git::types::GitDiffQuery;
 
 /// 待确认的「丢弃」请求。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -358,6 +361,9 @@ pub fn WorkspaceBar(data: Option<WorkspaceData>, status: WorkspaceStatus) -> Ele
 }
 
 /// 按分组展示变更。
+///
+/// 工作区那几组（已暂存 / 未暂存 / 未跟踪 / 冲突）是**可操作**的；
+/// 最后那组「与上游比较」是**只读**的 —— 见 [`BranchComparisonSection`]。
 #[component]
 fn ChangeSections(
     data: WorkspaceData,
@@ -365,6 +371,10 @@ fn ChangeSections(
     busy: bool,
     on_discard: EventHandler<PendingDiscard>,
 ) -> Element {
+    // 「相对上游」的差异不属于工作区状态，单列一组。
+    // 没有上游时 `branch_comparison_label()` 是 `None`，整组不渲染。
+    let branch_label = data.branch_comparison_label().map(str::to_string);
+
     rsx! {
         for section in data.populated_sections() {
             ChangeSection {
@@ -375,6 +385,179 @@ fn ChangeSections(
                 busy,
                 on_discard,
             }
+        }
+        if let Some(label) = branch_label {
+            BranchComparisonSection {
+                data: data.clone(),
+                workspace_path: workspace_path.clone(),
+                label,
+            }
+        }
+    }
+}
+
+/// 「与上游比较」分组 —— **只读**。
+///
+/// 上游对应的是 `readonly: true` 的那个数据集（`useGitRepository.ts` 的
+/// `buildRepositoryDatasets`）。只读的原因很实在：这里 diff 的两侧都是**提交**，
+/// 不存在「暂存 / 取消暂存 / 丢弃」这些动作的对象 —— 把它们画出来
+/// 只会得到一排点了没反应的按钮。
+///
+/// 但「点开看补丁」仍然有意义，所以整行可点的行为保留，
+/// 只是把右侧那组操作按钮整个去掉。
+#[component]
+fn BranchComparisonSection(data: WorkspaceData, workspace_path: PathBuf, label: String) -> Element {
+    let changes = &data.branch_comparison.changes;
+    let added: u32 = changes.iter().map(|change| change.added).sum();
+    let removed: u32 = changes.iter().map(|change| change.removed).sum();
+
+    rsx! {
+        div { class: "flex flex-col gap-1",
+            "data-slot": "branch-comparison-section",
+            div { class: "flex items-center gap-2 px-1",
+                span { class: "text-ui-xs font-medium text-foreground-subtle",
+                    "与上游比较"
+                }
+                Badge { variant: BadgeVariant::Outline, class: "h-4 px-1 text-ui-xs",
+                    "{changes.len()}"
+                }
+                if !label.is_empty() {
+                    span {
+                        class: "min-w-0 truncate text-ui-xs text-foreground-subtlest",
+                        "data-slot": "branch-comparison-label",
+                        "{label}"
+                    }
+                }
+                span { class: "ml-auto text-ui-xs text-primary", "+{added}" }
+                span { class: "text-ui-xs text-destructive", "-{removed}" }
+            }
+            if changes.is_empty() {
+                div { class: "rounded-md border border-card-border bg-card px-3 py-2 text-ui-xs text-foreground-subtle",
+                    "当前分支与上游没有任何差异。"
+                }
+            } else {
+                div { class: "flex flex-col overflow-hidden rounded-md border border-card-border bg-card",
+                    for change in changes {
+                        ReadOnlyChangeRow {
+                            key: "{change.repo_relative_path}",
+                            change: change.clone(),
+                            workspace_path: workspace_path.clone(),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 分支比较里一行该怎么显示。
+///
+/// 重命名要显示成 `旧路径 → 新路径` —— 只写新路径的话，用户看到一个
+/// 从没见过的文件名，会以为是新加的文件。`→` 用普通字符即可，
+/// 转义问题交给 dioxus 处理。
+fn branch_comparison_display_path(change: &GitBranchComparisonChange) -> String {
+    let new_path = if change.workspace_relative_path.is_empty() {
+        change.repo_relative_path.as_str()
+    } else {
+        change.workspace_relative_path.as_str()
+    };
+    match change.original_path.as_deref() {
+        Some(original) if !original.is_empty() => format!("{original} → {new_path}"),
+        _ => new_path.to_string(),
+    }
+}
+
+/// 只读的一行（分支比较用）。
+///
+/// 与 [`ActionableChangeRow`] 的唯一区别是**没有操作按钮**，
+/// 但「点开看 diff」一样支持 —— 这是只读分组里用户真正想做的事。
+#[component]
+fn ReadOnlyChangeRow(
+    change: GitBranchComparisonChange,
+    workspace_path: PathBuf,
+) -> Element {
+    let ctx = use_app();
+    let requester = use_workspace_requester();
+    let mut diff_preview = ctx.diff_preview;
+
+    let row_key = change.workspace_relative_path.clone();
+    let is_open = diff_preview
+        .read()
+        .as_ref()
+        .is_some_and(|state| state.is_open_for(&row_key));
+    let preview_state = if is_open {
+        diff_preview.read().clone()
+    } else {
+        None
+    };
+
+    // 分支比较的两侧都是提交 ⇒ 来源固定是 `Branch`（服务层会走 merge-base 比较）。
+    let query = GitDiffQuery::branch(change.repo_relative_path.clone());
+    let workspace_for_diff = workspace_path.clone();
+    let requester_for_diff = requester.clone();
+    let row_key_for_click = row_key.clone();
+
+    let added = change.added;
+    let removed = change.removed;
+
+    rsx! {
+        div {
+            class: "border-b border-border last:border-b-0",
+            "data-slot": "change-row",
+            "data-expanded": if is_open { "true" } else { "false" },
+            div {
+                class: "flex cursor-pointer items-center gap-1 pr-1.5",
+                onclick: move |_| {
+                    if is_open {
+                        diff_preview.set(None);
+                        return;
+                    }
+                    let id = requester_for_diff.load_diff(
+                        workspace_for_diff.clone(),
+                        query.clone(),
+                        row_key_for_click.clone(),
+                    );
+                    diff_preview.set(Some(DiffPreviewState::Loading {
+                        id,
+                        path: row_key_for_click.clone(),
+                    }));
+                },
+                div { class: "min-w-0 flex-1",
+                    ReadOnlyChangeLine {
+                        label: branch_comparison_display_path(&change),
+                        kind: change.kind,
+                        added,
+                        removed,
+                    }
+                }
+            }
+            if let Some(state) = preview_state {
+                DiffPreviewPane { state }
+            }
+        }
+    }
+}
+
+/// 只读行的内容部分（路径 + 变更性质 + `+N/-M`）。
+#[component]
+fn ReadOnlyChangeLine(
+    label: String,
+    kind: GitChangeKind,
+    added: u32,
+    removed: u32,
+) -> Element {
+    rsx! {
+        div { class: "flex min-w-0 flex-1 items-center gap-2 py-1 pl-2",
+            span {
+                class: "min-w-0 flex-1 truncate text-ui-xs text-foreground",
+                title: "{label}",
+                "{label}"
+            }
+            span { class: "shrink-0 text-ui-xs text-foreground-subtlest",
+                {kind_label(kind)}
+            }
+            span { class: "shrink-0 text-ui-xs text-primary", "+{added}" }
+            span { class: "shrink-0 text-ui-xs text-destructive", "-{removed}" }
         }
     }
 }
@@ -727,13 +910,25 @@ fn LoadingPane() -> Element {
 }
 
 /// 工作区干净。
+///
+/// 「干净」只说明**没有未提交的改动**，不代表「和上游一致」——
+/// 工作区干净但本地领先上游若干提交时，相对上游的差异必须照样摆出来，
+/// 否则用户会以为「没东西可推」。
 #[component]
 fn CleanPane(data: WorkspaceData) -> Element {
+    let branch_label = data.branch_comparison_label().map(str::to_string);
+    let workspace_path = PathBuf::from(&data.summary.workspace_path);
+
     rsx! {
-        EmptyPane {
-            icon: rsx! { IconCheck { class: "size-4 text-primary" } },
-            title: "工作区干净".to_string(),
-            hint: format!("{}（{}）没有任何未提交改动。", data.branch_label(), data.summary.repo_root),
+        div { class: "flex flex-col gap-3",
+            EmptyPane {
+                icon: rsx! { IconCheck { class: "size-4 text-primary" } },
+                title: "工作区干净".to_string(),
+                hint: format!("{}（{}）没有任何未提交改动。", data.branch_label(), data.summary.repo_root),
+            }
+            if let Some(label) = branch_label {
+                BranchComparisonSection { data, workspace_path, label }
+            }
         }
     }
 }
@@ -833,6 +1028,7 @@ mod tests {
             },
             totals: zcode_services::git::changes::summarize_changes(&changes),
             changes,
+            branch_comparison: zcode_shared::git::GitBranchComparison::default(),
         }
     }
 

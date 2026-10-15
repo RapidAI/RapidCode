@@ -41,11 +41,16 @@ fn scan_workspace() -> (Option<WorkspaceData>, WorkspaceStatus) {
         Ok(snapshot) => {
             let changes = get_workspace_changes(&snapshot);
             let totals = summarize_changes(&changes);
+            // 分支比较也走真实查询 —— 本仓库的 `rust-only` 通常落后/领先
+            // `origin/rust-only` 若干提交，快照里就能看到「与上游比较」分组。
+            // 没有上游（或目录不是仓库）时降级成默认值，分组自动不渲染。
+            let branch_comparison = repo.get_branch_comparison(&workspace).unwrap_or_default();
             (
                 Some(WorkspaceData {
                     summary: snapshot.summary,
                     changes,
                     totals,
+                    branch_comparison,
                 }),
                 WorkspaceStatus::Ready,
             )

@@ -24,11 +24,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use zcode_shared::git::{
-    GitChangeSourceId, GitCommitGraphResult, GitDiffResult, GitHeadRefType, GitIdentity,
-    GitLocalBranch, GitLocalBranchListResult, GitRepositoryAutoRefreshWatchPath,
+    GitBranchComparison, GitChangeSourceId, GitCommitGraphResult, GitDiffResult, GitHeadRefType,
+    GitIdentity, GitLocalBranch, GitLocalBranchListResult, GitRepositoryAutoRefreshWatchPath,
     GitRepositorySummary,
 };
 
+use super::changes::to_branch_comparison_change;
 use super::cli_helpers::{
     build_untracked_stats, ensure_git_command_succeeded, ensure_git_command_succeeded_with,
     ensure_repository_available, is_missing_working_directory_result, is_not_repository_result,
@@ -474,6 +475,95 @@ impl GitCliRepo {
         Ok(GitCommitGraphResult {
             commits: parsed.into_iter().take(normalized_max).collect(),
             has_more,
+        })
+    }
+
+    /// 取「当前分支相对其上游」的差异文件列表。
+    ///
+    /// 对应上游 `getBranchComparison`。这是「这次改动相对远端多了什么」的视图，
+    /// 界面把它渲染成**只读**分组（`readonly: true`）—— 因为 diff 的两侧都是
+    /// 提交，不存在「暂存/丢弃」这种操作可言。
+    ///
+    /// ## 没有上游时**不是错误**
+    ///
+    /// 本地新建的分支、detached HEAD、没有 remote 的仓库，都没有 tracking branch。
+    /// 这时返回一份**降级快照**（`changes` 为空、`comparison_label` 为 `None`），
+    /// 而不是报错 —— 「还没推过」是仓库的常见正常状态，不该让用户看到一片红。
+    /// 注意 `base_ref` 此时也是 `None`，调用方据此判断「这个分组压根不该出现」。
+    ///
+    /// ## 为什么复用 `get_status` 而不自己算分支名
+    ///
+    /// tracking branch 的名字、HEAD 是不是 detached、workspace 在不在仓库里
+    /// —— 这些 `get_status` 都已经算好了，而且它的判定细节很多（见其文档）。
+    /// 再实现一遍必然会与它漂移。代价是多跑一次 `git status`，
+    /// 但相比「两个真源不一致」这个风险是划算的（上游也是这么做的）。
+    pub fn get_branch_comparison(
+        &self,
+        workspace_path: &Path,
+    ) -> Result<GitBranchComparison, GitCommandFailure> {
+        let status = self.get_status(workspace_path)?;
+
+        if !status.resolution.is_usable() {
+            return Ok(GitBranchComparison::default());
+        }
+
+        // detached HEAD 时没有分支名，但比较仍然成立（`HEAD` 是个合法的 rev）。
+        // 这个值**要在「没有上游」的提前返回之前**算好 —— `head_ref` 回答的是
+        // 「我们现在在哪个分支上」，与「有没有比较基准」无关，不该被一起丢掉。
+        let head_ref = status
+            .summary
+            .branch_name
+            .clone()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "HEAD".to_string());
+
+        let Some(tracking_branch_name) = status
+            .summary
+            .tracking_branch_name
+            .clone()
+            .filter(|name| !name.is_empty())
+        else {
+            return Ok(GitBranchComparison {
+                base_ref: None,
+                head_ref: Some(head_ref),
+                comparison_label: None,
+                changes: Vec::new(),
+            });
+        };
+
+        let range = format!("{tracking_branch_name}...HEAD");
+        let result = self.provider.run(
+            &GitCommandRequest::new(
+                &status.resolution.repo_root,
+                ["diff", "--numstat", "-z", "--find-renames", &range, "--"],
+            )
+            .with_timeout_ms(DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .with_max_output_bytes(DEFAULT_GIT_OUTPUT_BYTES),
+        )?;
+        ensure_git_command_succeeded("git diff --numstat upstream...HEAD", &result)?;
+
+        let stats = parse_numstat(&result.stdout);
+        let changes = stats
+            .iter()
+            .filter_map(|(repo_relative_path, stat)| {
+                to_branch_comparison_change(
+                    &status.resolution,
+                    &status.summary.workspace_in_repo_path,
+                    repo_relative_path,
+                    stat,
+                )
+            })
+            .collect();
+
+        Ok(GitBranchComparison {
+            comparison_label: Some(format!(
+                "{} -> {}",
+                status.summary.branch_name.as_deref().unwrap_or("HEAD"),
+                tracking_branch_name
+            )),
+            base_ref: Some(tracking_branch_name),
+            head_ref: Some(head_ref),
+            changes,
         })
     }
 

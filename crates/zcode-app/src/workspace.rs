@@ -31,8 +31,8 @@ use zcode_services::git::changes::{get_workspace_changes, summarize_changes, Git
 use zcode_services::git::repo::GitCliRepo;
 use zcode_services::git::types::GitDiffQuery;
 use zcode_shared::git::{
-    GitChangeKind, GitChangeSectionId, GitDiffResult, GitFileChange, GitHeadRefType,
-    GitRepositorySummary,
+    GitBranchComparison, GitChangeKind, GitChangeSectionId, GitDiffResult, GitFileChange,
+    GitHeadRefType, GitRepositorySummary,
 };
 
 /// 一次扫描的结果。
@@ -42,6 +42,9 @@ pub struct WorkspaceData {
     /// 已按 staged / unstaged / untracked / conflicted 分组标注好。
     pub changes: Vec<GitFileChange>,
     pub totals: GitChangeSummary,
+    /// 「当前分支相对上游」的差异。没有上游时 `base_ref` 是 `None`，
+    /// 界面据此整个不渲染该分组（见 [`WorkspaceData::branch_comparison_label`]）。
+    pub branch_comparison: GitBranchComparison,
 }
 
 impl WorkspaceData {
@@ -67,6 +70,16 @@ impl WorkspaceData {
             return None;
         }
         Some(format!("↑{} ↓{}", self.summary.ahead, self.summary.behind))
+    }
+
+    /// 「与上游比较」分组的标题，形如 `main -> origin/main`。
+    ///
+    /// 返回 `None` 表示**不该渲染这个分组** —— 没有上游时压根没有可比较的对象，
+    /// 渲染一个空分组只会让用户以为「和上游一致」，那是错的
+    /// （真实情况是「无从比较」）。
+    pub fn branch_comparison_label(&self) -> Option<&str> {
+        self.branch_comparison.base_ref.as_deref()?;
+        self.branch_comparison.comparison_label.as_deref()
     }
 
     /// 某个分组下的变更。
@@ -481,10 +494,18 @@ fn load_workspace(repo: &GitCliRepo, workspace: &Path) -> WorkspaceMessage {
         Ok(snapshot) => {
             let changes = get_workspace_changes(&snapshot);
             let totals = summarize_changes(&changes);
+            // 分支比较失败**不该拖垮整个扫描** —— 它只是「变更」页上的一个
+            // 附加分组，拿到状态与变更列表才是这次刷新的主要目的。
+            // 所以这里降级成「没有比较」（`base_ref: None` ⇒ 界面不渲染该分组），
+            // 而不是把整个页面变成失败态。
+            let branch_comparison = repo
+                .get_branch_comparison(workspace)
+                .unwrap_or_default();
             WorkspaceMessage::Loaded(Box::new(WorkspaceData {
                 summary: snapshot.summary,
                 changes,
                 totals,
+                branch_comparison,
             }))
         }
         Err(failure) => WorkspaceMessage::Failed(failure.message),
@@ -639,6 +660,8 @@ mod tests {
             summary: summary(Some("main"), GitHeadRefType::Branch, 0, 0),
             totals: summarize_changes(&changes),
             changes,
+            // 默认「没有上游」—— 这是最保守的默认值：界面不会渲染比较分组。
+            branch_comparison: GitBranchComparison::default(),
         }
     }
 
