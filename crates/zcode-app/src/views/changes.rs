@@ -46,8 +46,8 @@ use zcode_ui::*;
 use crate::state::use_app;
 use crate::workspace::{
     action_paths, default_workspace_path, diff_query_for, display_path, kind_label, section_label,
-    split_patch_lines, use_workspace_requester, DiffPreviewState, WorkspaceAction, WorkspaceData,
-    WorkspaceNotice, WorkspaceStatus,
+    split_patch_lines, use_code_comments, use_workspace_requester, DiffPreviewState,
+    WorkspaceAction, WorkspaceData, WorkspaceNotice, WorkspaceStatus,
 };
 
 use zcode_services::git::types::GitDiffQuery;
@@ -479,6 +479,7 @@ fn ReadOnlyChangeRow(
     let ctx = use_app();
     let requester = use_workspace_requester();
     let mut diff_preview = ctx.diff_preview;
+    let identity = workspace_identity_of(&ctx);
 
     let row_key = change.workspace_relative_path.clone();
     let is_open = diff_preview
@@ -532,7 +533,11 @@ fn ReadOnlyChangeRow(
                 }
             }
             if let Some(state) = preview_state {
-                DiffPreviewPane { state }
+                DiffPreviewPane {
+                    state,
+                    workspace_path: workspace_path.clone(),
+                    workspace_identity: identity.clone(),
+                }
             }
         }
     }
@@ -662,6 +667,7 @@ fn ActionableChangeRow(
     let ctx = use_app();
     let requester = use_workspace_requester();
     let mut diff_preview = ctx.diff_preview;
+    let identity = workspace_identity_of(&ctx);
 
     let path = action_paths(&[&change]);
 
@@ -752,15 +758,35 @@ fn ActionableChangeRow(
                 }
             }
             if let Some(state) = preview_state {
-                DiffPreviewPane { state }
+                DiffPreviewPane {
+                    state,
+                    workspace_path: workspace_path.clone(),
+                    workspace_identity: identity.clone(),
+                }
             }
         }
     }
 }
 
+/// 当前工作区的 identity（分桶要用，见 `get_code_comment_workspace_key`）。
+///
+/// 用分支名当 identity：同一个仓库在不同路径下打开时（软链、大小写、
+/// 挂载点差异），只有 identity 能证明「这是同一个工作区」。取不到时给
+/// `None`，桶 key 会退回用路径。
+fn workspace_identity_of(ctx: &crate::state::AppCtx) -> Option<String> {
+    ctx.workspace
+        .read()
+        .as_ref()
+        .and_then(|data| data.summary.branch_name.clone())
+}
+
 /// 一行下面的 diff 面板。
 #[component]
-fn DiffPreviewPane(state: DiffPreviewState) -> Element {
+fn DiffPreviewPane(
+    state: DiffPreviewState,
+    workspace_path: PathBuf,
+    #[props(default)] workspace_identity: Option<String>,
+) -> Element {
     let path = state.path().to_string();
     let body = match state {
         DiffPreviewState::Loading { .. } => rsx! {
@@ -777,7 +803,14 @@ fn DiffPreviewPane(state: DiffPreviewState) -> Element {
                 }
             }
         },
-        DiffPreviewState::Ready { diff, .. } => rsx! { DiffReadyPane { diff: *diff } },
+        DiffPreviewState::Ready { diff, .. } => rsx! {
+            DiffReadyPane {
+                diff: *diff,
+                source_path: path.clone(),
+                workspace_path: workspace_path.clone(),
+                workspace_identity: workspace_identity.clone(),
+            }
+        },
     };
 
     rsx! {
@@ -804,7 +837,12 @@ fn DiffPreviewPane(state: DiffPreviewState) -> Element {
 /// 关键点：**非 `Patch` 的三种也必须有文案**。空面板会让用户以为界面坏了，
 /// 而这正是「失败必须看得见」这条约束要防的东西。
 #[component]
-fn DiffReadyPane(diff: GitDiffResult) -> Element {
+fn DiffReadyPane(
+    diff: GitDiffResult,
+    source_path: String,
+    workspace_path: PathBuf,
+    #[props(default)] workspace_identity: Option<String>,
+) -> Element {
     match diff.availability {
         GitDiffAvailability::Patch => {
             let lines = diff
@@ -813,9 +851,11 @@ fn DiffReadyPane(diff: GitDiffResult) -> Element {
                 .map(split_patch_lines)
                 .unwrap_or_default();
             rsx! {
-                div { class: "max-h-80 overflow-auto px-2 pb-2",
-                    "data-slot": "diff-patch",
-                    LightweightDiffPreview { lines, font_size_px: 11.0 }
+                AnnotatablePatch {
+                    lines,
+                    source_path,
+                    workspace_path,
+                    workspace_identity,
                 }
             }
         }
@@ -847,6 +887,231 @@ fn DiffReadyPane(diff: GitDiffResult) -> Element {
             }
         }
     }
+}
+
+/// 可批注的 patch 预览。
+///
+/// 为什么不直接用 [`zcode_ui::LightweightDiffPreview`]：那个原语是**纯展示**的，
+/// 每行只是 `div + code`，没有可以挂批注的槽位，而且它显示的行号是
+/// **patch 内序号**（`index + 1`），不是文件行号。
+///
+/// 批注必须锚定**文件里的真实行号**（发给模型时也要带这个行号），
+/// 所以这里自己渲染行，用 [`zcode_ui::map_patch_lines_to_file_numbers`]
+/// 把每一行映射到新侧文件行号；映射不到的行（hunk 头、协议头、
+/// 被删除的行）**不可批注** —— 它们在改动后的文件里不存在。
+///
+/// 交互刻意做得比富渲染器简单：单击一行即选中该行，再点输入框写批注。
+/// 富渲染器那套拖拽多选依赖 Shadow DOM，本移植的宿主拿不到，
+/// 与其做一个半截的拖拽，不如把「点一行、写一句」这条最常用的路走通。
+#[component]
+fn AnnotatablePatch(
+    lines: Vec<String>,
+    source_path: String,
+    workspace_path: PathBuf,
+    workspace_identity: Option<String>,
+) -> Element {
+    let comments = use_code_comments();
+    if lines.is_empty() {
+        return rsx! {
+            div { class: "px-2 pb-2 text-ui-xs text-foreground-subtlest",
+                "data-slot": "diff-patch", "没有可预览的 diff。"
+            }
+        };
+    }
+
+    // 分桶用 `<workspaceKey>\0<sourcePath>`，而 `workspaceKey` **优先取
+    // identity**（见 `get_code_comment_workspace_key`）。所以这里必须把
+    // identity 一路传下来 —— 少传就会和别处算出来的桶 key 不一致，
+    // 表现是「批注加上了却一条也看不见」。
+    let bucket = CodeCommentPreviewBucket {
+        workspace_path: workspace_path.to_string_lossy().to_string(),
+        workspace_identity: workspace_identity.filter(|id| !id.trim().is_empty()),
+        source_path: source_path.clone(),
+    };
+
+    // `CodeCommentRange` 走的是**文件行号**；store 里存的是同一套坐标。
+    let ranges = map_patch_lines_to_file_numbers(&lines);
+    let entries = comments.previews.read().get_comments(&bucket).to_vec();
+    let draft = comments.draft.read().clone();
+
+    rsx! {
+        div {
+            class: "max-h-80 overflow-auto px-2 pb-2",
+            "data-slot": "diff-patch",
+            div {
+                class: "font-mono text-ui-xs leading-relaxed",
+                "data-slot": "annotatable-patch",
+                for (index, line) in lines.iter().enumerate() {
+                    {
+                        let anchor = ranges.get(index).copied().flatten();
+                        rsx! {
+                            PatchRow {
+                                line: line.clone(),
+                                anchor,
+                                comments: entries.clone(),
+                                draft: draft.clone(),
+                                bucket: bucket.clone(),
+                                row_index: index,
+                            }
+                        }
+                    }
+                }
+            }
+            // 没有草稿时给一条提示，否则用户不知道「批注」这个入口在哪。
+            if draft.is_none() && entries.is_empty() {
+                div {
+                    class: "px-1 pt-2 text-ui-xs text-foreground-subtlest",
+                    "data-slot": "annotation-hint",
+                    "点击任意一行即可对该行添加批注。"
+                }
+            }
+        }
+    }
+}
+
+/// patch 里的一行：行号槽 + 代码 + 该行挂着的批注。
+///
+/// 批注按 `end_line` 挂（与 `zcode_ui::build_line_annotations` 一致）——
+/// 一段多行选区只在它的**末行**下方展开，避免同一条批注在多行里重复出现。
+#[component]
+fn PatchRow(
+    line: String,
+    anchor: Option<PatchLineFileNumber>,
+    comments: Vec<CodeCommentPreviewEntry>,
+    draft: Option<(CodeCommentRange, String)>,
+    bucket: CodeCommentPreviewBucket,
+    row_index: usize,
+) -> Element {
+    let mut ctx = use_code_comments();
+    let parts = get_lightweight_diff_line_parts(&line);
+    let styles = get_lightweight_diff_line_styles(parts.kind);
+    let file_line = anchor.map(|a| a.new_line);
+
+    let key = row_index.to_string();
+    let code = parts.content.clone();
+    let is_interactive = anchor.is_some();
+    let line_for_click = file_line;
+    let bucket_for_click = bucket.clone();
+    let code_for_submit = code.clone();
+    let first_line = file_line.map(|n| n as i64).unwrap_or(1);
+    let bucket_for_submit = bucket.clone();
+
+    // 这一行下方要展开的东西：已有批注 + 正在写的草稿
+    let shown = file_line
+        .map(|n| {
+            comments
+                .into_iter()
+                .filter(|c| c.end_line as usize == n)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let draft_here = draft.filter(|(range, _)| is_draft_anchored_at(range, &anchor));
+
+    rsx! {
+        div {
+            key: "{key}",
+            "data-slot": "patch-row",
+            "data-file-line": file_line.map(|n| n.to_string()),
+            div {
+                class: cn(&[
+                    "flex items-start gap-2 rounded px-1",
+                    if is_interactive {
+                        "cursor-pointer hover:bg-background-alt"
+                    } else {
+                        ""
+                    },
+                ]),
+                style: if styles.row_style.is_empty() {
+                    None
+                } else {
+                    Some(styles.row_style.clone())
+                },
+                // 「加批注」的按钮：只在可锚定的行上出现，且用行号槽而不是整行
+                // 去接点击 —— 整行接点击会和文本选择抢事件。
+                if let Some(n) = line_for_click {
+                    button {
+                        r#type: "button",
+                        class: "shrink-0 select-none px-1 text-ui-xs text-foreground-subtlest hover:text-foreground",
+                        "data-slot": "patch-comment-button",
+                        "data-file-line": "{n}",
+                        title: "对此行添加批注",
+                        onclick: move |_| {
+                            ctx.start_draft(CodeCommentRange {
+                                start_line: n as i64,
+                                end_line: n as i64,
+                            });
+                        },
+                        "+"
+                    }
+                    span {
+                        "aria-hidden": "true",
+                        class: lightweight_diff_gutter_classes(parts.kind),
+                        style: styles.gutter_style.clone(),
+                        "{n}"
+                    }
+                } else {
+                    // 不可批注的行也要占住槽位，否则左侧会参差不齐
+                    span { class: "w-8 shrink-0" }
+                }
+                code {
+                    // 行语义（新增 / 删除 / 上下文）既要体现在行号上，也要体现在
+                    // 正文颜色上：`get_lightweight_diff_line_styles` 返回的
+                    // `line_number_class` 就是给正文用的 `text-diff-*`。
+                    // 上游 `LightweightDiffPreview` 只把它挂在行号槽上，
+                    // 这里多挂一次到正文，否则正文全是同一个颜色。
+                    class: cn(&[
+                        &lightweight_diff_code_classes(true),
+                        styles.line_number_class,
+                    ]),
+                    // 这里是**纯文本**渲染，不走语法高亮 —— 高亮 token 是按
+                    // `LightweightDiffPreview` 的坐标系算的（patch 内行号），
+                    // 与批注用的**文件行号**不同源，混用会出现
+                    // 「高亮对了但批注挂错行」。
+                    {code.clone()}
+                }
+            }
+
+            for comment in shown {
+                {
+                    let bucket_for_delete = bucket_for_click.clone();
+                    rsx! {
+                        CodeCommentAnnotation {
+                            comment: comment.clone(),
+                            labels: CodeCommentLabels::default(),
+                            on_delete: move |id: String| {
+                                ctx.delete_comment(&bucket_for_delete, &id);
+                            },
+                        }
+                    }
+                }
+            }
+
+            if let Some((range, text)) = draft_here {
+                CodeCommentDraft {
+                    range,
+                    labels: CodeCommentLabels::default(),
+                    value: text.clone(),
+                    onvaluechange: move |next: String| ctx.set_draft_text(next),
+                    onsubmit: move |_| {
+                        ctx.submit_draft(&code_for_submit, first_line, &bucket_for_submit);
+                    },
+                    oncancel: move |_| ctx.cancel_draft(),
+                }
+            }
+        }
+    }
+}
+
+/// 草稿是否应该挂在这一行下面。
+///
+/// 用**归一化后的末行**比对：`CodeCommentRange` 允许 `start > end`
+/// （用户从下往上点），直接比 `start_line` 会让草稿挂到错误的那一行。
+fn is_draft_anchored_at(range: &CodeCommentRange, anchor: &Option<PatchLineFileNumber>) -> bool {
+    let Some(anchor) = anchor else {
+        return false;
+    };
+    let normalized = normalize_code_comment_range(*range);
+    normalized.end_line as usize == anchor.new_line
 }
 
 /// 一行变更。详情面板与变更页共用。

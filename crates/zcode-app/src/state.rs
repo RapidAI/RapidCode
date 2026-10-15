@@ -152,6 +152,12 @@ pub struct AppState {
     pub active_id: &'static str,
     pub messages: Vec<Message>,
     pub draft: String,
+    /// 最近一次「发给助手」的**完整正文**（含 `# Code comments:` 批注块）。
+    ///
+    /// 单独留一份是因为输入框里的 `draft` 发完就清空了，而批注是**附加**上去的
+    /// —— 用户看不到这一份就等于「静默改写了我要发的东西」。留档 + 界面上
+    /// 展示，才能让「发出去的内容」和「我写的内容」的差异是可审计的。
+    pub last_prompt: String,
     pub model: Model,
     pub approval: ApprovalMode,
     pub search: String,
@@ -394,6 +400,7 @@ pub fn demo_state() -> AppState {
             },
         ],
         draft: String::new(),
+        last_prompt: String::new(),
         model: Model::Pro,
         approval: ApprovalMode::Ask,
         search: String::new(),

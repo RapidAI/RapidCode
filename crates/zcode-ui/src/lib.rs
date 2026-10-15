@@ -50,6 +50,8 @@
 
 /// 类名合并（`clsx` + `tailwind-merge` 的务实子集）。
 pub mod cn;
+pub mod code_comment_context;
+pub mod code_comment_preview_store;
 pub mod code_preview_preferences;
 pub mod diffs_highlighter_engine;
 /// shadcn 风格原语组件。
@@ -64,6 +66,8 @@ pub mod presentation_element_model;
 pub mod shiki_highlighter;
 
 pub use cn::{cn, cn_opt};
+pub use code_comment_context::*;
+pub use code_comment_preview_store::*;
 pub use components::accordion::*;
 pub use components::alert::*;
 pub use components::alert_dialog::*;
@@ -113,3 +117,4 @@ pub use components::textarea::*;
 pub use components::toast::*;
 pub use components::tooltip::*;
 pub use icons::*;
+pub use patch_diff_preview::*;

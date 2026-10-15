@@ -27,12 +27,21 @@ use std::sync::Arc;
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
+// `Signal` 的 `read` / `write` / `set` 是扩展 trait 上的方法，必须把 prelude 引进来
+// 才能调用；只 `use dioxus::prelude::Signal` 是拿不到这些方法的。
+use dioxus::prelude::*;
 use zcode_services::git::changes::{get_workspace_changes, summarize_changes, GitChangeSummary};
 use zcode_services::git::repo::GitCliRepo;
 use zcode_services::git::types::GitDiffQuery;
 use zcode_shared::git::{
     GitBranchComparison, GitChangeKind, GitChangeSectionId, GitDiffResult, GitFileChange,
     GitHeadRefType, GitRepositorySummary,
+};
+
+use zcode_ui::{
+    build_code_comment_submission, get_source_title, CodeCommentPreviewEntry,
+    CodeCommentPreviewStore, CodeCommentRange, CodeCommentRemovalRegistry,
+    CodeCommentPreviewBucket,
 };
 
 /// 一次扫描的结果。
@@ -460,6 +469,112 @@ impl WorkspaceChannel {
 /// 因此只有「脱离 AppShell 单独渲染某个视图」时才会踩到。
 pub fn use_workspace_requester() -> WorkspaceRequester {
     dioxus::prelude::use_context::<WorkspaceRequester>()
+}
+
+// ---- 代码批注 ----
+
+/// 批注相关的共享状态。
+///
+/// 和 [`WorkspaceRequester`] 一样**不放进** `AppCtx` —— 后者要保持 `Copy`，
+/// 而这里持有一个 `Signal`（本身就是 `Copy`）加一个「当前正在写的草稿」，
+/// 语义上属于「批注」这一件事，混进通用 UI 状态里会让 `AppCtx` 越来越杂。
+///
+/// `previews` 是 [`CodeCommentPreviewStore`]，`draft` 是**正在编辑的那条草稿**。
+/// 两者分开：草稿还没提交，不属于任何文件；一旦提交才进 store 的某个桶。
+#[derive(Clone, Copy)]
+pub struct CodeCommentCtx {
+    /// 已提交的批注预览（按 workspace + 文件分桶）。
+    pub previews: Signal<CodeCommentPreviewStore>,
+    /// 正在写的草稿：`(行区间, 文本)`。
+    ///
+    /// 同时承载「有没有草稿」——`None` 表示没有。这样就不可能出现
+    /// 「区间在、文本没了」或「文本在、区间没了」的半截状态。
+    pub draft: Signal<Option<(CodeCommentRange, String)>>,
+    /// 被移除的批注 id（用来让「从输入框移除」与「预览里也消失」保持一致）。
+    pub removals: Signal<CodeCommentRemovalRegistry>,
+}
+
+impl CodeCommentCtx {
+    /// 开始写一条新草稿（会覆盖未提交的那条）。
+    pub fn start_draft(&mut self, range: CodeCommentRange) {
+        self.draft.set(Some((range, String::new())));
+    }
+
+    /// 放弃当前草稿。
+    pub fn cancel_draft(&mut self) {
+        self.draft.set(None);
+    }
+
+    /// 改草稿的文本（草稿不存在时什么都不做）。
+    ///
+    /// 不在这里「顺手创建草稿」：没有区间就没有锚点，凭空造一条会得到
+    /// 一条挂不到任何代码上的批注。
+    pub fn set_draft_text(&mut self, text: String) {
+        let current = self.draft.read().clone();
+        let Some((range, _)) = current else {
+            return;
+        };
+        self.draft.set(Some((range, text)));
+    }
+
+    /// 提交草稿，返回是否真的提交了。
+    ///
+    /// 走 [`zcode_ui::build_code_comment_submission`] 的判定 —— 选区取不到
+    /// 文本就不提交。这里**不能**放宽成「只要写了字就提交」：批注锚定的是
+    /// 一段代码，锚不到代码的批注对模型毫无意义。
+    pub fn submit_draft(
+        &mut self,
+        code: &str,
+        first_line_number: i64,
+        bucket: &CodeCommentPreviewBucket,
+    ) -> bool {
+        let draft = self.draft.read().clone();
+        let Some((range, text)) = draft else {
+            return false;
+        };
+        let Some(submission) =
+            build_code_comment_submission(code, first_line_number, Some(range), &text)
+        else {
+            return false;
+        };
+
+        let id = format!(
+            "code-comment:{}:{}",
+            submission.range.start_line,
+            bucket.source_path
+        );
+        let mut previews = self.previews;
+        previews.write().add_comment(
+            bucket,
+            CodeCommentPreviewEntry {
+                id: id.clone(),
+                source_path: Some(bucket.source_path.clone()),
+                source_title: get_source_title(&bucket.source_path),
+                selected_text: submission.selected_text,
+                comment: submission.comment,
+                start_line: submission.range.start_line,
+                end_line: submission.range.end_line,
+            },
+        );
+        // 提交成功就清掉草稿，否则输入框会一直停在「已提交但还显示着」
+        self.draft.set(None);
+        true
+    }
+
+    /// 删掉一条已提交的批注。
+    pub fn delete_comment(&mut self, bucket: &CodeCommentPreviewBucket, id: &str) {
+        let mut previews = self.previews;
+        previews.write().remove_comment(bucket, id);
+    }
+}
+
+/// 读取批注上下文。
+///
+/// # Panics
+///
+/// 没有 provider 时 panic。provider 由 `AppShell` 提供。
+pub fn use_code_comments() -> CodeCommentCtx {
+    dioxus::prelude::use_context::<CodeCommentCtx>()
 }
 
 /// 等下一个结果。

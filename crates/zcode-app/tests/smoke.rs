@@ -818,10 +818,39 @@ fn WorkspaceHarness(
     #[props(default)] notice: Option<WorkspaceNotice>,
     /// 注入一个已展开的 diff 面板（`None` = 没有展开项）。
     #[props(default)] diff: Option<DiffPreviewState>,
+    /// 预先塞进批注 store 的一条批注（`None` = 没有批注）。
+    #[props(default)] comment: Option<CodeCommentPreviewEntry>,
 ) -> Element {
     let channel = use_hook(zcode_app::workspace::create_workspace_channel);
     let requester = channel.requester();
     use_context_provider(move || requester);
+
+    // 批注上下文和 `AppShell` 里提供的保持一致（`AppCtx` 必须保持 `Copy`，
+    // 所以它单独走一个 context）。
+    let mut comment_previews = use_signal(CodeCommentPreviewStore::new);
+    let comment_draft = use_signal(|| None::<(CodeCommentRange, String)>);
+    let comment_removals = use_signal(CodeCommentRemovalRegistry::new);
+    use_hook(move || {
+        if let Some(comment) = comment {
+            comment_previews.write().add_comment(
+                &CodeCommentPreviewBucket {
+                    // 与 `workspace_fixture` 里的 path 保持一致 —— 否则批注
+                    // 会被分到另一个桶里，面板上一条也看不到。
+                    workspace_path: "F:/demo/workspace".to_string(),
+                    // 视图层用**分支名**当 identity（见 `workspace_identity_of`），
+                    // fixture 的分支是 `rust-only`，这里必须对齐。
+                    workspace_identity: Some("rust-only".to_string()),
+                    source_path: "src/dirty.rs".to_string(),
+                },
+                comment,
+            );
+        }
+    });
+    use_context_provider(move || zcode_app::workspace::CodeCommentCtx {
+        previews: comment_previews,
+        draft: comment_draft,
+        removals: comment_removals,
+    });
 
     let (data, status) = workspace_fixture(case);
     let ctx = AppCtx {
@@ -1173,14 +1202,45 @@ fn diff_result(availability: GitDiffAvailability, patch: Option<&str>, summary: 
 
 /// 一个展开在 `src/dirty.rs` 那一行之下的 diff 面板。
 #[component]
-fn DiffFixture(state: DiffPreviewState) -> Element {
-    rsx! { WorkspaceHarness { case: "changes", diff: Some(state) } }
+fn DiffFixture(
+    state: DiffPreviewState,
+    #[props(default)] comment: Option<CodeCommentPreviewEntry>,
+) -> Element {
+    rsx! { WorkspaceHarness { case: "changes", diff: Some(state), comment } }
 }
 
 #[component]
 fn DiffPatchFixture() -> Element {
     rsx! {
         DiffFixture {
+            state: DiffPreviewState::Ready {
+                id: 1,
+                path: "src/dirty.rs".to_string(),
+                diff: Box::new(diff_result(
+                    GitDiffAvailability::Patch,
+                    Some("--- a/src/dirty.rs\n+++ b/src/dirty.rs\n@@ -1 +1 @@\n-let a = 1;\n+let a = 2;\n"),
+                    None,
+                )),
+            },
+        }
+    }
+}
+
+/// 一个已展开、且**第 1 行上已经有一条批注**的 patch 面板。
+#[component]
+fn DiffAnnotatedFixture() -> Element {
+    rsx! {
+        DiffFixture {
+            comment: Some(CodeCommentPreviewEntry {
+                id: "code-comment:1:src/dirty.rs".to_string(),
+                source_path: Some("src/dirty.rs".to_string()),
+                source_title: "dirty.rs".to_string(),
+                // 批注锚在第一行（= 新增行 `let a = 2;` 所在的那一行）
+                start_line: 1,
+                end_line: 1,
+                selected_text: "let a = 2;".to_string(),
+                comment: "这里的常量名建议改成大写".to_string(),
+            }),
             state: DiffPreviewState::Ready {
                 id: 1,
                 path: "src/dirty.rs".to_string(),
@@ -1289,11 +1349,14 @@ fn diff_preview_renders_the_real_patch() {
     assert!(out.contains(r#"data-slot="diff-preview""#), "面板没渲染");
     assert!(out.contains(r#"data-diff-path="src/dirty.rs""#));
     assert!(out.contains(r#"data-slot="diff-patch""#), "缺少 patch 容器");
-    // 用的是已经移植好的轻量 diff 原语
-    assert!(out.contains("data-lightweight-diff-preview"));
-    // patch 原文逐行渲染出来了。注意 `LightweightDiffPreview` 会把行首的
-    // 协议标记（`+` / `-` / 空格）**取出来做样式**，所以正文里看到的是
-    // 去掉标记之后的内容，而标记体现在 diff-removed / diff-added 类名上。
+    // 用的是**可批注**的 patch 渲染（不是纯展示的 `LightweightDiffPreview`）
+    assert!(
+        out.contains(r#"data-slot="annotatable-patch""#),
+        "缺少可批注 patch 容器"
+    );
+    // patch 原文逐行渲染出来了。行首的协议标记（`+` / `-` / 空格）被
+    // **取出来做样式**，所以正文里看到的是去掉标记之后的内容，
+    // 而标记体现在 diff-removed / diff-added 类名上。
     assert!(out.contains("let a = 1;"), "缺少删除行内容");
     assert!(out.contains("let a = 2;"), "缺少新增行内容");
     assert!(
@@ -1302,6 +1365,77 @@ fn diff_preview_renders_the_real_patch() {
     );
     // 展开的那一行要标出来
     assert!(out.contains(r#"data-expanded="true""#));
+}
+
+#[test]
+fn patch_lines_expose_file_line_numbers_for_annotation() {
+    // 批注锚定的是**文件行号**，不是 patch 内的序号 —— 这里钉住这个坐标。
+    //
+    // fixture 的 patch 是 `@@ -1 +1 @@` 加一条删除、一条新增：
+    // 删除行在改动后的文件里不存在，所以**没有**行号；新增行是第 1 行。
+    let out = html(DiffPatchFixture);
+
+    assert!(
+        out.contains(r#"data-slot="patch-row""#),
+        "每一行都要是可寻址的一行"
+    );
+    // 新增行拿到文件行号 1
+    assert!(
+        out.contains(r#"data-file-line="1""#),
+        "新增行应当带上文件行号 1"
+    );
+    // 可批注的行才有「加批注」按钮
+    assert!(
+        out.contains(r#"data-slot="patch-comment-button""#),
+        "缺少加批注入口"
+    );
+}
+
+#[test]
+fn patch_rows_without_a_file_line_are_not_annotatable() {
+    // `@@` hunk 头与 `---` / `+++` 协议头在改动后的文件里没有对应行，
+    // 它们**不能**被批注 —— 给它们编个行号会让批注指向不存在的位置。
+    let out = html(DiffPatchFixture);
+    let rows = out.matches(r#"data-slot="patch-row""#).count();
+    let buttons = out.matches(r#"data-slot="patch-comment-button""#).count();
+
+    assert!(rows > 0, "应该有行");
+    assert!(
+        buttons < rows,
+        "并非每一行都可批注：{buttons} 个入口 / {rows} 行"
+    );
+}
+
+#[test]
+fn annotation_hint_is_shown_when_there_is_nothing_to_annotate() {
+    // 没有任何批注时给一条提示，否则用户不知道入口在哪。
+    let out = html(DiffPatchFixture);
+    assert!(
+        out.contains(r#"data-slot="annotation-hint""#),
+        "没有批注时应当给出提示"
+    );
+    assert!(!out.contains("data-code-comment-id"), "此时不该有批注卡片");
+}
+
+#[test]
+fn an_existing_annotation_is_rendered_next_to_its_line() {
+    let out = html(DiffAnnotatedFixture);
+
+    // 批注卡片本身
+    assert!(
+        out.contains(r#"data-code-comment-id="code-comment:1:src/dirty.rs""#),
+        "批注卡片没渲染出来"
+    );
+    // 批注正文
+    assert!(
+        out.contains("这里的常量名建议改成大写"),
+        "批注正文缺失"
+    );
+    // 已经是「有批注」的状态，就不该再出现「点击任意一行」的提示
+    assert!(
+        !out.contains(r#"data-slot="annotation-hint""#),
+        "有批注时不该再提示怎么加批注"
+    );
 }
 
 #[test]

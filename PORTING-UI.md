@@ -398,6 +398,8 @@ rsx! {
 | `pdf_zoom_overlay.rs` | `components/ui/usePdfZoomOverlay.ts` | PDF 缩放的数学：两套倍率（手势走 CSS transform、停顿后提交真实渲染）、指针锚点、滚轮指数缩放 |
 | `pdf_js_assets.rs` | `lib/pdfJsAssets.ts` | 算 `cMapUrl`。ReportLab 的 `STSong-Light` 等 Type0 字体只声明预定义 CMap、未内嵌字符映射，不给这个路径就是一片空白 |
 | `presentation_element_model.rs` | `presentation/presentationElementModel.ts` | PPTX 元素模型：节点树 → 可命中矩形表（含表格单元格的比例换算与合并单元格推进规则）+ 命中测试 |
+| `code_comment_context.rs` | `lib/codeCommentContext.ts` | **批注 ↔ prompt 的格式定义**。`build_code_comment_markdown` / `build_code_comments_block` / `build_prompt_with_code_comments` 负责拼，`parse_prompt_code_comments` 负责解 —— 两侧共用同一套定义，所以「批注真的能传到助手那边」这条链是可往返验证的 |
+| `code_comment_preview_store.rs` | `store/codeCommentPreviewStore.ts` | **批注预览的分桶表**，桶 key 是 `<workspaceKey>\0<sourcePath>`（NUL 不可能出现在合法路径里，所以不存在歧义）。`add` 是「先按 id 过滤再追加」，重复添加会把条目**移到末尾**（UI 上表现为「最近提交的排在最后」）；`remove_comment_by_source` 按 `<workspaceKey>\0` 前缀**扫所有桶** —— 因为「从输入框移除」只拿得到 workspace + id，不知道是哪个文件 |
 
 > **为什么 Dialog 不需要这套约定**：Dialog / AlertDialog 的内容用 `position: fixed`，
 > containing block 是**视口**而不是最近的定位祖先，所以没有 Portal 也能居中盖满整屏。
@@ -414,9 +416,9 @@ rsx! {
 | `src/workspace.rs` | **真实数据桥**：`WorkspaceRequester`（后台线程 + `futures-channel`）、`use_workspace_requester()`、`WorkspaceStatus` 四态；`refresh()` 读、`run(WorkspaceAction)` 写，两者共用同一个 `busy` 原子量**串行化**；`load_diff()` 读补丁，**刻意不共用 `busy`**（读 diff 不碰 `index.lock`），代价是每次请求带一个单调递增 `id`，轮询端只采纳当前那次的结果；`WorkspaceNotice` 回传单次写操作的成败 |
 | `src/views/sidebar.rs` | 品牌行 + 搜索（`InputGroup`）+ 按「今天/昨天/更早」分组的会话列表 + 右键菜单（`DropdownMenu`，destructive 删除）+ 上下文用量（`Progress`）+ 头像；**底部显示真实工作区目录名与「分支 · N 个变更」** |
 | `src/views/topbar.rs` | 会话标题 + **`WorkspaceBadge`**（五态：失败 / 加载中 / 未扫描 / 非仓库 / 真实分支 + ahead-behind + 变更数）+ 视图 `Tabs` + 模型选择器（`DropdownMenuRadioItem`）+ 带 `Tooltip` 的图标按钮（刷新按钮接 `requester.refresh()`） |
-| `src/views/changes.rs` | **「变更」页**：`WorkspaceBar`（分支 / 仓库根 / 汇总 / 刷新 + **推送按钮** + **提交输入框与提交按钮**）+ 按「已暂存 / 未暂存 / 未跟踪 / 冲突」分节（每组带 **全部暂存 / 全部丢弃**）+ `ActionableChangeRow`（`+N/-M` + 行内 **暂存** 按钮 + 垃圾桶按钮，默认 `opacity-40`、hover 才完全显形；**整行可点，点开就地展开真实补丁**）+ `DiffPreviewPane`（四种状态：有补丁 / 加载中 / 不可用且说明原因 / 命令失败）+ `NoticeBanner`（成功 / 失败提示条）+ 丢弃前的 `AlertDialog` 二次确认 + 加载 / 干净 / 非仓库 / 失败 / 空 五种落空态 + `NotPortedPane` |
+| `src/views/changes.rs` | **「变更」页**：`WorkspaceBar`（分支 / 仓库根 / 汇总 / 刷新 + **推送按钮** + **提交输入框与提交按钮**）+ 按「已暂存 / 未暂存 / 未跟踪 / 冲突」分节（每组带 **全部暂存 / 全部丢弃**）+ `ActionableChangeRow`（`+N/-M` + 行内 **暂存** 按钮 + 垃圾桶按钮，默认 `opacity-40`、hover 才完全显形；**整行可点，点开就地展开真实补丁**）+ `DiffPreviewPane`（四种状态：有补丁 / 加载中 / 不可用且说明原因 / 命令失败）+ **`AnnotatablePatch`**（可批注的补丁：逐行带**文件行号**与「加批注」按钮，行下挂已有批注与草稿，行号映射走 `map_patch_lines_to_file_numbers`）+ `NoticeBanner`（成功 / 失败提示条）+ 丢弃前的 `AlertDialog` 二次确认 + 加载 / 干净 / 非仓库 / 失败 / 空 五种落空态 + `NotPortedPane` |
 | `src/views/conversation.rs` | 消息流；助手头像挂 `HoverCard`；工具调用卡片（分段 `Progress`）；流式提示用受控 `Collapsible` + `Alert` |
-| `src/views/composer.rs` | `InputGroup`（`InlineStart` 回形针 / `Textarea` / `InlineEnd` 发送或停止）+ 审批模式选择器 |
+| `src/views/composer.rs` | `InputGroup`（`InlineStart` 回形针 / `Textarea` / `InlineEnd` 发送或停止）+ 审批模式选择器 + **待发送批注计数**（`N 条代码批注将一并发送`）+ **上一条实际发出内容**（含 `# Code comments:` 块的折叠展示）；发送时把批注经 `build_prompt_with_code_comments` 拼进正文并清空 store |
 | `src/views/detail.rs` | 执行计划（受控 `Collapsible`）+ **变更文件（`ChangesSection`，真实数据）** + 工具调用 / 上下文来源（`Accordion`）+ 权限 `RadioGroup` + 分段 `Progress` + 图例 + `AvatarGroup` + `ButtonGroup` |
 | `src/views/settings.rs` | 设置 `Dialog`（常规/外观/关于 三个 `Tabs`）+ 删除确认 `AlertDialog` |
 | `src/views/gallery.rs` | 组件画廊 `Dialog`，六个分页把所有原语和变体都渲染一遍 |
@@ -503,10 +505,10 @@ bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,806 
 
 | 层 | 文件 | 数量 | 断言粒度 |
 | --- | --- | --- | --- |
-| 纯函数单测 | `zcode-ui/src/**` 内联 `#[cfg(test)]` | 742 | 字符串包含 / 相等 / 数值 |
+| 纯函数单测 | `zcode-ui/src/**` 内联 `#[cfg(test)]` | 803 | 字符串包含 / 相等 / 数值 |
 | mutation 记录式渲染 | `zcode-ui/tests/render.rs` | 11 | 区分静态属性 / 动态属性 / 文本节点 |
 | HTML 快照 | `zcode-ui/tests/html_snapshot.rs` | 75 | 序列化后的 HTML 字符串 |
-| 整树冒烟（真实数据注入） | `zcode-app/tests/smoke.rs` | 39（+1 ignored） | 把整个应用（含浮层）真渲染一遍，变更页用 fixture 注入六种数据状态 + 写操作入口与提示条 + **diff 预览的四种状态** + **只读分支分组**（有上游 / 无上游 / 干净但领先） |
+| 整树冒烟（真实数据注入） | `zcode-app/tests/smoke.rs` | 43（+1 ignored） | 把整个应用（含浮层）真渲染一遍，变更页用 fixture 注入六种数据状态 + 写操作入口与提示条 + **diff 预览的四种状态** + **可批注的补丁行**（文件行号 / 不可批注的行 / 已有批注卡片 / 无批注时的提示）+ **只读分支分组**（有上游 / 无上游 / 干净但领先） |
 | 跨线程读 / 写 / diff 链路 | `zcode-app/tests/workspace_loader.rs` | 10 | 手写 executor 驱动 `refresh` / `run` / `load_diff → 后台线程 → 通道 → 结果`，不依赖 dioxus 运行时；含**分支比较穿透后台通道** |
 | git 端到端 | `zcode-services/tests/git_workspace.rs` | 43 | 真起临时仓库，跑真实 `git status` / `git log` / `git config` / `git diff`（读 23，含分支比较）与 `stage` / `unstage` / `discard` / `commit` / `push`（写 20） |
 
@@ -517,9 +519,9 @@ bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,806 
 | `zcode-rpc` | 10 | — | 10 |
 | `zcode-shared` | 19 | — | 19 |
 | `zcode-services` | 148 | 43 | 191 |
-| `zcode-ui` | 742 | 75 + 11 | 828 |
-| `zcode-app` | 33 | 39 + 10 | 82 |
-| **合计** | **952** | **178** | **1130** |
+| `zcode-ui` | 803 | 75 + 11 | 889 |
+| `zcode-app` | 33 | 43 + 10 | 86 |
+| **合计** | **1013** | **182** | **1195** |
 
 > **为什么「变更」页的冒烟测试不跑真 git**：快照测试只跑同步代码，
 > `spawn` 出来的 future 根本不会被 poll，所以 `AppShell` 在拿不到
@@ -547,7 +549,7 @@ bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,806 
 > `text-diff-added` 类名上。所以正确写法是断言内容
 > （`let a = 1;` / `let a = 2;`）**加上**两个类名同时存在。
 
-### 5.1 纯函数单测（742 个）
+### 5.1 纯函数单测（803 个）
 
 `*_classes()` 与 `cn()` 的直接断言。覆盖 variant/size 映射、用户 class 覆盖
 组件默认、`text-ui-*` 与文字颜色不互相覆盖、方括号修饰符切分、
@@ -559,7 +561,8 @@ bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,806 
 - **几何**：`pdf_zoom_overlay` 的锚点捕获/还原（指针在容器外要先夹进容器再算比例）、
   `presentation_element_model` 的表格单元格矩形与合并单元格的**不对称推进**
   （纵向续格推进列号、横向续格不推进）；
-- **坐标系换算**：`code_viewer` 的「文件行号 ↔ 选中行 ↔ 注释锚点」三套坐标；
+- **坐标系换算**：`code_viewer` 的「文件行号 ↔ 选中行 ↔ 注释锚点」三套坐标，
+  以及 §5.1.1 的 patch 行号映射；
 - **JS 数值语义**：`Math.round` 半数向 `+∞`（与 Rust 的 `f64::round` 不同）、
   `Number.parseInt` 的前缀解析、`JSON.stringify` 的转义、
   `Number.prototype.toString(36)`、`Math.max(0, NaN) = NaN` 的传染性；
@@ -567,6 +570,39 @@ bash .tailwind-build/build.sh   # → crates/zcode-app/assets/app.css（117,806 
   都按 **UTF-16 码元**走，否则非 BMP 字符算出的 `cacheKey` 与 TS 不一致；
 - **`Array.prototype.join` 把 `null` 变成 `""`**：`chart.rs` 里
   「主题没有颜色时输出一行空白」是**上游行为**，被单独钉成一条测试。
+
+#### 5.1.1 批注：三套坐标系与一次映射
+
+批注这块最容易出的不是崩溃，而是**静默错位**：批注挂在错误的行上、
+或者「加上了却一条也看不见」。根因是这里有**三套坐标**，任何两套混淆
+都不会报错：
+
+| 坐标 | 含义 | 谁用 |
+| --- | --- | --- |
+| patch 内行号 | 渲染出来的第几行（`index + 1`） | `LightweightDiffPreview` 的行号槽 |
+| **文件行号（新侧）** | 这一行在**改动后**的文件里是第几行 | `CodeCommentRange` / store / 发给模型的 prompt |
+| `@pierre/diffs` 锚点 | `endLine - firstLineNumber + 1`，用于富渲染器 | `build_line_annotations`（本移植的 app 层不走它） |
+
+三者互不相等。sanity 检查：`@@ -10,3 +10,4 @@` 后面的第一条上下文行，
+patch 内是第 2 行、文件行号是 **10**、锚点又是别的值。
+
+连接第一套与第二套的是 `patch_diff_preview.rs::map_patch_lines_to_file_numbers`。
+它返回的向量**与输入等长**（调用方靠 `index` 对齐，不等长就整体错位），
+每个元素是 `Option<PatchLineFileNumber>`，`None` 表示「这一行没有新侧行号、
+不可批注」。三条判定规则各自有测试钉住：
+
+- `@@` 头把游标**重置**到 `+c`；多个 hunk 时第二个 hunk 必须重新对齐
+  （忘了重置会让第二个 hunk 从第一个的位置继续数）；
+- `+` 与上下文行推进游标，**`-` 不推进** —— 删除行在改动后的文件里根本不存在，
+  给它编个行号会让批注指向一个不存在的位置；
+- `\ No newline at end of file` 与认不出的前缀**既不批注也不推进游标**
+  （推进了会让后面所有行整体偏移一行）。
+
+buckets 的 key 也有一个签名级别的坑：`get_code_comment_workspace_key` 里
+**identity 优先于 path**。所以视图层分桶时必须把 identity 一路传下去 ——
+`AnnotatablePatch` 少传一次，算出来的桶 key 就和别处不一致，
+表现正是「批注加上了却一条也看不见」（这个 bug 在开发过程中真的踩过一次，
+集成测试把它挡住了）。
 
 ### 5.2 mutation 记录式渲染（11 个）
 
@@ -633,7 +669,7 @@ cargo run -p zcode-ui --example preview            # → ./preview.html
 浏览器版 + 从 `packages/ui/src/styles.css` 复刻的 `@theme` / `@custom-variant`
 令牌驱动（需联网加载 CDN；离线打开会退化为无样式但结构正确的 HTML）。
 
-### 5.5 整树冒烟 + 「能正常运行」的判定（36 + 1 ignored）
+### 5.5 整树冒烟 + 「能正常运行」的判定（43 + 1 ignored）
 
 `zcode-app/tests/smoke.rs` 把 [`AppShell`] 整棵树、以及三个浮层（画廊 / 设置 /
 删除确认）**真渲染一遍**，断言：
@@ -658,6 +694,13 @@ cargo run -p zcode-ui --example preview            # → ./preview.html
   有补丁时渲染真实行、加载中显示提示、二进制 / 截断 / 不可用 / 命令失败
   **都必须说明原因**（`data-slot="diff-unavailable"` + `data-diff-availability`），
   且展开预览**不会遮掉页面其余部分**（顶栏、其它分组仍在）；
+- **补丁是可批注的**（4 条）：每行都带 `data-file-line`（**文件行号**，
+  不是 patch 内序号）；可批注的行才有 `patch-comment-button`，所以
+  `按钮数 < 行数`（协议头与被删除的行不可批注）；一条预置的批注会渲染成
+  `data-code-comment-id` 卡片且正文可读；没有任何批注时给 `annotation-hint`
+  提示、有批注时这条提示消失。批注夹具的 `workspace_identity` 必须与视图层
+  算出来的一致（都取分支名），否则批注会落进另一个桶 —— 这正是这条测试
+  第二次跑起来才通过的原因；
 - 顶栏 `WorkspaceBadge` 的五个分支各命中一次；「任务」tab 渲染 `NotPortedPane`
   而不是静默空白。
 
@@ -779,8 +822,12 @@ cargo run -p zcode-ui --example preview            # → ./preview.html
    **提交图 / 分支比较视图**（`getCommitGraph` 与 `getDiff` 的服务层已经就位，
    界面上还没有消费它们的页面 —— 上游那部分叫 `getBranchComparison`，未移植）、
    以及**冲突解决入口**（冲突现在只在「冲突」分组里列出来，点不了）。
-   另外补丁现在**只读**：上游能在 diff 上留评论 / 选中行区间，
-   `code_viewer` 的注释原语已移植好，但「变更」页还没接上。
+   **补丁现在可以批注**了（见 §3 的 `code_comment_context` /
+   `code_comment_preview_store` 与 §4 的「批注坐标系」），但仍有两块没接：
+   **拖拽多选行区间**（上游靠 `@pierre/diffs` 的 Shadow DOM，宿主拿不到；
+   本移植退化成「点单行加批注」，多行批注的 API 已经就位但没有入口），
+   以及**批注随消息真正发给模型**（现在只到「拼成 prompt 正文 + 留档展示」
+   这一步，发出去的通道本身还没接 —— 那是会话子系统的事）。
 8. **其余页面仍是演示数据** —— 会话流 / 输入区 / 设置里的内容还是 `demo_state()`
    的硬编码值。它们要接的是会话与消息存储，那是 `packages/services` 里
    体量大得多的另一块。

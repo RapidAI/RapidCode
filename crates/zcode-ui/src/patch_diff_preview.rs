@@ -400,6 +400,85 @@ pub fn collect_patch_metadata_preview_lines(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// 一行 patch 在**文件里**的落点。
+///
+/// 批注只能挂在「改动后」那一侧，所以这里只关心新侧行号。
+/// `None` 表示这一行**没有新侧行号**，不该被批注：
+///
+/// - `@@` hunk 头、`diff --git` / `index` 这类协议头；
+/// - 被删除的行（`-`）—— 它在改动后的文件里**根本不存在**，
+///   给它编一个行号会让批注指向一个不存在的位置。
+///
+/// 平文本行（` `）与新增行（`+`）都有新侧行号。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PatchLineFileNumber {
+    /// 新侧文件行号（1 起）。
+    pub new_line: usize,
+    /// 这一行在 patch 里是不是「新增」。
+    pub is_added: bool,
+}
+
+/// 把 patch 的每一行映射到它的**新侧文件行号**。
+///
+/// 返回的向量与输入**等长**：`None` 表示该行没有新侧行号（见
+/// [`PatchLineFileNumber`] 的说明）。等长是刻意的 —— 调用方拿这个向量
+/// 按 `index` 与渲染出来的行一一对应，不需要自己再数一遍。
+///
+/// 计数规则（与 unified diff 一致）：
+/// - 遇到 `@@ -a,b +c,d @@` 时，游标跳到 `c`；
+/// - ` ` 与 `+` 让游标前进；
+/// - `-` **不动**游标（它占用的是旧侧的行号）。
+///
+/// 没有 `@@` 头的 patch（rename-only / mode-only）会给每行返回 `None` ——
+/// 这种 patch 本来就没有可批注的代码行。
+pub fn map_patch_lines_to_file_numbers(lines: &[String]) -> Vec<Option<PatchLineFileNumber>> {
+    let mut result = Vec::with_capacity(lines.len());
+    let mut new_cursor: Option<usize> = None;
+
+    for line in lines {
+        if is_patch_hunk_header_line(line) {
+            // 游标跳到新侧起始行；解析不出来就保持「不可批注」
+            new_cursor = parse_hunk_header(line).map(|(_, _, new_start, _)| new_start);
+            result.push(None);
+            continue;
+        }
+
+        let Some(cursor) = new_cursor else {
+            result.push(None);
+            continue;
+        };
+
+        match line.chars().next() {
+            Some('+') => {
+                result.push(Some(PatchLineFileNumber {
+                    new_line: cursor,
+                    is_added: true,
+                }));
+                new_cursor = Some(cursor + 1);
+            }
+            Some('-') => {
+                // 删除行在改动后的文件里不存在，游标不动
+                result.push(None);
+            }
+            Some(' ') | None | Some('\u{0}') => {
+                // 空行等同于「上下文里的空行」
+                result.push(Some(PatchLineFileNumber {
+                    new_line: cursor,
+                    is_added: false,
+                }));
+                new_cursor = Some(cursor + 1);
+            }
+            // `\ No newline at end of file` 之类的元信息行：不对应任何文件行，
+            // 也**不该**推进游标
+            Some('\\') => result.push(None),
+            // 认不出来的行按上下文行处理会错位，所以只标为不可批注、不动游标
+            Some(_) => result.push(None),
+        }
+    }
+
+    result
+}
+
 /// 只保留 hunk 正文（丢掉 `diff --git` / `index` / `---` / `+++` / `@@` 这些协议头）。
 pub fn collect_plain_text_preview_lines(lines: &[String]) -> Vec<String> {
     let mut preview_lines = Vec::new();
@@ -1204,5 +1283,218 @@ rename to new.txt";
         let lines = get_plain_text_patch_fallback_lines("", &PierrePatchProbe::default())
             .expect("必须降级");
         assert_eq!(lines, owned(&[""]));
+    }
+
+    // ---- patch 行 → 文件行号 ----
+
+    /// 返回向量必须与输入**等长** —— 调用方靠 `index` 对齐，不等长就会错位批注。
+    #[test]
+    fn file_number_map_is_always_the_same_length_as_the_input() {
+        let lines = owned(&[
+            "diff --git a/x b/x",
+            "index 111..222 100644",
+            "--- a/x",
+            "+++ b/x",
+            "@@ -1,3 +1,4 @@",
+            " keep",
+            "-drop",
+            "+added",
+            "+another",
+        ]);
+        assert_eq!(map_patch_lines_to_file_numbers(&lines).len(), lines.len());
+        // 空输入也不能崩
+        assert!(map_patch_lines_to_file_numbers(&[]).is_empty());
+    }
+
+    /// 游标从 `+c` 起步：上下文行与新增行各占一个新侧行号，删除行不占。
+    #[test]
+    fn file_number_map_walks_the_new_side_cursor() {
+        let map = map_patch_lines_to_file_numbers(&owned(&[
+            "@@ -10,3 +10,4 @@",
+            " keep",
+            "-drop",
+            "+added",
+            "+another",
+        ]));
+
+        assert_eq!(map[0], None, "hunk 头自身没有行号");
+        assert_eq!(
+            map[1],
+            Some(PatchLineFileNumber {
+                new_line: 10,
+                is_added: false
+            })
+        );
+        assert_eq!(map[2], None, "删除行在改动后的文件里不存在");
+        assert_eq!(
+            map[3],
+            Some(PatchLineFileNumber {
+                new_line: 11,
+                is_added: true
+            })
+        );
+        assert_eq!(
+            map[4],
+            Some(PatchLineFileNumber {
+                new_line: 12,
+                is_added: true
+            })
+        );
+    }
+
+    /// 删除行**不推进游标** —— 这是最容易写错的一处（写成推进会让后续行号整体偏移）。
+    #[test]
+    fn deleted_lines_do_not_advance_the_cursor() {
+        let map = map_patch_lines_to_file_numbers(&owned(&[
+            "@@ -1,4 +1,2 @@",
+            "-a",
+            "-b",
+            "-c",
+            " d",
+            "+e",
+        ]));
+
+        // 三条删除之后，上下文行仍然是新侧第 1 行
+        assert_eq!(
+            map[4],
+            Some(PatchLineFileNumber {
+                new_line: 1,
+                is_added: false
+            })
+        );
+        assert_eq!(
+            map[5],
+            Some(PatchLineFileNumber {
+                new_line: 2,
+                is_added: true
+            })
+        );
+    }
+
+    /// 多个 hunk：第二个 hunk 的游标必须**重置**到它自己声明的 `+c`。
+    #[test]
+    fn second_hunk_resets_the_cursor() {
+        let map = map_patch_lines_to_file_numbers(&owned(&[
+            "@@ -1,1 +1,1 @@",
+            "-old",
+            "+new",
+            "@@ -50,1 +50,1 @@",
+            " ctx",
+            "+added",
+        ]));
+
+        assert_eq!(map[4].map(|n| n.new_line), Some(50));
+        assert_eq!(map[5].map(|n| n.new_line), Some(51));
+        assert!(map[5].expect("有新侧行号").is_added);
+    }
+
+    /// 第一个 `@@` 之前的协议头一律 `None`；没有 `@@` 的 patch（rename-only）全 `None`。
+    #[test]
+    fn protocol_headers_and_hunkless_patches_are_not_annotatable() {
+        let map = map_patch_lines_to_file_numbers(&owned(&[
+            "diff --git a/x b/x",
+            "index 111..222 100644",
+            "--- a/x",
+            "+++ b/x",
+        ]));
+        assert!(map.iter().all(Option::is_none), "没有 hunk，全部不可批注");
+
+        // rename-only：只有元信息，没有正文
+        let rename_only = map_patch_lines_to_file_numbers(&owned(&[
+            "diff --git a/a.txt b/b.txt",
+            "similarity index 100%",
+            "rename from a.txt",
+            "rename to b.txt",
+        ]));
+        assert!(rename_only.iter().all(Option::is_none));
+    }
+
+    /// `\ No newline at end of file` **不推进游标**（它不是文件里的行）。
+    #[test]
+    fn no_newline_marker_does_not_advance_the_cursor() {
+        let map = map_patch_lines_to_file_numbers(&owned(&[
+            "@@ -1,2 +1,2 @@",
+            " keep",
+            "\\ No newline at end of file",
+            "+added",
+        ]));
+
+        assert_eq!(map[2], None, "元信息行不批注");
+        assert_eq!(
+            map[3],
+            Some(PatchLineFileNumber {
+                new_line: 2,
+                is_added: true
+            }),
+            "元信息行不该占用行号"
+        );
+    }
+
+    /// 认不出的前缀：不批注，也**不能**当上下文行推进游标（会整体错位）。
+    #[test]
+    fn unrecognized_prefix_does_not_advance_the_cursor() {
+        let map = map_patch_lines_to_file_numbers(&owned(&[
+            "@@ -1,2 +1,3 @@",
+            " keep",
+            "? mumble",
+            "+added",
+        ]));
+
+        assert_eq!(map[2], None);
+        assert_eq!(
+            map[3],
+            Some(PatchLineFileNumber {
+                new_line: 2,
+                is_added: true
+            })
+        );
+    }
+
+    /// 空行当作「上下文里的空行」，占据新侧行号（patch 正文里的空上下文行就是这样存的）。
+    #[test]
+    fn blank_context_lines_still_get_a_file_number() {
+        let map = map_patch_lines_to_file_numbers(&owned(&[
+            "@@ -1,2 +1,2 @@",
+            " a",
+            "",
+            "+b",
+        ]));
+
+        assert_eq!(
+            map[2],
+            Some(PatchLineFileNumber {
+                new_line: 2,
+                is_added: false
+            })
+        );
+        assert_eq!(map[3].map(|n| n.new_line), Some(3));
+    }
+
+    /// 与真实 git patch 对齐：`git diff` 产出的头两行（`diff --git` / `index`）没有行号，
+    /// 而第一行上下文拿到的是 `@@` 声明的 `+c`。
+    #[test]
+    fn real_world_patch_maps_consistently() {
+        let lines: Vec<String> = split_patch_lines(
+            "diff --git a/README.md b/README.md\n\
+             index 1234567..89abcde 100644\n\
+             --- a/README.md\n\
+             +++ b/README.md\n\
+             @@ -12,3 +12,4 @@\n\
+             \x20context\n\
+             -removed\n\
+             +kept\n\
+             +brand new\n",
+        )
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let map = map_patch_lines_to_file_numbers(&lines);
+        assert_eq!(map.len(), lines.len());
+        // `@@` 在新侧第 4 行
+        assert_eq!(map[4], None);
+        assert_eq!(map[5].map(|n| n.new_line), Some(12));
+        assert_eq!(map[6], None, "removed 是删除行");
+        assert_eq!(map[7].map(|n| (n.new_line, n.is_added)), Some((13, true)));
+        assert_eq!(map[8].map(|n| (n.new_line, n.is_added)), Some((14, true)));
     }
 }

@@ -95,6 +95,11 @@ pub struct WorkspaceSeed {
     /// 单独开一个字段是为了让静态快照也能把 diff 预览拍进去 ——
     /// 否则那一块在快照里永远是关着的，等于没验证。
     pub diff: Option<DiffPreviewState>,
+    /// 初始就存在的代码批注；空表示没有。
+    ///
+    /// 和 `diff` 同样的理由：批注这一块在静态快照里也要能拍进去，
+    /// 否则「批注能渲染」这件事没有任何视觉证据。
+    pub comments: Vec<(CodeCommentPreviewBucket, CodeCommentPreviewEntry)>,
 }
 
 impl WorkspaceSeed {
@@ -105,6 +110,7 @@ impl WorkspaceSeed {
             status: WorkspaceStatus::Ready,
             tab: None,
             diff: None,
+            comments: Vec::new(),
         }
     }
 
@@ -117,6 +123,15 @@ impl WorkspaceSeed {
     /// 指定初始展开的 diff 面板。
     pub fn with_diff(mut self, diff: DiffPreviewState) -> Self {
         self.diff = Some(diff);
+        self
+    }
+
+    /// 指定初始批注。
+    pub fn with_comments(
+        mut self,
+        comments: Vec<(CodeCommentPreviewBucket, CodeCommentPreviewEntry)>,
+    ) -> Self {
+        self.comments = comments;
         self
     }
 }
@@ -152,6 +167,7 @@ pub fn AppShell() -> Element {
     let seeded_data = seed.as_ref().and_then(|seed| seed.data.clone());
     let seeded_status = seed.as_ref().map(|seed| seed.status.clone());
     let seeded_diff = seed.as_ref().and_then(|seed| seed.diff.clone());
+    let seeded_comments = seed.as_ref().map(|seed| seed.comments.clone()).unwrap_or_default();
 
     // 全局 store
     let state = use_signal(state::demo_state);
@@ -177,6 +193,23 @@ pub fn AppShell() -> Element {
     let workspace_channel = use_hook(workspace::create_workspace_channel);
     let requester_for_context = workspace_channel.requester();
     use_context_provider(move || requester_for_context);
+
+    // 代码批注：已提交的预览 + 正在写的草稿 + 「已移除」登记表。
+    // 三个都是 `Signal`（`Copy`），所以能整个塞进一个 `Copy` 的 context。
+    let comment_previews = use_signal(move || {
+        let mut store = CodeCommentPreviewStore::new();
+        for (bucket, comment) in seeded_comments {
+            store.add_comment(&bucket, comment);
+        }
+        store
+    });
+    let comment_draft = use_signal(|| None::<(CodeCommentRange, String)>);
+    let comment_removals = use_signal(CodeCommentRemovalRegistry::new);
+    use_context_provider(move || workspace::CodeCommentCtx {
+        previews: comment_previews,
+        draft: comment_draft,
+        removals: comment_removals,
+    });
 
     // 结果回传循环。
     //

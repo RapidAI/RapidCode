@@ -31,6 +31,7 @@ use zcode_app::workspace::{
 use zcode_app::{AppShell, WorkspaceSeed};
 use zcode_services::git::changes::{get_workspace_changes, summarize_changes};
 use zcode_services::git::repo::GitCliRepo;
+use zcode_ui::{CodeCommentPreviewBucket, CodeCommentPreviewEntry};
 
 /// 同步扫一次工作区，产出可以注入界面的数据。
 fn scan_workspace() -> (Option<WorkspaceData>, WorkspaceStatus) {
@@ -118,12 +119,14 @@ fn PreviewRoot(
     status: WorkspaceStatus,
     tab: String,
     diff: Option<DiffPreviewState>,
+    comments: Vec<(CodeCommentPreviewBucket, CodeCommentPreviewEntry)>,
 ) -> Element {
     use_context_provider(move || WorkspaceSeed {
         data,
         status,
         tab: Some(tab),
         diff,
+        comments,
     });
 
     rsx! { AppShell {} }
@@ -136,6 +139,7 @@ fn write_snapshot(
     status: WorkspaceStatus,
     tab: &str,
     diff: Option<DiffPreviewState>,
+    comments: Vec<(CodeCommentPreviewBucket, CodeCommentPreviewEntry)>,
 ) {
     let mut dom = VirtualDom::new_with_props(
         PreviewRoot,
@@ -144,6 +148,7 @@ fn write_snapshot(
             status,
             tab: tab.to_string(),
             diff,
+            comments,
         },
     );
     dom.rebuild_in_place();
@@ -222,12 +227,76 @@ fn main() {
         _ => println!("没有可展开的变更"),
     }
 
+    // 给「变更」页那份快照塞一条**真实的**批注：锚在 patch 里第一条新增行上。
+    // 这样截图里能看到批注卡片，而不是「有入口但没内容」。
+    let comments = build_demo_comments(data.as_ref(), diff.as_ref());
+    if !comments.is_empty() {
+        println!("已注入 {} 条代码批注", comments.len());
+    }
+
     write_snapshot(
         "app-preview.html",
         data.clone(),
         status.clone(),
         "conversation",
         None,
+        Vec::new(),
     );
-    write_snapshot("app-preview-changes.html", data, status, "changes", diff);
+    write_snapshot("app-preview-changes.html", data, status, "changes", diff, comments);
+}
+
+/// 从真实的 diff 里挑一条新增行，造一条批注。
+///
+/// 用真实行号（而不是硬编码 1）是有意的：批注锚点错位是这一块最容易出的 bug，
+/// 拿真实 patch 算出来的行号能让截图同时验证「映射对不对」。
+fn build_demo_comments(
+    data: Option<&WorkspaceData>,
+    diff: Option<&DiffPreviewState>,
+) -> Vec<(CodeCommentPreviewBucket, CodeCommentPreviewEntry)> {
+    let Some(WorkspaceData { summary, .. }) = data else {
+        return Vec::new();
+    };
+    let Some(DiffPreviewState::Ready { path, diff, .. }) = diff else {
+        return Vec::new();
+    };
+    let Some(patch) = diff.patch.as_deref() else {
+        return Vec::new();
+    };
+
+    let lines: Vec<String> = patch
+        .split('\n')
+        .map(|line| line.to_string())
+        .collect();
+    let numbers = zcode_ui::map_patch_lines_to_file_numbers(&lines);
+    // 第一条**新增**行（`is_added`）才是我们要的锚点
+    let Some((index, anchor)) = numbers
+        .iter()
+        .enumerate()
+        .find_map(|(index, mapped)| mapped.filter(|m| m.is_added).map(|m| (index, m)))
+    else {
+        return Vec::new();
+    };
+
+    let selected_text = zcode_ui::get_lightweight_diff_line_parts(&lines[index])
+        .content
+        .trim()
+        .to_string();
+    let source_path = path.clone();
+
+    vec![(
+        CodeCommentPreviewBucket {
+            workspace_path: summary.workspace_path.clone(),
+            workspace_identity: Some(summary.branch_name.clone().unwrap_or_default()),
+            source_path: source_path.clone(),
+        },
+        CodeCommentPreviewEntry {
+            id: format!("code-comment:{}:{source_path}", anchor.new_line),
+            source_path: Some(source_path.clone()),
+            source_title: zcode_ui::get_source_title(&source_path),
+            selected_text,
+            comment: "这一行是这次改动新加的，确认一下是否需要同步更新文档。".to_string(),
+            start_line: anchor.new_line as i64,
+            end_line: anchor.new_line as i64,
+        },
+    )]
 }

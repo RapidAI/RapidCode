@@ -14,7 +14,7 @@
 4. **真实业务链路**（移植自 `packages/services`）—— 见 **[PORTING.md](./PORTING.md) §2.4**
 
 **当前状态，请先读这一句**：**可编译、可测试**已经做到（`cargo build` 零警告、
-1130 个测试全绿），但**桌面窗口渲染不出内容**（环境层面的依赖不兼容，见「已知问题」）。
+1195 个测试全绿），但**桌面窗口渲染不出内容**（环境层面的依赖不兼容，见「已知问题」）。
 
 **应用外壳已经能显示并修改真实数据**：「变更」页走的是**真正移植过来的 git 工作区状态链路**
 （`crates/zcode-services`）—— 它会真的去 `git status --porcelain=v2` / `git diff --numstat`，
@@ -32,7 +32,7 @@
 
 ```bash
 cargo build                          # 编译整个工作区
-cargo test                           # 运行全部测试（1130 个）
+cargo test                           # 运行全部测试（1195 个）
 cargo run -p zcode-app               # 桌面窗口（⚠️ 本机开得出窗口但内容是空白，见「已知问题」）
 cargo build --release
 
@@ -59,7 +59,7 @@ cargo run -p zcode-app --example app_preview  # → ./app-preview.html        �
 >
 > ⚠️ **`cargo run -p zcode-app` 能开出窗口，但窗口内容区是空白的** —— UI 渲染不出来。
 > 这是 dioxus-desktop 0.6.3（wry 0.45）与较新 WebView2 Runtime 的兼容性问题，
-> **与本仓库代码无关**（`cargo build` 零警告、1130 个测试全绿，SSR 渲染出的组件树
+> **与本仓库代码无关**（`cargo build` 零警告、1195 个测试全绿，SSR 渲染出的组件树
 > 也完整正确）。完整证据链与可选出路见「已知问题」一节。
 > 想直接看 UI，用浏览器打开 `app-preview.html` / `app-preview-changes.html`
 > （SSR 静态快照），或直接看下面的截图。
@@ -186,7 +186,7 @@ cargo run -p zcode-app --example app_preview  # → ./app-preview.html        �
 ## 测试
 
 ```
-cargo test                    # 工作区 1130 个测试
+cargo test                    # 工作区 1195 个测试
 cargo test -p zcode-ui        # UI 层 828 个测试
 cargo test -p zcode-services  # 服务层 191 个测试（含真起临时仓库的端到端）
 cargo test -p zcode-app       # 应用层 82 个测试
@@ -284,7 +284,7 @@ git 进程 ──► provider.rs ──► cli_helpers.rs ──► repo.rs ─�
 **结论先说**：`cargo run -p zcode-app` 能开出一个标题正确的窗口，但**窗口内容区一片空白**
 —— UI 渲染不出来。这是 **dioxus-desktop 0.6.3（内置 wry 0.45）与 WebView2 Runtime
 `154.0.4258.62` 之间的兼容性问题，不是本仓库代码的问题**。同一份代码
-`cargo build` 零警告、1130 个测试全绿；SSR 渲染出的组件树也完整正确（见下方
+`cargo build` 零警告、1195 个测试全绿；SSR 渲染出的组件树也完整正确（见下方
 「能看的东西」）。
 
 ### 证据链
